@@ -5,11 +5,13 @@
  *   - the order of section F: the account limit; the reserved test domains
  *     and the allow-list (suppressed); the organisation limit and the
  *     ceiling (refused); not configured (failed); the send. A code or a
- *     link writes its claim (suppressed, pending) before it counts, and the
- *     outcome's row after it (the note of 2026-11-22; the claims under
- *     concurrent requests are in tests/unit/mail-claims.test.ts);
+ *     link writes its claim (suppressed, pending) before it counts its
+ *     account, its in-flight row (suppressed, in_flight) once it passed that
+ *     count, and the outcome's row after the send (the notes of 2026-11-22;
+ *     the claims under concurrent requests are in
+ *     tests/unit/mail-claims.test.ts);
  *   - a limit that cannot be read, or a missing table, sends nothing and
- *     writes nothing but a claim already there;
+ *     writes nothing but a claim or an in-flight row already there;
  *   - the limits of section G: 5 an hour and 10 a day per account and kind,
  *     one refused row an hour; a platform owner's own code and link have the
  *     hourly limit only; the test counts only sends that reached the mail
@@ -153,8 +155,8 @@ const reads = () => requests.filter((r) => r.path === "/rest/v1/platform_email_l
 const ago = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
 /** A claim of a code or link (the note of 2026-11-22): the account's requests are counted on these. */
 const CLAIM: Partial<Row> = { status: "suppressed", error_code: "pending" };
-/** The rows of what came of the sends, without their claims. */
-const outcomes = () => rows.filter((r) => !(r.status === "suppressed" && r.error_code === "pending"));
+/** The rows of what came of the sends, without their claims and in-flight rows. */
+const outcomes = () => rows.filter((r) => !(r.status === "suppressed" && (r.error_code === "pending" || r.error_code === "in_flight")));
 const seed = (n: number, base: Partial<Row>, minutesAgo: (i: number) => number) => {
   for (let i = 0; i < n; i++) rows.push({ id: `s${nextId++}`, sent_at: ago(minutesAgo(i)), event_type: "platform_reset_code", organization_id: null, to_user_id: null, status: "sent", error_code: null, error_detail: null, ...base });
 };
@@ -201,7 +203,7 @@ async function main() {
 
       fresh();
       const half = { ...ENV }; delete half.PLATFORM_SMTP_PASSWORD;
-      eq("a code while not configured: failed, not_configured, its claim and one row, nothing dispatched", [short(await send(code(ADMIN_A, ORG_A), half)), sends().length, rows.map((r) => [r.status, r.error_code])], [["failed", "not_configured", true], 0, [["suppressed", "pending"], ["failed", "not_configured"]]]);
+      eq("a code while not configured: failed, not_configured, its claim, its in-flight row and one row, nothing dispatched", [short(await send(code(ADMIN_A, ORG_A), half)), sends().length, rows.map((r) => [r.status, r.error_code])], [["failed", "not_configured", true], 0, [["suppressed", "pending"], ["suppressed", "in_flight"], ["failed", "not_configured"]]]);
       fresh();
       eq("…a welcome while not configured: one row, no claim", [short(await send(welcome(ADMIN_A, ORG_A), half)), rows.map((r) => [r.status, r.error_code])], [["failed", "not_configured", true], [["failed", "not_configured"]]]);
       fresh();
@@ -218,8 +220,9 @@ async function main() {
       eq("the payload carries the platform's settings and the fixed text", [p.host, p.port, p.secure, p.user, p.from, p.to, p.subject], ["smtp.platform.stub", 465, true, SMTP_USER, FROM, ADMIN_A.email, "Your LMS password reset code"]);
       eq("…no Reply-To unless set", "replyTo" in p && p.replyTo !== undefined, false);
       eq("…the request is bounded by a signal (the 15 s wait)", sends()[0].init?.signal instanceof AbortSignal, true);
-      eq("the rows: the claim, then the outcome; each with the event, the organisation and the user id, no address, no content", rows.map((x) => [x.event_type, x.organization_id, x.to_user_id, x.status, x.error_code, x.error_detail]), [["platform_reset_code", ORG_A, ADMIN_A.userId, "suppressed", "pending", null], ["platform_reset_code", ORG_A, ADMIN_A.userId, "sent", null, null]]);
-      eq("each insert names only the log's columns", inserts().map((i) => Object.keys(JSON.parse(i.body)).sort()), [0, 1].map(() => ["error_code", "error_detail", "event_type", "organization_id", "status", "to_user_id"]));
+      eq("the rows: the claim, the in-flight row, then the outcome; each with the event, the organisation and the user id, no address, no content", rows.map((x) => [x.event_type, x.organization_id, x.to_user_id, x.status, x.error_code, x.error_detail]),
+        [["platform_reset_code", ORG_A, ADMIN_A.userId, "suppressed", "pending", null], ["platform_reset_code", ORG_A, ADMIN_A.userId, "suppressed", "in_flight", null], ["platform_reset_code", ORG_A, ADMIN_A.userId, "sent", null, null]]);
+      eq("each insert names only the log's columns", inserts().map((i) => Object.keys(JSON.parse(i.body)).sort()), [0, 1, 2].map(() => ["error_code", "error_detail", "event_type", "organization_id", "status", "to_user_id"]));
       fresh();
       await send(code(ADMIN_A, ORG_A), { ...ENV, PLATFORM_EMAIL_REPLY_TO: "help@platform-owner.stub", PLATFORM_SMTP_SECURE: "" , PLATFORM_SMTP_PORT: "587" });
       const p2 = JSON.parse(sends()[0].body) as Record<string, unknown>;
@@ -319,7 +322,7 @@ async function main() {
       fresh(); failRead = "account";
       eq("the account count fails: nothing sent, no row", [short(await send(code(ADMIN_A, ORG_A))), sends().length, inserts().length], [["failed", "log_unreadable", false], 0, 0]);
       fresh(); failRead = "count";
-      eq("the organisation count after the claim fails: nothing sent, the claim the only row", [short(await send(code(ADMIN_A, ORG_A))), sends().length, rows.map((r) => [r.status, r.error_code])], [["failed", "log_unreadable", false], 0, [["suppressed", "pending"]]]);
+      eq("the organisation's counts after the in-flight row fail: nothing sent, the claim and the in-flight row the only rows", [short(await send(code(ADMIN_A, ORG_A))), sends().length, rows.map((r) => [r.status, r.error_code])], [["failed", "log_unreadable", false], 0, [["suppressed", "pending"], ["suppressed", "in_flight"]]]);
       fresh(); failRead = "count";
       eq("the ceiling count fails (a welcome): the same", [short(await send(welcome(ADMIN_A, ORG_A))), sends().length, inserts().length], [["failed", "log_unreadable", false], 0, 0]);
       fresh(); tableMissing = true;

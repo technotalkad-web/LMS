@@ -55,27 +55,37 @@ export const SMTP_SEND_WAIT_MS = 15_000;
 
 /**
  * Each limit on a public code or link is claimed before the send (ADR 0029,
- * the note of 2026-11-22): the job writes its claim, then counts the rows
- * with its own among them, and goes on only within the limit. The same
- * three numbers hold in both systems (the platform's `pending` row, the
- * tenant's `queued` row).
+ * the notes of 2026-11-22): the job writes its claim, then counts its
+ * account's requests with its own among them, and goes on only within the
+ * account's limit. Only a request that passed its account's count writes a
+ * second row, the in-flight row, and the shares (an organisation's platform
+ * share, the platform's ceiling and a tenant's daily limit) count the rows
+ * sent and the in-flight rows, never the claims. The same two times and the
+ * one word hold in both systems: the platform's claim is a `suppressed` row
+ * with the word `pending`, the tenant's a `queued` row with the word
+ * `claim`, and the in-flight row is `suppressed` or `queued` with the word
+ * IN_FLIGHT_WORD.
  *
  * CLAIM_SEND_WITHIN_MS: a job starts its send no later than this after it
  * wrote its claim; later, it sends nothing.
  */
 export const CLAIM_SEND_WITHIN_MS = 30_000;
 /**
- * A claim counts as a send in flight for this long from its row's time,
- * against an organisation's share, the platform's ceiling and a tenant's
- * daily limit. It is at least the time to start the send, the send's own
- * wait, and a minute for the outcome's row and for two clocks that differ,
- * so a mail that went has its sent row before its claim stops counting.
+ * An in-flight row counts as a send in flight for this long from its row's
+ * time, against an organisation's share, the platform's ceiling and a
+ * tenant's daily limit. It is at least the time to start the send, the
+ * send's own wait, and a minute for the outcome's row and for two clocks
+ * that differ, so a mail that went has its sent row before its in-flight row
+ * stops counting.
  */
 export const CLAIM_IN_FLIGHT_MS = 120_000;
-/** At most this many claims of one account and kind count as in flight: no more of them can go in an hour. */
-export const CLAIMS_IN_FLIGHT_PER_ACCOUNT = 5;
-/** A read of the claims in flight asks for this many rows; a full page cannot be counted, and nothing is sent. */
-export const CLAIMS_IN_FLIGHT_PAGE = 1000;
+/**
+ * The word of an in-flight row, in both systems (the platform's error_code,
+ * the tenant's error). An in-flight row is never a request and never a send:
+ * the account counts read claims only, and the readers of sent and failed
+ * mail read neither row.
+ */
+export const IN_FLIGHT_WORD = "in_flight";
 
 /**
  * One exact count of an account's rows at or after a time: a read with
@@ -93,36 +103,20 @@ export type CountSince = (sinceIso: string) => PromiseLike<{ count: number | nul
  * sent on it.
  */
 export async function accountRequests(countSince: CountSince, nowMs: number, daily: boolean): Promise<{ hour: number; day: number | null } | null> {
-  // A count that throws, fails or answers no number is one that cannot be read.
-  const read = (sinceMs: number): Promise<number | null> =>
-    new Promise<{ count: number | null; error: unknown } | null>((resolve) => resolve(countSince(new Date(sinceMs).toISOString())))
-      .then((r) => (!r || r.error || typeof r.count !== "number" ? null : r.count))
-      .catch(() => null);
+  const read = (sinceMs: number): Promise<number | null> => exactCount(() => countSince(new Date(sinceMs).toISOString()));
   const [hour, day] = await Promise.all([read(nowMs - 3_600_000), daily ? read(nowMs - 24 * 3_600_000) : Promise.resolve(null)]);
   if (hour === null || (daily && day === null)) return null;
   return { hour, day: daily ? day : null };
 }
 
 /**
- * The sends in flight that a list of claims stands for: for each account and
- * kind at most CLAIMS_IN_FLIGHT_PER_ACCOUNT, and a claim with no account
- * counts by itself. So the claims of one address hold back no more of a
- * share than that address may use.
+ * The number an exact count answers (`count: "exact", head: true`), or null
+ * when it cannot be read: a count that throws, fails or answers no number.
  */
-export function claimsInFlight(rows: ReadonlyArray<{ to_user_id?: unknown; event_type?: unknown }>): number {
-  const byAccount = new Map<string, number>();
-  let alone = 0;
-  for (const r of rows) {
-    if (typeof r.to_user_id !== "string" || r.to_user_id.length === 0) {
-      alone++;
-      continue;
-    }
-    const key = `${r.to_user_id} ${String(r.event_type ?? "")}`;
-    byAccount.set(key, Math.min(CLAIMS_IN_FLIGHT_PER_ACCOUNT, (byAccount.get(key) ?? 0) + 1));
-  }
-  let n = alone;
-  for (const c of byAccount.values()) n += c;
-  return n;
+export function exactCount(count: () => PromiseLike<{ count: number | null; error: unknown }>): Promise<number | null> {
+  return new Promise<{ count: number | null; error: unknown } | null>((resolve) => resolve(count()))
+    .then((r) => (!r || r.error || typeof r.count !== "number" ? null : r.count))
+    .catch(() => null);
 }
 
 export type SmtpDispatchOptions = {

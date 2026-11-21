@@ -13,8 +13,8 @@
  *     ceiling) makes the authenticated status "degraded"; one timeout,
  *     unreachable or unknown row, or half the ceiling, is "warn";
  *     suppressed, refused, rejected and not_configured rows never move it,
- *     and neither does a claim (suppressed, pending), which hides no
- *     failure under it;
+ *     and neither does a claim (suppressed, pending) or an in-flight row
+ *     (suppressed, in_flight), which hides no failure under it;
  *   - the route, under a stubbed fetch: the `email` check ignores
  *     password_reset and magic_link rows and counts the rest; the
  *     unauthenticated answer is { status, ts } computed without the new
@@ -223,7 +223,7 @@ console.log("\nclassifyPlatformEmail (ADR 0029 section H)");
   eq("two failures in a row → fail", P({ newest: [row("failed", "timeout"), row("failed", "unknown")] }), { status: "fail", reasons: ["two_failures"] });
   eq("no time window: an old auth failure with nothing after it still fails", P({ newest: [row("failed", "auth")] }).status, "fail");
   eq("a delivered test after the failures clears it", P({ newest: [row("sent"), row("failed", "auth")] }).status, "ok");
-  for (const [label, r] of [["suppressed", row("suppressed", "test_domain")], ["refused (account)", row("refused", "account_limit")], ["refused (ceiling)", row("refused", "ceiling")], ["rejected", row("failed", "rejected")], ["not_configured", row("failed", "not_configured")]] as const) {
+  for (const [label, r] of [["suppressed", row("suppressed", "test_domain")], ["claim (pending)", row("suppressed", "pending")], ["in-flight", row("suppressed", "in_flight")], ["refused (account)", row("refused", "account_limit")], ["refused (ceiling)", row("refused", "ceiling")], ["rejected", row("failed", "rejected")], ["not_configured", row("failed", "not_configured")]] as const) {
     eq(`a ${label} row never moves it (newest, above a sent row)`, P({ newest: [r, r, row("sent")] }).status, "ok");
     eq(`…nor above a timeout row (still the one-row warn)`, P({ newest: [r, row("failed", "timeout"), row("sent")] }).status, "warn");
   }
@@ -601,6 +601,9 @@ async function routeTests() {
         // A claim (suppressed, pending: the note of 2026-11-22) is no send and no failure: it neither moves the check nor hides a row under it.
         ["configured, claims of codes and links above a sent row", () => { configure(true); platformRows = [...Array.from({ length: 30 }, (_, i) => ({ sent_at: minutesAgo(1 + i / 100), status: "suppressed", error_code: "pending" })), { sent_at: minutesAgo(9), status: "sent", error_code: null }]; }, "ok", "ok"],
         ["configured, claims above an auth failure", () => { configure(true); platformRows = [{ sent_at: minutesAgo(1), status: "suppressed", error_code: "pending" }, { sent_at: minutesAgo(2), status: "suppressed", error_code: "pending" }, { sent_at: minutesAgo(3), status: "failed", error_code: "auth" }]; }, "fail", "degraded"],
+        // An in-flight row (suppressed, in_flight: the later note of 2026-11-22) is no send and no failure either.
+        ["configured, in-flight rows of codes and links above a sent row", () => { configure(true); platformRows = [...Array.from({ length: 30 }, (_, i) => ({ sent_at: minutesAgo(1 + i / 100), status: "suppressed", error_code: "in_flight" })), { sent_at: minutesAgo(9), status: "sent", error_code: null }]; }, "ok", "ok"],
+        ["configured, in-flight rows above an auth failure", () => { configure(true); platformRows = [{ sent_at: minutesAgo(1), status: "suppressed", error_code: "in_flight" }, { sent_at: minutesAgo(2), status: "suppressed", error_code: "pending" }, { sent_at: minutesAgo(3), status: "failed", error_code: "auth" }]; }, "fail", "degraded"],
         ["configured, the log not there (0113 not pasted)", () => { configure(true); platformTableMissing = true; }, "fail", "degraded"],
         ["not configured", () => { configure(false); }, "fail", "degraded"],
       ];

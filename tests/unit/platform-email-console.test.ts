@@ -18,7 +18,8 @@
  *     mfa_required, and nothing is read, sent or written; at AAL2: sent;
  *   - the answer and the audit row say whether the sender's log row was
  *     written (logged);
- *   - /super/email's last send is never a claim (pending).
+ *   - /super/email's last send is never a claim (pending) or an in-flight
+ *     row (in_flight).
  *
  * ADR 0029 pull request B, stage 4 (step 17; rule FP4):
  *   - POST /api/super/email/limit: a platform owner sets an organisation's
@@ -404,6 +405,16 @@ async function main() {
       const lastSend = between(await render(), "Last send", "Sent in 24 hours");
       eq("the last send is never a claim: a pending row after a sent one shows the sent one",
         [lastSend.includes("platform_reset_code"), lastSend.includes("pending"), lastSend.includes("platform_sign_in_link")], [true, false, false]);
+      fresh();
+      page.orgs = [{ id: ORG_ID, name: "Tenant A" }];
+      page.log = [
+        { sent_at: "2026-11-21T10:06:00.000Z", event_type: "platform_sign_in_link", status: "suppressed", error_code: "in_flight" },
+        { sent_at: "2026-11-21T10:05:00.000Z", event_type: "platform_sign_in_link", status: "suppressed", error_code: "pending" },
+        { sent_at: "2026-11-21T10:00:00.000Z", event_type: "platform_reset_code", status: "sent", error_code: null },
+      ];
+      const lastAfterFlight = between(await render(), "Last send", "Sent in 24 hours");
+      eq("…nor an in-flight row: a pending row and an in-flight row after a sent one show the sent one",
+        [lastAfterFlight.includes("platform_reset_code"), lastAfterFlight.includes("in_flight"), lastAfterFlight.includes("pending"), lastAfterFlight.includes("platform_sign_in_link")], [true, false, false, false]);
       fresh();
       page.log = [{ sent_at: "2026-11-21T10:05:00.000Z", event_type: "platform_reset_code", status: "suppressed", error_code: "test_domain" }];
       eq("…a row the reserved domains stopped is still shown", between(await render(), "Last send", "Sent in 24 hours").includes("test_domain"), true);

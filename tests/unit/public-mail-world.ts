@@ -21,6 +21,9 @@
  *     (`sent24h` adds the organisation's mail sent before the test, which
  *     is not in `log`);
  *   - an insert-or-ignore that finds its row answers no row;
+ *   - a table's reads or inserts can fail as a whole (failing,
+ *     writeFailing), and one chosen read or write on its own (failRead,
+ *     failWrite);
  *   - every database call is answered from the rows as they are when it
  *     arrives, and the answer is handed back after a wait (`readDelayMs`,
  *     else one turn of the event loop), so that jobs started together
@@ -91,6 +94,8 @@ export type World = {
   smtpDelayMs: number;
   /** A read for which this answers true fails (a read that fails after an earlier one did not). */
   failRead: ((r: Req) => boolean) | null;
+  /** A write (an insert, an update or a function call that is not a read) for which this answers true fails: one chosen write, as failRead fails one chosen read. */
+  failWrite: ((r: Req) => boolean) | null;
   /** notification_log's status check: "no_queued" refuses the word queued, as a database whose check lacks it would. */
   logCheck: "ok" | "no_queued";
 };
@@ -128,6 +133,7 @@ export function freshWorld(over: Partial<World> = {}): World {
     writeFailing: new Set(),
     smtpDelayMs: 0,
     failRead: null,
+    failWrite: null,
     logCheck: "ok",
     ...over,
   };
@@ -290,6 +296,7 @@ const serve = async (input: RequestInfo | URL, init?: RequestInit): Promise<Resp
     return json({ code: "XX000", message: "stub read failure" }, 500);
   }
   if (method === "POST" && world.writeFailing.has(table)) return json({ code: "XX000", message: "stub write failure" }, 500);
+  if (!isRead && world.failWrite?.(me)) return json({ code: "XX000", message: "stub write failure" }, 500);
 
   switch (table) {
     case "organizations": {

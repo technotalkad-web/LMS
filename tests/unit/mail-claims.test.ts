@@ -1,8 +1,11 @@
 /**
  * Each limit on a public reset code or sign-in link is claimed before the
- * send (ADR 0029, the note of 2026-11-22): a job writes its claim, then
- * counts the rows with its own claim among them, and goes on only within
- * the limit. So the limits hold under concurrent requests:
+ * send (ADR 0029, the notes of 2026-11-22): a job writes its claim, then
+ * counts its account's requests with its own claim among them, and goes on
+ * only within the account's limit. Only a request that passed its
+ * account's count writes its in-flight row, and the shares count the rows
+ * sent and the in-flight rows, never a claim. So the limits hold under
+ * concurrent requests:
  *   - the account limit (5 in the hour, 10 in the day), in both systems;
  *   - the organisation's platform share and the platform's ceiling;
  *   - the organisation's own daily limit for its codes and links.
@@ -14,16 +17,21 @@
  * together is asserted as "at most the limit", never as an exact number:
  * a claim may refuse more than it must, never less.
  *
- * Each account count is exact (a count of the rows its limit names, with no
- * page), and the account limits hold hour after hour on a moved clock: at
- * the limit, a burst of requests at once, then requests one by one.
+ * Each account count is exact (a count of the claims its limit names, with
+ * no page), and the account limits hold hour after hour on a moved clock: at
+ * the limit, a burst of requests at once, then requests one by one. The
+ * in-flight rows of one account and kind are at most five, however many of
+ * its requests run at once, and requests for one account never hold back
+ * another account's code or link: its claims count against nobody else.
  *
- * Also: the shared times and the count of claims in flight; a reset code's
- * row written closed and opened only after every limit; a claim older than
- * the send window sends nothing; a claim or a count that cannot be written
- * or read sends nothing; the fallbacks of a database without 0114, each on
- * its own; the welcome, the alert and the test write no claim; the calls
- * before the answer are the same for a known and an unknown address.
+ * Also: the shared times and the word; each path's rows in order; a reset
+ * code's row written closed and opened only after every limit; a claim older
+ * than the send window sends nothing; a claim, an in-flight row or a count
+ * that cannot be written or read sends nothing on the platform, and on a
+ * tenant in-flight rows that cannot be counted are no reading of the daily
+ * limit; the fallbacks of a database without 0114, each on its own; the
+ * welcome, the alert and the test write no claim; the calls before the
+ * answer are the same for a known and an unknown address.
  *
  * No database, no network.
  *
@@ -34,7 +42,7 @@ import {
   ORG, OTHER_ORG, PLATFORM_ENV, SLUG, SUPABASE, ask, captureLogs, eq, finish, freshWorld, handed, install, requests, uninstall, world,
   type Asked, type Req, type Row,
 } from "./public-mail-world";
-import { CLAIMS_IN_FLIGHT_PAGE, CLAIM_IN_FLIGHT_MS, CLAIM_SEND_WITHIN_MS, SMTP_SEND_WAIT_MS, accountRequests, claimsInFlight } from "../../lib/email/smtp-function";
+import { CLAIM_IN_FLIGHT_MS, CLAIM_SEND_WITHIN_MS, IN_FLIGHT_WORD, SMTP_SEND_WAIT_MS, accountRequests } from "../../lib/email/smtp-function";
 import { claimPlatformSend, sendPlatformEmail, type PlatformSendRequest } from "../../lib/email/platform-sender";
 import { hashOtp } from "../../lib/auth/password-reset";
 
@@ -45,6 +53,8 @@ const ADMIN_X = { id: id(3), email: "admin-x@tenant.stub" };
 const ADMIN_Y = { id: id(4), email: "admin-y@tenant.stub" };
 const LEARNER_X = { id: id(5), email: "learner-x@tenant.stub" };
 const LEARNER_Y = { id: id(6), email: "learner-y@tenant.stub" };
+/** An administrator of the other organisation. */
+const ADMIN_B = { id: id(7), email: "admin-b@tenant-b.stub" };
 const many = (n: number, from: number, role: "admin" | "user") =>
   Array.from({ length: n }, (_, i) => ({ id: id(from + i), email: `${role}-${from + i}@tenant.stub`, role }));
 const ADMINS = many(40, 100, "admin");
@@ -58,13 +68,16 @@ const LINK = "https://lms.stub/auth/finish?token_hash=t&type=magiclink";
 type Route = { POST: (r: Request) => Promise<Response> };
 type Kind = { name: string; path: string; route: Route; tenantEvent: "password_reset" | "magic_link"; platformEvent: "platform_reset_code" | "platform_sign_in_link" };
 
-/** Every account the tests use, as members of the organisation. */
+/** Every account the tests use, as members of the organisation, and one administrator of the other. */
 function base(over: Parameters<typeof freshWorld>[0] = {}) {
   const people = [ADMIN, LEARNER, ADMIN_X, ADMIN_Y, LEARNER_X, LEARNER_Y, ...ADMINS, ...LEARNERS];
   const role = (p: { id: string }) => ([ADMIN, ADMIN_X, ADMIN_Y].some((a) => a.id === p.id) || ADMINS.some((a) => a.id === p.id) ? "admin" : "user");
   freshWorld({
-    users: people.map((p) => ({ id: p.id, email: p.email })),
-    members: people.map((p) => ({ organization_id: ORG, user_id: p.id, role: role(p), status: "active" })),
+    users: [...people, ADMIN_B].map((p) => ({ id: p.id, email: p.email })),
+    members: [
+      ...people.map((p) => ({ organization_id: ORG, user_id: p.id, role: role(p), status: "active" })),
+      { organization_id: OTHER_ORG, user_id: ADMIN_B.id, role: "admin", status: "active" },
+    ],
     ...over,
   });
 }
@@ -111,10 +124,15 @@ const jobLines = (lines: string[]) =>
 
 const dispatched = (host: "platform" | "tenant") => requests.filter((r) => r.path === "/functions/v1/send-smtp" && (r.body as Row).host === `smtp.${host}.stub`);
 const platformRowsOf = (pred: (r: Row) => boolean) => world.platformLog.filter(pred);
-const claimsOfPlatform = () => platformRowsOf((r) => r.status === "suppressed" && r.error_code === "pending");
-const outcomesOfPlatform = (event: string) => platformRowsOf((r) => r.event_type === event && !(r.status === "suppressed" && r.error_code === "pending"));
-const tenantClaims = (event: string) => world.log.filter((r) => r.event_type === event && r.status === "queued");
+const isPlatformClaim = (r: Row) => r.status === "suppressed" && r.error_code === "pending";
+const isPlatformInFlight = (r: Row) => r.status === "suppressed" && r.error_code === IN_FLIGHT_WORD;
+const claimsOfPlatform = () => platformRowsOf(isPlatformClaim);
+const inFlightOfPlatform = (userId?: string, event?: string) => platformRowsOf((r) => isPlatformInFlight(r) && (!userId || r.to_user_id === userId) && (!event || r.event_type === event));
+const outcomesOfPlatform = (event: string) => platformRowsOf((r) => r.event_type === event && !isPlatformClaim(r) && !isPlatformInFlight(r));
+const tenantClaims = (event: string) => world.log.filter((r) => r.event_type === event && r.status === "queued" && r.error === "claim");
+const tenantInFlight = (event?: string, userId?: string) => world.log.filter((r) => r.status === "queued" && r.error === IN_FLIGHT_WORD && (!event || r.event_type === event) && (!userId || r.to_user_id === userId));
 const tenantSent = (event: string) => world.log.filter((r) => r.event_type === event && r.status === "sent");
+const dailyLimitRows = () => world.log.filter((r) => r.error === "daily_limit");
 const openCodes = (email: string) => world.otps.filter((r) => r.email === email && r.used_at === null);
 
 /** The codes the mails carried: the tenant's "# 123456" line or the platform's code line. */
@@ -137,6 +155,8 @@ type Ask = () => Promise<Array<() => unknown>>;
 /** A burst at the limit: this many requests at once for one account. */
 const BURST = 150;
 const HOURS = 3;
+/** The requests at once for one account in the cases where another account's mail must still go. */
+const AT_ONCE = 1200;
 
 /**
  * Hour after hour on a moved clock (61 minutes apart, so all of them lie
@@ -203,6 +223,16 @@ const seedPlatform = (n: number, row: Row, msAgo: (i: number) => number) => {
 const seedTenant = (n: number, row: Row, msAgo: (i: number) => number) => {
   for (let i = 0; i < n; i++) world.log.push({ id: `seed-t-${world.log.length}`, organization_id: ORG, error: null, ...row, sent_at: ago(msAgo(i)) });
 };
+/** A platform request that passed its account's count: its claim and its in-flight row. */
+const seedPlatformPassed = (n: number, row: Row, msAgo: (i: number) => number) => {
+  seedPlatform(n, { ...row, status: "suppressed", error_code: "pending" }, msAgo);
+  seedPlatform(n, { ...row, status: "suppressed", error_code: IN_FLIGHT_WORD }, msAgo);
+};
+/** A tenant link that passed its account's count: its claim and its in-flight row. */
+const seedTenantPassed = (n: number, row: Row, msAgo: (i: number) => number) => {
+  seedTenant(n, { ...row, status: "queued", error: "claim" }, msAgo);
+  seedTenant(n, { ...row, status: "queued", error: IN_FLIGHT_WORD }, msAgo);
+};
 
 async function main() {
   install(PLATFORM_ENV);
@@ -214,16 +244,11 @@ async function main() {
     const KINDS = [CODE, LINK_KIND];
     const db = createClient(SUPABASE, "stub-service-key-0029", { auth: { persistSession: false } });
 
-    console.log("\nthe times and the count of claims in flight");
+    console.log("\nthe times and the word");
     {
-      eq("a send starts within 30 s of its claim; a claim counts in flight for two minutes", [CLAIM_SEND_WITHIN_MS, CLAIM_IN_FLIGHT_MS], [30_000, 120_000]);
+      eq("a send starts within 30 s of its claim; an in-flight row counts for two minutes", [CLAIM_SEND_WITHIN_MS, CLAIM_IN_FLIGHT_MS], [30_000, 120_000]);
       eq("…two minutes cover the start, the send's own wait and a minute for the outcome's row and two clocks", CLAIM_IN_FLIGHT_MS >= CLAIM_SEND_WITHIN_MS + SMTP_SEND_WAIT_MS + 60_000, true);
-      eq("…a read of claims asks for a page of 1,000", CLAIMS_IN_FLIGHT_PAGE, 1000);
-      const of = (user: string | null, event: string, n: number) => Array.from({ length: n }, () => ({ to_user_id: user, event_type: event }));
-      eq("400 claims of one account and kind count as five", claimsInFlight(of("u1", "platform_sign_in_link", 400)), 5);
-      eq("…another kind of that account counts apart, and so does another account", claimsInFlight([...of("u1", "magic_link", 7), ...of("u1", "password_reset", 2), ...of("u2", "magic_link", 3)]), 5 + 2 + 3);
-      eq("…a claim with no account counts by itself", claimsInFlight([...of(null, "magic_link", 7), ...of("u1", "magic_link", 9)]), 7 + 5);
-      eq("…no claims, none", claimsInFlight([]), 0);
+      eq("one word for an in-flight row, in both systems", IN_FLIGHT_WORD, "in_flight");
       const at = Date.now();
       const byWindow = (sinceIso: string) => Promise.resolve({ count: at - Date.parse(sinceIso) > 2 * 3_600_000 ? 9 : 4, error: null });
       eq("an account's requests: two exact counts, the hour's and the day's", await accountRequests(byWindow, at, true), { hour: 4, day: 9 });
@@ -250,30 +275,37 @@ async function main() {
       eq("jobs started together each read the table as it was on arrival, before any of their rows", [seen.length, seen.every((n) => n === 0), platformRowsOf((r) => r.event_type === "world_check").length], [40, true, 40]);
     }
 
-    console.log("\neach path sends one request, and five one after another; the sixth is refused, counted once");
+    console.log("\neach path sends one request with its rows in order, and five one after another; the sixth is refused, counted once");
     for (const kind of KINDS) {
+      const tenantRows = () => world.log.map((r) => [r.event_type, r.status, r.error]);
+      const tenantOrder = kind === CODE
+        ? [[kind.tenantEvent, "queued", IN_FLIGHT_WORD], [kind.tenantEvent, "sent", null]]
+        : [[kind.tenantEvent, "queued", "claim"], [kind.tenantEvent, "queued", IN_FLIGHT_WORD], [kind.tenantEvent, "sent", null]];
       base();
       await one(kind, { email: LEARNER.email, orgSlug: SLUG });
-      eq(`tenant ${kind.name}: one request sends: its claim, then its row`, [dispatched("tenant").length, world.log.map((r) => [r.event_type, r.status])], [1, [[kind.tenantEvent, "queued"], [kind.tenantEvent, "sent"]]]);
+      eq(`tenant ${kind.name}: one request sends: ${kind === CODE ? "its in-flight row (its claim is its closed code row)" : "its claim, its in-flight row"}, then its row`, [dispatched("tenant").length, tenantRows()], [1, tenantOrder]);
       base();
       let sends = 0;
       for (let i = 0; i < 5; i++) { await one(kind, { email: LEARNER.email, orgSlug: SLUG }); sends += dispatched("tenant").length; }
-      eq(`tenant ${kind.name}: five one after another all send, with five claims and five rows`, [sends, tenantClaims(kind.tenantEvent).length, tenantSent(kind.tenantEvent).length], [5, 5, 5]);
+      const claimsOf = () => (kind === CODE ? world.otps.filter((r) => r.email === LEARNER.email).length : tenantClaims(kind.tenantEvent).length);
+      eq(`tenant ${kind.name}: five one after another all send, with five claims, five in-flight rows and five rows`, [sends, claimsOf(), tenantInFlight(kind.tenantEvent).length, tenantSent(kind.tenantEvent).length], [5, 5, 5, 5]);
       const sixth = jobLines(await one(kind, { email: LEARNER.email, orgSlug: SLUG }));
-      eq(`tenant ${kind.name}: the sixth is refused for the account, with no claim and no send`, [sixth.map((l) => l.outcome), dispatched("tenant").length, tenantClaims(kind.tenantEvent).length], [["account_limit"], 0, 5]);
+      eq(`tenant ${kind.name}: the sixth is refused for the account, with no claim, no in-flight row and no send`, [sixth.map((l) => l.outcome), dispatched("tenant").length, claimsOf(), tenantInFlight(kind.tenantEvent).length], [["account_limit"], 0, 5, 5]);
 
       base();
       await one(kind, { email: ADMIN.email });
-      eq(`platform ${kind.name}: one request sends: its claim, then its row`, [dispatched("platform").length, world.platformLog.map((r) => [r.event_type, r.status, r.error_code])], [1, [[kind.platformEvent, "suppressed", "pending"], [kind.platformEvent, "sent", null]]]);
+      eq(`platform ${kind.name}: one request sends: its claim, its in-flight row, then its row`, [dispatched("platform").length, world.platformLog.map((r) => [r.event_type, r.status, r.error_code])],
+        [1, [[kind.platformEvent, "suppressed", "pending"], [kind.platformEvent, "suppressed", IN_FLIGHT_WORD], [kind.platformEvent, "sent", null]]]);
       base();
       sends = 0;
       for (let i = 0; i < 5; i++) { await one(kind, { email: ADMIN.email }); sends += dispatched("platform").length; }
-      eq(`platform ${kind.name}: five one after another all send, with five claims and five rows`, [sends, claimsOfPlatform().length, outcomesOfPlatform(kind.platformEvent).filter((r) => r.status === "sent").length], [5, 5, 5]);
+      eq(`platform ${kind.name}: five one after another all send, with five claims, five in-flight rows and five rows`,
+        [sends, claimsOfPlatform().length, inFlightOfPlatform().length, outcomesOfPlatform(kind.platformEvent).filter((r) => r.status === "sent").length], [5, 5, 5, 5]);
       const sixthAdmin = jobLines(await one(kind, { email: ADMIN.email }));
       // A code's account limit is read on its code rows first; a link's in the sender, which writes one refused row.
-      eq(`platform ${kind.name}: the sixth is refused for the account, with no claim and no send`,
-        [dispatched("platform").length, claimsOfPlatform().length, outcomesOfPlatform(kind.platformEvent).filter((r) => r.status === "refused").map((r) => r.error_code), sixthAdmin.map((l) => l.code ?? l.outcome)],
-        [0, 5, kind === CODE ? [] : ["account_limit"], ["account_limit"]]);
+      eq(`platform ${kind.name}: the sixth is refused for the account, with no claim, no in-flight row and no send`,
+        [dispatched("platform").length, claimsOfPlatform().length, inFlightOfPlatform().length, outcomesOfPlatform(kind.platformEvent).filter((r) => r.status === "refused").map((r) => r.error_code), sixthAdmin.map((l) => l.code ?? l.outcome)],
+        [0, 5, 5, kind === CODE ? [] : ["account_limit"], ["account_limit"]]);
     }
 
     console.log("\nthe platform sender alone: one account, one kind (60 at once)");
@@ -283,7 +315,7 @@ async function main() {
       const req: PlatformSendRequest<"platform_sign_in_link"> = { event: "platform_sign_in_link", to, organizationId: ORG, content: { link: LINK, minutes: 60 } };
       requests.length = 0;
       const { value: results } = await captureLogs(() => Promise.all(Array.from({ length: 60 }, () => sendPlatformEmail(req, { db, env: PLATFORM_ENV }))));
-      eq("60 at once: at most 5 sends", [dispatched("platform").length <= 5, results.filter((r) => r.status === "sent").length <= 5], [true, true]);
+      eq("60 at once: at most 5 sends, and at most 5 in-flight rows", [dispatched("platform").length <= 5, results.filter((r) => r.status === "sent").length <= 5, inFlightOfPlatform(ADMIN.id).length <= 5], [true, true, true]);
       eq("…the rest are refused for the account, never sent", results.every((r) => r.status === "sent" || (r.status === "refused" && r.errorCode === "account_limit")), true);
       base({ smtpDelayMs: 1500 });
       requests.length = 0;
@@ -306,6 +338,7 @@ async function main() {
       const { answers } = await together(kind, Array.from({ length: 40 }, () => ({ email: ADMIN.email })));
       eq(`${kind.name}: every answer is the same 200`, answers.every((a) => a.status === 200 && a.body === answers[0].body), true);
       eq(`${kind.name}: at most 5 mails go`, [dispatched("platform").length <= 5, outcomesOfPlatform(kind.platformEvent).filter((r) => r.status === "sent").length <= 5], [true, true]);
+      eq(`${kind.name}: at most 5 in-flight rows for that account and kind`, inFlightOfPlatform(ADMIN.id, kind.platformEvent).length <= 5, true);
       if (kind === CODE) {
         const sentHashes = new Set(mailedCodes().map((c) => hashOtp(c)));
         eq("…every new open code row belongs to a request whose mail went", openCodes(ADMIN.email).filter((r) => r.id !== "otp-older").every((r) => sentHashes.has(String(r.code_hash))), true);
@@ -399,7 +432,7 @@ async function main() {
       }
     }
 
-    console.log("\neach account count is an exact count of the note's rows: a count of the rows, with no page");
+    console.log("\neach account count is an exact count of the account's claims: a count of the rows, with no page");
     {
       /** The reads of one account's rows: by its user id, or by its address for code rows. */
       const accountReads = (table: string) => requests.filter((r) => r.table === table && (r.method === "GET" || r.method === "HEAD") && (r.query.has("to_user_id") || r.query.has("email")));
@@ -417,20 +450,33 @@ async function main() {
         const spans = reads.map((r) => Date.parse((r.query.get("sent_at") ?? r.query.get("created_at") ?? "").slice(4)));
         eq(`${label}: …two of them read the hour and two the day`, [spans.filter((t) => Date.now() - t <= 3_600_000 + 60_000).length, spans.filter((t) => Date.now() - t >= 24 * 3_600_000 - 60_000).length], [2, 2]);
       };
+      const platformKeys = ["error_code", "event_type", "select", "sent_at", "status", "to_user_id"];
+      const platformRequests = "in.(pending,test_domain,not_allowed)";
       base();
       await one(LINK_KIND, { email: ADMIN.email });
-      check("platform link", accountReads("platform_email_log"), ["event_type", "select", "sent_at", "status", "to_user_id"], { event_type: "eq.platform_sign_in_link", status: "eq.suppressed" });
+      check("platform link", accountReads("platform_email_log"), platformKeys, { event_type: "eq.platform_sign_in_link", status: "eq.suppressed", error_code: platformRequests });
       base();
       await one(CODE, { email: ADMIN.email });
-      check("platform code, the sender's account", accountReads("platform_email_log"), ["event_type", "select", "sent_at", "status", "to_user_id"], { event_type: "eq.platform_reset_code", status: "eq.suppressed" });
+      check("platform code, the sender's account", accountReads("platform_email_log"), platformKeys, { event_type: "eq.platform_reset_code", status: "eq.suppressed", error_code: platformRequests });
       check("platform code, the address's code rows", accountReads("password_reset_otps"), ["created_at", "email", "select"], {});
       base();
       await one(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG });
-      check("tenant link", accountReads("notification_log"), ["event_type", "select", "sent_at", "status", "to_user_id"], { event_type: "eq.magic_link", status: "eq.queued" });
+      check("tenant link", accountReads("notification_log"), ["error", "event_type", "select", "sent_at", "status", "to_user_id"], { event_type: "eq.magic_link", status: "eq.queued", error: "eq.claim" });
       base();
       await one(CODE, { email: LEARNER.email, orgSlug: SLUG });
       check("tenant code, the address's code rows", accountReads("password_reset_otps"), ["created_at", "email", "select"], {});
       eq("…a tenant code reads no account count of links", accountReads("notification_log").length, 0);
+      // The shares' counts read no rows either: exact counts of the in-flight rows.
+      base();
+      await one(LINK_KIND, { email: ADMIN.email });
+      const flightReads = requests.filter((r) => r.table === "platform_email_log" && r.query.get("error_code") === `eq.${IN_FLIGHT_WORD}`);
+      eq("platform: the organisation's in-flight rows and every in-flight row, two exact counts from two minutes ago, with no page or order",
+        [flightReads.length, flightReads.every((r) => shape(r).exact && !r.query.has("limit") && !r.query.has("order")), flightReads.map((r) => r.query.has("organization_id")).sort()], [2, true, [false, true]]);
+      base();
+      await one(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG });
+      const tenantFlight = requests.filter((r) => r.table === "notification_log" && r.query.get("error") === `eq.${IN_FLIGHT_WORD}`);
+      eq("tenant: the organisation's in-flight rows, one exact count, with no page or order",
+        [tenantFlight.length, tenantFlight.every((r) => shape(r).exact && !r.query.has("limit") && !r.query.has("order") && r.query.get("organization_id") === `eq.${ORG}`)], [1, true]);
     }
 
     console.log("\nan organisation's share and the ceiling, many accounts at once");
@@ -440,7 +486,7 @@ async function main() {
       const { lines } = await together(LINK_KIND, ADMINS.map((a) => ({ email: a.email })));
       const orgSent = () => platformRowsOf((r) => r.organization_id === ORG && r.status === "sent" && (r.event_type === "platform_sign_in_link" || r.event_type === "platform_reset_code")).length;
       eq("40 administrators of one organisation, 3 short of its share of 50: no more than 3 go", [dispatched("platform").length <= 3, orgSent() <= 50], [true, true]);
-      eq("…the others are refused by the share (non-vacuous: the claims were counted)", jobLines(lines).some((l) => l.code === "org_limit"), true);
+      eq("…the others are refused by the share (non-vacuous: the in-flight rows were counted)", jobLines(lines).some((l) => l.code === "org_limit"), true);
       base();
       seedPlatform(372, { event_type: "platform_admin_welcome", organization_id: OTHER_ORG, to_user_id: id(902), status: "sent" }, () => 60 * MIN);
       const ceiling = await withEnv({ PLATFORM_EMAIL_ORG_DAILY_LIMIT: "1000" }, () => together(LINK_KIND, ADMINS.map((a) => ({ email: a.email }))));
@@ -454,6 +500,7 @@ async function main() {
       if (kind === CODE) world.otps.push({ id: "otp-older", email: LEARNER.email, code_hash: hashOtp("333333"), created_at: ago(30 * MIN), used_at: null, attempts: 0, expires_at: new Date(Date.now() + 5 * MIN).toISOString() });
       await together(kind, Array.from({ length: 40 }, () => ({ email: LEARNER.email, orgSlug: SLUG })));
       eq(`${kind.name}: at most 5 go through the organisation's SMTP`, [dispatched("tenant").length <= 5, tenantSent(kind.tenantEvent).length <= 5], [true, true]);
+      eq(`${kind.name}: at most 5 in-flight rows for that account and kind`, tenantInFlight(kind.tenantEvent, LEARNER.id).length <= 5, true);
       if (kind === CODE) {
         const sentHashes = new Set(mailedCodes().map((c) => hashOtp(c)));
         eq("…every new open code row is one that was mailed", openCodes(LEARNER.email).filter((r) => r.id !== "otp-older").every((r) => sentHashes.has(String(r.code_hash))), true);
@@ -476,50 +523,78 @@ async function main() {
       eq("…the same for codes: at most 5 go, the rest read daily_limit", [dispatched("tenant").length <= 5, jobLines(codes.lines).filter((l) => l.outcome !== "sent").every((l) => l.outcome === "daily_limit" || l.code === "daily_limit")], [true, true]);
     }
 
-    console.log("\nthe claims of one account count as five: another account still goes");
+    console.log("\nthe shares count the in-flight rows of requests that passed their account's count");
     {
       base();
       seedPlatform(44, { event_type: "platform_reset_code", organization_id: ORG, to_user_id: id(903), status: "sent" }, () => 60 * MIN);
-      seedPlatform(400, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN_X.id, status: "suppressed", error_code: "pending" }, () => 30_000);
+      seedPlatformPassed(5, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN_X.id }, () => 30_000);
       await one(LINK_KIND, { email: ADMIN_Y.email });
-      eq("platform: 400 claims of one administrator in flight, the share 6 short: another administrator's link goes", dispatched("platform").length, 1);
+      eq("platform: five in-flight rows of another administrator, the share six short: the next link goes", dispatched("platform").length, 1);
+      base();
+      seedPlatform(45, { event_type: "platform_reset_code", organization_id: ORG, to_user_id: id(903), status: "sent" }, () => 60 * MIN);
+      seedPlatformPassed(5, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN_X.id }, () => 30_000);
+      const refused = jobLines(await one(LINK_KIND, { email: ADMIN_Y.email }));
+      eq("…five short: refused by the share", [dispatched("platform").length, refused.map((l) => l.code)], [0, ["org_limit"]]);
       base({ dailyLimit: 30, sent24h: 24 });
-      seedTenant(400, { event_type: "magic_link", to_user_id: LEARNER_X.id, status: "queued", error: "claim" }, () => 30_000);
+      seedTenantPassed(5, { event_type: "magic_link", to_user_id: LEARNER_X.id }, () => 30_000);
       await one(LINK_KIND, { email: LEARNER_Y.email, orgSlug: SLUG });
-      eq("tenant: 400 claims of one learner in flight, the daily limit 6 short: another learner's link goes", dispatched("tenant").length, 1);
+      eq("tenant: five in-flight rows of another learner, the daily limit six short: the next link goes", dispatched("tenant").length, 1);
+      base({ dailyLimit: 30, sent24h: 25 });
+      seedTenantPassed(5, { event_type: "magic_link", to_user_id: LEARNER_X.id }, () => 30_000);
+      const tl = jobLines(await one(LINK_KIND, { email: LEARNER_Y.email, orgSlug: SLUG }));
+      eq("…five short: not attempted, daily_limit", [dispatched("tenant").length, tl.map((l) => l.outcome)], [0, ["daily_limit"]]);
     }
 
-    console.log("\na full page of claims in flight cannot be counted, and nothing is sent");
+    console.log("\na claim with no in-flight row counts against nobody else");
     {
       base();
-      for (let a = 0; a < CLAIMS_IN_FLIGHT_PAGE / 5; a++) seedPlatform(5, { event_type: "platform_sign_in_link", organization_id: OTHER_ORG, to_user_id: id(10_000 + a), status: "suppressed", error_code: "pending" }, () => 30_000);
-      const pl = jobLines(await one(LINK_KIND, { email: ADMIN.email }));
-      eq("platform: a page of 1,000 claims back reads as a limit that cannot be read: nothing sent", [dispatched("platform").length, pl.map((l) => l.code)], [0, ["log_unreadable"]]);
-      base();
-      for (let a = 0; a < CLAIMS_IN_FLIGHT_PAGE / 5; a++) seedTenant(5, { event_type: "magic_link", to_user_id: id(20_000 + a), status: "queued", error: "claim" }, () => 30_000);
-      const tl = jobLines(await one(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG }));
-      eq("tenant: a page of 1,000 claims back reads as the daily limit reached: not attempted", [dispatched("tenant").length, tl.map((l) => l.outcome)], [0, ["daily_limit"]]);
+      seedPlatform(49, { event_type: "platform_reset_code", organization_id: ORG, to_user_id: id(903), status: "sent" }, () => 60 * MIN);
+      seedPlatform(400, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN_X.id, status: "suppressed", error_code: "pending" }, () => 30_000);
+      await one(LINK_KIND, { email: ADMIN_Y.email });
+      eq("platform: 400 claims of one administrator with no in-flight row, the share one short: another administrator's link goes", dispatched("platform").length, 1);
+      base({ dailyLimit: 30, sent24h: 29 });
+      seedTenant(400, { event_type: "magic_link", to_user_id: LEARNER_X.id, status: "queued", error: "claim" }, () => 30_000);
+      await one(LINK_KIND, { email: LEARNER_Y.email, orgSlug: SLUG });
+      eq("tenant: 400 claims of one learner with no in-flight row, the daily limit one short: another learner's link goes", dispatched("tenant").length, 1);
     }
 
-    console.log("\na claim older than two minutes with no outcome");
+    console.log(`\nrequests at once for one account hold back no other account's mail (${AT_ONCE} at once)`);
+    {
+      base();
+      const burst = await together(LINK_KIND, Array.from({ length: AT_ONCE }, () => ({ email: ADMIN.email })));
+      eq(`platform: ${AT_ONCE} link requests at once for one administrator ran, at most 5 went, with at most 5 in-flight rows`,
+        [burst.answers.length, dispatched("platform").length <= 5, inFlightOfPlatform(ADMIN.id, "platform_sign_in_link").length <= 5], [AT_ONCE, true, true]);
+      const other = jobLines(await one(LINK_KIND, { email: ADMIN_B.email }));
+      eq("…then one link for an administrator of another organisation is sent, and its line reads sent",
+        [dispatched("platform").length, platformRowsOf((r) => r.to_user_id === ADMIN_B.id && r.status === "sent").length, other.map((l) => l.outcome)], [1, 1, ["sent"]]);
+      base();
+      const tenantBurst = await together(LINK_KIND, Array.from({ length: AT_ONCE }, () => ({ email: LEARNER.email, orgSlug: SLUG })));
+      eq(`tenant: on a day with nothing sent, ${AT_ONCE} link requests at once for one learner ran, at most 5 went, with at most 5 in-flight rows`,
+        [tenantBurst.answers.length, tenantSent("magic_link").length <= 5, tenantInFlight("magic_link", LEARNER.id).length <= 5], [AT_ONCE, true, true]);
+      const next = jobLines(await one(LINK_KIND, { email: LEARNER_Y.email, orgSlug: SLUG }));
+      eq("…then one link for another learner of the organisation is sent, with no daily_limit row and no alert due",
+        [dispatched("tenant").length, next.map((l) => l.outcome), dailyLimitRows().length, world.state?.alert_due_at ?? null], [1, ["sent"], 0, null]);
+    }
+
+    console.log("\nan in-flight row older than two minutes");
     {
       base();
       seedPlatform(49, { event_type: "platform_reset_code", organization_id: ORG, to_user_id: id(904), status: "sent" }, () => 60 * MIN);
-      seedPlatform(1, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN_X.id, status: "suppressed", error_code: "pending" }, () => 3 * MIN);
+      seedPlatformPassed(1, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN_X.id }, () => 3 * MIN);
       await one(LINK_KIND, { email: ADMIN_Y.email });
       eq("platform: no longer in flight (the share's last place still goes)", dispatched("platform").length, 1);
       base();
-      seedPlatform(5, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN_Y.id, status: "suppressed", error_code: "pending" }, (i) => 3 * MIN + i * MIN);
+      seedPlatformPassed(5, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN_Y.id }, (i) => 3 * MIN + i * MIN);
       const lines = jobLines(await one(LINK_KIND, { email: ADMIN_Y.email }));
-      eq("…and still a request for its hour (five such claims: refused)", [dispatched("platform").length, lines.map((l) => l.code)], [0, ["account_limit"]]);
+      eq("…its claim still counts as a request for its hour (five such claims: refused)", [dispatched("platform").length, lines.map((l) => l.code)], [0, ["account_limit"]]);
       base({ dailyLimit: 30, sent24h: 29 });
-      seedTenant(1, { event_type: "magic_link", to_user_id: LEARNER_X.id, status: "queued", error: "claim" }, () => 3 * MIN);
+      seedTenantPassed(1, { event_type: "magic_link", to_user_id: LEARNER_X.id }, () => 3 * MIN);
       await one(LINK_KIND, { email: LEARNER_Y.email, orgSlug: SLUG });
       eq("tenant: no longer in flight (the day's last place still goes)", dispatched("tenant").length, 1);
       base();
-      seedTenant(5, { event_type: "magic_link", to_user_id: LEARNER_Y.id, status: "queued", error: "claim" }, (i) => 3 * MIN + i * MIN);
+      seedTenantPassed(5, { event_type: "magic_link", to_user_id: LEARNER_Y.id }, (i) => 3 * MIN + i * MIN);
       const tl = jobLines(await one(LINK_KIND, { email: LEARNER_Y.email, orgSlug: SLUG }));
-      eq("…and still a request for its hour", [dispatched("tenant").length, tl.map((l) => l.outcome)], [0, ["account_limit"]]);
+      eq("…its claim still counts as a request for its hour", [dispatched("tenant").length, tl.map((l) => l.outcome)], [0, ["account_limit"]]);
     }
 
     console.log("\na job that reaches its send more than 30 s after its claim sends nothing");
@@ -541,6 +616,7 @@ async function main() {
       base();
       lines = await late(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG }, mint);
       eq("tenant link: nothing sent, no outcome row, one claim_stale line", [dispatched("tenant").length, tenantSent("magic_link").length, lines.map((l) => l.outcome)], [0, 0, ["claim_stale"]]);
+      // The first row a code's job writes after its code row: the tenant's in-flight row, the platform's claim.
       const claimWrite = (table: string) => (r: Req) => r.table === table && r.method === "POST" && ((r.body as Row).status === "queued" || (r.body as Row).error_code === "pending");
       base();
       world.otps.push({ id: "otp-older", email: LEARNER.email, code_hash: hashOtp("444444"), created_at: ago(5 * MIN), used_at: null, attempts: 0, expires_at: new Date(Date.now() + 5 * MIN).toISOString() });
@@ -552,14 +628,18 @@ async function main() {
       eq("platform code: the same", [dispatched("platform").length, openCodes(ADMIN.email).map((r) => r.id), lines.map((l) => l.outcome)], [0, ["otp-older"], ["claim_stale"]]);
     }
 
-    console.log("\na claim that cannot be written, or a count after it that cannot be read, sends nothing");
+    console.log("\na claim, an in-flight row or a count after them that cannot be written or read sends nothing");
     for (const kind of KINDS) {
       base({ writeFailing: new Set(["platform_email_log"]) });
       let lines = jobLines(await one(kind, { email: ADMIN.email }));
       eq(`platform ${kind.name}: the claim cannot be written: nothing sent, no row`, [dispatched("platform").length, world.platformLog.length, lines.map((l) => l.code)], [0, 0, ["log_unreadable"]]);
-      base({ failRead: (r) => r.table === "platform_email_log" && r.query.get("error_code") === "eq.pending" });
+      base({ failWrite: (r) => r.table === "platform_email_log" && r.method === "POST" && (r.body as Row).error_code === IN_FLIGHT_WORD });
       lines = jobLines(await one(kind, { email: ADMIN.email }));
-      eq(`platform ${kind.name}: the claims in flight cannot be read: nothing sent, the claim the only row`, [dispatched("platform").length, world.platformLog.map((r) => r.error_code), lines.map((l) => l.code)], [0, ["pending"], ["log_unreadable"]]);
+      eq(`platform ${kind.name}: the in-flight row cannot be written: nothing sent, the claim the only row`, [dispatched("platform").length, world.platformLog.map((r) => r.error_code), lines.map((l) => l.code)], [0, ["pending"], ["log_unreadable"]]);
+      base({ failRead: (r) => r.table === "platform_email_log" && r.query.get("error_code") === `eq.${IN_FLIGHT_WORD}` });
+      lines = jobLines(await one(kind, { email: ADMIN.email }));
+      eq(`platform ${kind.name}: the in-flight rows cannot be counted: nothing sent, the claim and the in-flight row the only rows`,
+        [dispatched("platform").length, world.platformLog.map((r) => r.error_code), lines.map((l) => l.code)], [0, ["pending", IN_FLIGHT_WORD], ["log_unreadable"]]);
       // The account's count read once its claim is written.
       base({ failRead: (r) => r.table === "platform_email_log" && r.method === "HEAD" && r.query.has("to_user_id") && world.platformLog.some((row) => row.error_code === "pending") });
       lines = jobLines(await one(kind, { email: ADMIN.email }));
@@ -567,30 +647,42 @@ async function main() {
       base({ writeFailing: new Set(["notification_log"]) });
       const all = await one(kind, { email: LEARNER.email, orgSlug: SLUG });
       lines = jobLines(all);
-      eq(`tenant ${kind.name}: the claim cannot be written: nothing sent, one fixed line with its code`,
+      eq(`tenant ${kind.name}: ${kind === CODE ? "its in-flight row" : "the claim"} cannot be written: nothing sent, one fixed line with its code`,
         [dispatched("tenant").length, lines.map((l) => l.outcome), all.some((l) => l.includes('"step":"claim_failed"') && l.includes('"code":"XX000"'))], [0, ["claim_failed"], true]);
+      base({ failWrite: (r) => r.table === "notification_log" && r.method === "POST" && (r.body as Row).error === IN_FLIGHT_WORD });
+      const flightFailed = await one(kind, { email: LEARNER.email, orgSlug: SLUG });
+      eq(`tenant ${kind.name}: the in-flight row cannot be written: nothing ${kind === CODE ? "" : "minted or "}sent, ${kind === CODE ? "no row" : "the claim the only row"}, one fixed line`,
+        [dispatched("tenant").length, requests.filter((r) => r.path === "/auth/v1/admin/generate_link").length, world.log.map((r) => r.error), jobLines(flightFailed).map((l) => l.outcome)],
+        [0, 0, kind === CODE ? [] : ["claim"], ["claim_failed"]]);
     }
     {
       // The account's count read once its claim is written.
       base({ failRead: (r) => r.table === "notification_log" && r.query.get("status") === "eq.queued" && r.query.has("to_user_id") && world.log.some((row) => row.status === "queued") });
       const lines = jobLines(await one(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG }));
-      eq("tenant link: the account's count after the claim cannot be read: nothing minted or sent", [dispatched("tenant").length, requests.filter((r) => r.path === "/auth/v1/admin/generate_link").length, lines.map((l) => l.outcome)], [0, 0, ["limit_read_failed"]]);
+      eq("tenant link: the account's count after the claim cannot be read: nothing minted or sent, the claim the only row",
+        [dispatched("tenant").length, requests.filter((r) => r.path === "/auth/v1/admin/generate_link").length, lines.map((l) => l.outcome), world.log.map((r) => r.error)], [0, 0, ["limit_read_failed"], ["claim"]]);
+      const credentialLine = (all: string[], step: string) => all.some((l) => l.includes('"event":"credential_claim"') && l.includes(`"step":"${step}"`));
       for (const kind of KINDS) {
+        // A limit of 30, 29 sent before the answer, and five in-flight rows of another learner.
+        const arrange = (over: Parameters<typeof freshWorld>[0] = {}) => {
+          base({ dailyLimit: 30, sent24h: 29, ...over });
+          seedTenantPassed(5, { event_type: "magic_link", to_user_id: LEARNER_X.id }, () => 20_000);
+        };
         let statusReads = 0;
-        base({ dailyLimit: 30, sent24h: 29, failRead: (r) => r.table === "rpc/tenant_mail_status" && ++statusReads === 2 });
-        seedTenant(5, { event_type: "magic_link", to_user_id: LEARNER_X.id, status: "queued", error: "claim" }, () => 20_000);
+        arrange({ failRead: (r) => r.table === "rpc/tenant_mail_status" && ++statusReads === 2 });
         const all = await one(kind, { email: LEARNER.email, orgSlug: SLUG });
-        eq(`tenant ${kind.name}: the status read again after the claim fails: sent without the daily limit, and its class logged`,
-          [dispatched("tenant").length, all.some((l) => l.includes('"event":"credential_claim"') && l.includes('"step":"status_unread"'))], [1, true]);
-        base({ dailyLimit: 30, sent24h: 29, failRead: (r) => r.table === "notification_log" && r.query.get("organization_id") === `eq.${ORG}` && r.query.get("status") === "eq.queued" });
-        seedTenant(5, { event_type: "magic_link", to_user_id: LEARNER_X.id, status: "queued", error: "claim" }, () => 20_000);
+        eq(`tenant ${kind.name}: the status read again fails: the run's first count and the in-flight rows apply: not attempted, daily_limit, with its record row and the status_unread line`,
+          [dispatched("tenant").length, jobLines(all).map((l) => l.outcome), dailyLimitRows().length, credentialLine(all, "status_unread")], [0, ["daily_limit"], 1, true]);
+        arrange({ failRead: (r) => r.table === "notification_log" && r.query.get("error") === `eq.${IN_FLIGHT_WORD}` });
         const all2 = await one(kind, { email: LEARNER.email, orgSlug: SLUG });
-        eq(`tenant ${kind.name}: the claims in flight cannot be read: the same, with their class`,
-          [dispatched("tenant").length, all2.some((l) => l.includes('"event":"credential_claim"') && l.includes('"step":"claims_unread"'))], [1, true]);
-        base({ dailyLimit: 30, sent24h: 29 });
-        seedTenant(5, { event_type: "magic_link", to_user_id: LEARNER_X.id, status: "queued", error: "claim" }, () => 20_000);
+        eq(`tenant ${kind.name}: the in-flight rows cannot be counted: one goes on the run's own count, with the claims_unread line, no daily_limit row and no alert due`,
+          [dispatched("tenant").length, credentialLine(all2, "claims_unread"), dailyLimitRows().length, world.state?.alert_due_at ?? null], [1, true, 0, null]);
+        arrange({ status: "missing" });
+        const all3 = await one(kind, { email: LEARNER.email, orgSlug: SLUG });
+        eq(`tenant ${kind.name}: without 0114 one goes, and no daily limit is applied`, [dispatched("tenant").length, jobLines(all3).map((l) => l.outcome), dailyLimitRows().length], [1, ["sent"], 0]);
+        arrange();
         const lines3 = jobLines(await one(kind, { email: LEARNER.email, orgSlug: SLUG }));
-        eq(`tenant ${kind.name}: …the control: with both read, the claims in flight fill the day, and it is not attempted`, [dispatched("tenant").length, lines3.map((l) => l.outcome)], [0, ["daily_limit"]]);
+        eq(`tenant ${kind.name}: …the control: with both read, the in-flight rows fill the day, and it is not attempted`, [dispatched("tenant").length, lines3.map((l) => l.outcome)], [0, ["daily_limit"]]);
       }
     }
 
@@ -601,23 +693,23 @@ async function main() {
       await one(CODE, { email: LEARNER.email, orgSlug: SLUG });
       const idx = (pred: (r: Req) => boolean) => requests.findIndex(pred);
       const written = idx((r) => r.table === "password_reset_otps" && r.method === "POST");
-      const claim = idx((r) => r.table === "notification_log" && r.method === "POST" && (r.body as Row).status === "queued");
+      const flight = idx((r) => r.table === "notification_log" && r.method === "POST" && (r.body as Row).error === IN_FLIGHT_WORD);
       const opened = idx((r) => r.table === "password_reset_otps" && r.method === "PATCH" && (r.body as Row).used_at === null);
       const closedOlder = idx((r) => r.table === "password_reset_otps" && r.method === "PATCH" && r.query.has("created_at"));
       const sent = idx((r) => r.path === "/functions/v1/send-smtp");
-      eq("the row is written closed, then the claim, then it is opened, then the older codes are closed, then the send",
-        [typeof (requests[written]?.body as Row | undefined)?.used_at, written < claim, claim < opened, opened < closedOlder, closedOlder < sent], ["string", true, true, true, true]);
+      eq("the row is written closed, then the in-flight row, then it is opened, then the older codes are closed, then the send",
+        [typeof (requests[written]?.body as Row | undefined)?.used_at, written < flight, flight < opened, opened < closedOlder, closedOlder < sent], ["string", true, true, true, true]);
       eq("…the new code is the one open; the older one is closed", openCodes(LEARNER.email).map((r) => r.id === "otp-older"), [false]);
       base({ dailyLimit: 30, sent24h: 29 });
-      seedTenant(5, { event_type: "password_reset", to_user_id: LEARNER_X.id, status: "queued", error: "claim" }, () => 20_000);
+      seedTenant(5, { event_type: "password_reset", to_user_id: LEARNER_X.id, status: "queued", error: IN_FLIGHT_WORD }, () => 20_000);
       world.otps.push({ id: "otp-older", email: LEARNER.email, code_hash: hashOtp("777777"), created_at: ago(5 * MIN), used_at: null, attempts: 0, expires_at: new Date(Date.now() + 5 * MIN).toISOString() });
       await one(CODE, { email: LEARNER.email, orgSlug: SLUG });
-      eq("a request its claim refuses: its row stays closed, and the older code stays open", [dispatched("tenant").length, openCodes(LEARNER.email).map((r) => r.id), world.otps.length], [0, ["otp-older"], 2]);
+      eq("a request the daily limit refuses after its in-flight row: its row stays closed, and the older code stays open", [dispatched("tenant").length, openCodes(LEARNER.email).map((r) => r.id), world.otps.length], [0, ["otp-older"], 2]);
       base();
       world.otps.push({ id: "otp-older", email: ADMIN.email, code_hash: hashOtp("888888"), created_at: ago(5 * MIN), used_at: null, attempts: 0, expires_at: new Date(Date.now() + 5 * MIN).toISOString() });
       await withEnv({ PLATFORM_SMTP_HOST: undefined }, () => one(CODE, { email: ADMIN.email }));
-      eq("the platform sender not configured: no code opened, none closed; the claim and the not_configured row",
-        [openCodes(ADMIN.email).map((r) => r.id), world.platformLog.map((r) => [r.status, r.error_code])], [["otp-older"], [["suppressed", "pending"], ["failed", "not_configured"]]]);
+      eq("the platform sender not configured: no code opened, none closed; the claim, the in-flight row and the not_configured row",
+        [openCodes(ADMIN.email).map((r) => r.id), world.platformLog.map((r) => [r.status, r.error_code])], [["otp-older"], [["suppressed", "pending"], ["suppressed", IN_FLIGHT_WORD], ["failed", "not_configured"]]]);
     }
 
     console.log("\nthe sender's two halves");
@@ -627,7 +719,7 @@ async function main() {
       const req: PlatformSendRequest<"platform_sign_in_link"> = { event: "platform_sign_in_link", to, organizationId: ORG, content: { link: LINK, minutes: 60 } };
       const claimed = await claimPlatformSend(req, { db, env: PLATFORM_ENV });
       const r = claimed.claimed ? await sendPlatformEmail(req, { db, env: PLATFORM_ENV, claim: claimed.claim }) : null;
-      eq("a claim handed to the sender: it does not claim again (one claim, one outcome)", [r?.status, claimsOfPlatform().length, outcomesOfPlatform("platform_sign_in_link").length], ["sent", 1, 1]);
+      eq("a claim handed to the sender: it does not claim again (one claim, one in-flight row, one outcome)", [r?.status, claimsOfPlatform().length, inFlightOfPlatform().length, outcomesOfPlatform("platform_sign_in_link").length], ["sent", 1, 1, 1]);
       if (claimed.claimed) {
         for (const [label, claim] of [
           ["another event", { ...claimed.claim, event: "platform_reset_code" as const }],
@@ -651,26 +743,33 @@ async function main() {
       } finally {
         clock.restore();
       }
+      base();
+      const owner = { userId: ADMIN.id, email: ADMIN.email, platformOwner: true };
+      const ownReq: PlatformSendRequest<"platform_sign_in_link"> = { event: "platform_sign_in_link", to: owner, organizationId: null, content: { link: LINK, minutes: 60 } };
+      requests.length = 0;
+      const own = await claimPlatformSend(ownReq, { db, env: PLATFORM_ENV });
+      eq("a platform owner's own request writes its in-flight row and reads none of the shares' four counts",
+        [own.claimed, inFlightOfPlatform(ADMIN.id).length, requests.filter((q) => q.table === "platform_email_log" && (q.query.has("organization_id") || q.query.get("status") === "eq.sent" || q.query.get("error_code") === `eq.${IN_FLIGHT_WORD}`)).length], [true, 1, 0]);
       // Four claims in the hour; another request claims at the same moment as this one.
       base();
       seedPlatform(4, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN.id, status: "suppressed", error_code: "pending" }, () => 50 * MIN);
       const alongside = (table: string, row: Row) => (q: Req) => {
-        if (q.table === table && q.method === "POST" && ((q.body as Row).error_code === "pending" || (q.body as Row).status === "queued") && !world.platformLog.concat(world.log).some((r) => r.id === "alongside")) {
+        if (q.table === table && q.method === "POST" && ((q.body as Row).error_code === "pending" || (q.body as Row).error === "claim") && !world.platformLog.concat(world.log).some((r) => r.id === "alongside")) {
           (table === "platform_email_log" ? world.platformLog : world.log).push({ id: "alongside", ...row, sent_at: new Date(Date.now()).toISOString() });
         }
       };
       world.onRequest = alongside("platform_email_log", { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: ADMIN.id, status: "suppressed", error_code: "pending" });
       const counted = await captureLogs(() => claimPlatformSend(req, { db, env: PLATFORM_ENV }));
       world.onRequest = null;
-      eq("platform: the count after the claim finds the account past its limit: refused, the claim its only row",
-        [counted.value.claimed ? "claimed" : counted.value.result, platformRowsOf((r) => r.status === "refused").length], [{ status: "refused", errorCode: "account_limit", logged: false }, 0]);
+      eq("platform: the count after the claim finds the account past its limit: refused, the claim its only row (no in-flight row)",
+        [counted.value.claimed ? "claimed" : counted.value.result, platformRowsOf((r) => r.status === "refused").length, inFlightOfPlatform().length], [{ status: "refused", errorCode: "account_limit", logged: false }, 0, 0]);
       base();
       seedTenant(4, { event_type: "magic_link", to_user_id: LEARNER.id, status: "queued", error: "claim" }, () => 50 * MIN);
       world.onRequest = alongside("notification_log", { organization_id: ORG, event_type: "magic_link", to_user_id: LEARNER.id, status: "queued", error: "claim" });
       const tl = jobLines(await one(LINK_KIND, { email: LEARNER.email, orgSlug: SLUG }));
       world.onRequest = null;
-      eq("tenant: the same for a link: nothing minted or sent, no row past the claim",
-        [tl.map((l) => l.outcome), requests.filter((r) => r.path === "/auth/v1/admin/generate_link").length, dispatched("tenant").length, world.log.filter((r) => r.status !== "queued").length], [["account_limit"], 0, 0, 0]);
+      eq("tenant: the same for a link: nothing minted or sent, no row past the claim (no in-flight row)",
+        [tl.map((l) => l.outcome), requests.filter((r) => r.path === "/auth/v1/admin/generate_link").length, dispatched("tenant").length, world.log.filter((r) => !(r.status === "queued" && r.error === "claim")).length], [["account_limit"], 0, 0, 0]);
     }
 
     console.log("\nthe welcome, the alert and the test write no claim");
@@ -681,15 +780,15 @@ async function main() {
         { db, env: PLATFORM_ENV }
       );
       const test = await sendPlatformEmail({ event: "platform_test", to: { userId: ADMIN.id, email: ADMIN.email, platformOwner: true }, organizationId: null, content: {} }, { db, env: PLATFORM_ENV });
-      eq("a welcome and a test: sent, one row each, no claim", [welcome.status, test.status, world.platformLog.map((r) => r.status), claimsOfPlatform().length], ["sent", "sent", ["sent", "sent"], 0]);
+      eq("a welcome and a test: sent, one row each, no claim and no in-flight row", [welcome.status, test.status, world.platformLog.map((r) => r.status), claimsOfPlatform().length, inFlightOfPlatform().length], ["sent", "sent", ["sent", "sent"], 0, 0]);
       base();
       seedPlatform(374, { event_type: "platform_admin_welcome", organization_id: OTHER_ORG, to_user_id: id(905), status: "sent" }, () => 60 * MIN);
-      for (const a of ADMINS.slice(0, 20)) seedPlatform(3, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: a.id, status: "suppressed", error_code: "pending" }, () => 10_000);
+      for (const a of ADMINS.slice(0, 20)) seedPlatformPassed(3, { event_type: "platform_sign_in_link", organization_id: ORG, to_user_id: a.id }, () => 10_000);
       const alert = await sendPlatformEmail(
         { event: "tenant_smtp_alert", to: { userId: ADMIN.id, email: ADMIN.email, platformOwner: false }, organizationId: ORG, content: { organizationName: "Tenant A", settingsUrl: "https://lms.stub/tenant-a/settings?tab=smtp", reading: "failing", errorClass: "auth" } },
         { db, env: PLATFORM_ENV }
       );
-      eq("an alert goes while other accounts' claims fill the ceiling's count, and writes no claim", [alert.status, claimsOfPlatform().length], ["sent", 60]);
+      eq("an alert goes from its sent rows while other accounts' claims and in-flight rows are on the log, and writes neither", [alert.status, claimsOfPlatform().length, inFlightOfPlatform().length], ["sent", 60, 60]);
     }
 
     console.log("\nthe calls before the answer are the same for a known and an unknown address");

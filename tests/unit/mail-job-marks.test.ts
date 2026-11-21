@@ -86,7 +86,7 @@ async function main() {
       base();
       await job(ADMIN.email, { orgSlug: SLUG }, PLATFORM_ENV);
       eq("a platform-served administrator: the marks are the platform's", marks().map((m) => [m.p_kind, m.p_mark]), [["platform", "started"], ["platform", "finished"]]);
-      eq("…around the platform's mail (its claim, then its row)", platformRows().map((r) => r.status), ["suppressed", "sent"]);
+      eq("…around the platform's mail (its claim, its in-flight row, then its row)", platformRows().map((r) => [r.status, r.error_code]), [["suppressed", "pending"], ["suppressed", "in_flight"], ["sent", null]]);
 
       base();
       const none = await job("nobody@tenant.stub");
@@ -147,9 +147,9 @@ async function main() {
 
       base();
       await slowJob(MEMBER.email, 22_500);
-      // The outcome's row, not the claim written before it.
+      // The outcome's row, not the claim or the in-flight row written before it.
       const outcomeRows = () => logInserts().filter((r) => r.event_type === "password_reset" && r.status !== "queued");
-      const platformOutcomes = () => platformRows().filter((r) => r.error_code !== "pending");
+      const platformOutcomes = () => platformRows().filter((r) => r.error_code !== "pending" && r.error_code !== "in_flight");
       const tenantRow = outcomeRows()[0];
       eq(`tenant: 22.5 s of the job spent before the send: the send is given what is left less the row's time (${left(22_500)} ms), not the whole wait`,
         [tenantSends().length, String(tenantRow?.error ?? "").includes(`Timed out after ${left(22_500)}ms`)], [1, true]);

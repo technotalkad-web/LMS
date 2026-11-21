@@ -1,13 +1,13 @@
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import {
-  CLAIMS_IN_FLIGHT_PAGE,
   CLAIM_IN_FLIGHT_MS,
   CLAIM_SEND_WITHIN_MS,
+  IN_FLIGHT_WORD,
   SMTP_SEND_WAIT_MS,
   accountRequests,
-  claimsInFlight,
   classifySmtpError,
   dispatchSmtp,
+  exactCount,
   type CountSince,
   type SmtpErrorClass,
 } from "./smtp-function";
@@ -48,15 +48,18 @@ export { PLATFORM_EVENTS, isPlatformEvent, type PlatformContent, type PlatformEv
  *   4. "not configured" (failed, not_configured);
  *   5. the send, at most 15 s (sent, or failed with the error class).
  * For a code or a link each limit is claimed before the send (ADR 0029, the
- * note of 2026-11-22; claimPlatformSend): after steps 1 and 2 the request
- * writes its claim (suppressed, pending), then counts with the claim among
- * the rows, so the account limit, the organisation's share and the ceiling
- * hold under concurrent requests. The welcome, the alert and the test read
- * their limits from the log as before and write no claim.
+ * notes of 2026-11-22; claimPlatformSend): after steps 1 and 2 the request
+ * writes its claim (suppressed, pending) and counts its account again with
+ * the claim among the rows; only a request within its account's limit then
+ * writes its in-flight row (suppressed, in_flight), and the organisation's
+ * share and the ceiling count the sent rows and the in-flight rows. So the
+ * limits hold under concurrent requests, and the shares count only the rows
+ * of requests that passed their account's count. The welcome, the alert and
+ * the test read their limits from the log as before and write no claim.
  * A limit that cannot be read sends nothing: the answer is "log_unreadable",
- * no row is written for it beyond a claim already there, and the
- * platform_email health check reads fail. The platform mailbox is never
- * used without its limits.
+ * no row is written for it beyond a claim or an in-flight row already there,
+ * and the platform_email health check reads fail. The platform mailbox is
+ * never used without its limits.
  *
  * Not a relay: no caller chooses the subject or the body. The text is fixed
  * per event (lib/email/platform-templates.ts) and carries only values the
@@ -134,8 +137,10 @@ export type PlatformErrorCode =
   | "account_limit"
   | "org_limit"
   | "ceiling"
-  /** A claim (ADR 0029, the note of 2026-11-22): the sender holds the mail back until its limits are read. Never a send. */
-  | "pending";
+  /** A claim (ADR 0029, the note of 2026-11-22): the sender holds the mail back until its limits are read. One request of its account; never a send. */
+  | "pending"
+  /** An in-flight row (ADR 0029, the later note of 2026-11-22): a request that passed its account's count. Counted by the share and the ceiling for two minutes; never a request and never a send. */
+  | "in_flight";
 /** The log row's status (migration 0113's check). */
 export type PlatformLogStatus = "sent" | "failed" | "suppressed" | "refused";
 
@@ -376,13 +381,17 @@ export type PlatformClaim = { event: PlatformEvent; userId: string; organization
 /** claimPlatformSend's answer: the claim, or what came of the request instead (its row, if one was written, is already there). */
 export type PlatformClaimAnswer = { claimed: true; claim: PlatformClaim } | { claimed: false; result: PlatformSendResult };
 
+/** The words of the rows that are requests of an account: its claims, and the requests the reserved domains or the list stopped. */
+export const ACCOUNT_REQUEST_WORDS = ["pending", "test_domain", "not_allowed"] as const satisfies readonly PlatformErrorCode[];
+
 /**
- * Claim one code or link before it is made (ADR 0029, the note of
+ * Claim one code or link before it is made (ADR 0029, the notes of
  * 2026-11-22). Each limit is claimed before the send: the request writes its
  * claim, a row with the status `suppressed` and the word `pending`, and only
- * then counts, its own claim among the rows. Each count of the account is
- * exact (accountRequests): the number of the account's rows of this kind
- * whose status is `suppressed`, in the hour and in the day. In this order:
+ * then counts its account again, its own claim among the rows. Each count of
+ * the account is exact (accountRequests): the number of the account's rows
+ * of this kind whose status is `suppressed` and whose word is one of
+ * ACCOUNT_REQUEST_WORDS, in the hour and in the day. In this order:
  *   1. the account's counts, read before anything is written: at the limit
  *      (5 in the hour, 10 in the day; a platform owner's own, the hourly
  *      limit only) it is refused, with one such row an hour, and no claim is
@@ -390,18 +399,22 @@ export type PlatformClaimAnswer = { claimed: true; claim: PlatformClaim } | { cl
  *   2. the reserved test domains and the allow-list: a `suppressed` row, as
  *      before, and no claim;
  *   3. the claim;
- *   4. four reads together: the account's counts again; the organisation's
- *      sent codes and links of 24 hours; all sent mail of 24 hours; and the
- *      claims in flight (CLAIM_IN_FLIGHT_MS, at most five for one account
- *      and kind, claimsInFlight). A read that fails, or a full page of
- *      claims, sends nothing;
- *   5. the account first: the account's `suppressed` rows, its claim among
- *      them, past the limit is refused, and the claim is the request's only
- *      row; then the organisation's share, then the ceiling, each counting
- *      the sent rows and the claims in flight, with its `refused` row as
- *      before.
- * A row that follows a claim (sent, failed, refused) is not counted against
- * the account, so a request counts once. The claim holds no address and no
+ *   4. the account's counts again: past the limit it is refused, and the
+ *      claim is the request's only row;
+ *   5. the in-flight row (`suppressed`, IN_FLIGHT_WORD), written only by a
+ *      request that passed its account's count, a platform owner's own too;
+ *   6. up to four exact counts together, each only where its limit applies:
+ *      the organisation's sent codes and links of 24 hours and its in-flight
+ *      rows, all sent mail of 24 hours and every in-flight row (each
+ *      in-flight row from CLAIM_IN_FLIGHT_MS ago on). A platform owner's own
+ *      request reads none of them;
+ *   7. the organisation's share, then the ceiling, each as its sent rows
+ *      plus its in-flight rows (this request's own among them), with its
+ *      `refused` row as before.
+ * A claim, an in-flight row or a count that cannot be written or read sends
+ * nothing (log_unreadable). A row that follows a claim (in flight, sent,
+ * failed, refused) is not counted against the account, so a request counts
+ * once; the shares never count a claim. Neither row holds an address or
  * content. Throws only for an event that is not claimed.
  */
 export async function claimPlatformSend(
@@ -417,7 +430,7 @@ export async function claimPlatformSend(
   const dailyApplies = !(to.platformOwner && OWNER_HOURLY_ONLY.has(event));
   const of: RowOf = { event, organizationId, userId: to.userId };
   const not = (result: PlatformSendResult): PlatformClaimAnswer => ({ claimed: false, result });
-  // A request of the account: a claim, or one the reserved domains or the list stopped.
+  // A request of the account: a claim, or one the reserved domains or the list stopped. Never an in-flight row.
   const requestsSince: CountSince = (sinceIso) =>
     db
       .from("platform_email_log")
@@ -425,6 +438,7 @@ export async function claimPlatformSend(
       .eq("to_user_id", to.userId)
       .eq("event_type", event)
       .eq("status", "suppressed")
+      .in("error_code", [...ACCOUNT_REQUEST_WORDS])
       .gte("sent_at", sinceIso);
   const past = (n: { hour: number; day: number | null }, ownIncluded: boolean) =>
     ownIncluded
@@ -466,49 +480,51 @@ export async function claimPlatformSend(
   });
   if (claim.error) return not(unreadable(event, "claim"));
 
-  // 4. The counts, the claim among the rows.
+  // 4. The account's counts again, the claim among the rows.
+  const again = await accountRequests(requestsSince, clock(), dailyApplies);
+  if (!again) return not(unreadable(event, "account"));
+  if (past(again, true)) return not({ status: "refused", errorCode: "account_limit", logged: false });
+
+  // 5. The in-flight row: this request passed its account's count.
+  const flight = await db.from("platform_email_log").insert({
+    event_type: event,
+    organization_id: organizationId,
+    to_user_id: to.userId,
+    status: "suppressed",
+    error_code: IN_FLIGHT_WORD,
+    error_detail: null,
+  });
+  if (flight.error) return not(unreadable(event, "in_flight"));
+
+  // 6. The shares' counts, this request's in-flight row among them: exact counts, no rows read.
   const nowMs = clock();
   const dayAgo = new Date(nowMs - DAY_MS).toISOString();
+  const flightSince = new Date(nowMs - CLAIM_IN_FLIGHT_MS).toISOString();
   const limits = platformEmailLimits(env);
   const orgApplies = organizationId !== null && !to.platformOwner;
   const ceilingApplies = !(to.platformOwner && OWNER_CEILING_EXEMPT.has(event));
-  const [again, orgSent, allSent, flight] = await Promise.all([
-    accountRequests(requestsSince, nowMs, dailyApplies),
-    orgApplies
-      ? db
-          .from("platform_email_log")
-          .select("id", { count: "exact", head: true })
-          .eq("organization_id", organizationId!)
-          .eq("status", "sent")
-          .in("event_type", [...ORG_LIMITED_EVENTS])
-          .gte("sent_at", dayAgo)
-      : null,
-    ceilingApplies ? db.from("platform_email_log").select("id", { count: "exact", head: true }).eq("status", "sent").gte("sent_at", dayAgo) : null,
-    orgApplies || ceilingApplies
-      ? db
-          .from("platform_email_log")
-          .select("to_user_id, event_type, organization_id")
-          .eq("status", "suppressed")
-          .eq("error_code", "pending")
-          .gte("sent_at", new Date(nowMs - CLAIM_IN_FLIGHT_MS).toISOString())
-          .order("sent_at", { ascending: false })
-          .limit(CLAIMS_IN_FLIGHT_PAGE)
-      : null,
+  const count = (applies: boolean, q: () => PromiseLike<{ count: number | null; error: unknown }>) => (applies ? exactCount(q) : Promise.resolve(0));
+  const inFlight = () => db.from("platform_email_log").select("id", { count: "exact", head: true }).eq("status", "suppressed").eq("error_code", IN_FLIGHT_WORD).gte("sent_at", flightSince);
+  const [orgSent, orgInFlight, allSent, allInFlight] = await Promise.all([
+    count(orgApplies, () =>
+      db
+        .from("platform_email_log")
+        .select("id", { count: "exact", head: true })
+        .eq("organization_id", organizationId!)
+        .eq("status", "sent")
+        .in("event_type", [...ORG_LIMITED_EVENTS])
+        .gte("sent_at", dayAgo)
+    ),
+    count(orgApplies, () => inFlight().eq("organization_id", organizationId!)),
+    count(ceilingApplies, () => db.from("platform_email_log").select("id", { count: "exact", head: true }).eq("status", "sent").gte("sent_at", dayAgo)),
+    count(ceilingApplies, () => inFlight()),
   ]);
-  if (!again) return not(unreadable(event, "account"));
-  if (orgSent && (orgSent.error || typeof orgSent.count !== "number")) return not(unreadable(event, "organisation"));
-  if (allSent && (allSent.error || typeof allSent.count !== "number")) return not(unreadable(event, "ceiling"));
-  if (flight && (flight.error || !Array.isArray(flight.data) || flight.data.length >= CLAIMS_IN_FLIGHT_PAGE)) return not(unreadable(event, "claims"));
+  if (orgSent === null || orgInFlight === null) return not(unreadable(event, "organisation"));
+  if (allSent === null || allInFlight === null) return not(unreadable(event, "ceiling"));
 
-  // 5. In section F's order: the account, the organisation's share, the ceiling.
-  if (past(again, true)) return not({ status: "refused", errorCode: "account_limit", logged: false });
-  const claims = (flight?.data ?? []) as Array<{ to_user_id: string | null; event_type: string; organization_id: string | null }>;
-  if (orgApplies && (orgSent!.count as number) + claimsInFlight(claims.filter((c) => c.organization_id === organizationId)) > limits.orgDailyLimit) {
-    return not(await writeRow(db, of, "refused", "org_limit"));
-  }
-  if (ceilingApplies && (allSent!.count as number) + claimsInFlight(claims) > limits.dailyCeiling) {
-    return not(await writeRow(db, of, "refused", "ceiling"));
-  }
+  // 7. In section F's order: the organisation's share, then the ceiling.
+  if (orgApplies && orgSent + orgInFlight > limits.orgDailyLimit) return not(await writeRow(db, of, "refused", "org_limit"));
+  if (ceilingApplies && allSent + allInFlight > limits.dailyCeiling) return not(await writeRow(db, of, "refused", "ceiling"));
   return { claimed: true, claim: { event, userId: to.userId, organizationId, at } };
 }
 

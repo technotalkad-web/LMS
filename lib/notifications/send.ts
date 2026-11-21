@@ -2,7 +2,7 @@ import { createClient as createServiceClient, type SupabaseClient } from "@supab
 import { loadTemplate, mdToHtml, DEFAULT_CTAS, DEFAULT_TEMPLATES } from "./templates";
 import { substitute } from "./placeholders";
 import { renderEmailShell, type EmailBranding } from "./layout";
-import { CLAIMS_IN_FLIGHT_PAGE, CLAIM_IN_FLIGHT_MS, SMTP_SEND_WAIT_MS, accountRequests, claimsInFlight, classifySmtpError, dispatchSmtp, isCallLimitMessage, type CountSince, type SmtpErrorClass } from "@/lib/email/smtp-function";
+import { CLAIM_IN_FLIGHT_MS, IN_FLIGHT_WORD, SMTP_SEND_WAIT_MS, accountRequests, classifySmtpError, dispatchSmtp, exactCount, isCallLimitMessage, type CountSince, type SmtpErrorClass } from "@/lib/email/smtp-function";
 import { MAX_REQUESTS_PER_DAY, MAX_REQUESTS_PER_HOUR } from "@/lib/auth/password-reset";
 import { isTenantEvent } from "./routing";
 import { ADMIN_REQUEST_OWN_CALLS, gateSettingsTest, markNotSentAlert, noteCallLimit, openRun, refreshRun, requestBudget, runMail, runReading, settleSettingsTest, spendCalls, MAIL_CALL_COSTS, type GroupHooks, type MailRun, type NotAttemptedClass, type RunItemResult } from "./smtp-state";
@@ -355,8 +355,9 @@ export const CREDENTIAL_CLAIM_ERROR = "claim";
 /**
  * The account's claimed sign-in links through its organisation's SMTP, as
  * an exact count from a time on (accountRequests): the `queued` rows of
- * magic_link. A record row of a link that was not attempted is not a
- * request, and is not counted here.
+ * magic_link whose word is `claim`. An in-flight row is not a request, and
+ * neither is the record row of a link that was not attempted: neither is
+ * counted here.
  */
 export function countLinkClaims(db: SupabaseClient, userId: string): CountSince {
   return (sinceIso) =>
@@ -366,6 +367,7 @@ export function countLinkClaims(db: SupabaseClient, userId: string): CountSince 
       .eq("to_user_id", userId)
       .eq("event_type", "magic_link")
       .eq("status", "queued")
+      .eq("error", CREDENTIAL_CLAIM_ERROR)
       .gte("sent_at", sinceIso);
 }
 
@@ -374,36 +376,8 @@ export type CredentialClaim =
   | { ok: true; at: number }
   | { ok: false; why: "claim_failed" | "limit_read_failed" | "account_limit" | CredentialNotAttempted };
 
-/**
- * Claim a public reset code or sign-in link on the organisation's own SMTP
- * before it is made (ADR 0029, the note of 2026-11-22). Each limit is
- * claimed before the send: the job writes its claim, a `queued` row with
- * the error word `claim` and no context, and only then reads, with its own
- * claim among the rows:
- *   - for a link, the account's claims again, two exact counts
- *     (countLinkClaims): past 5 in the hour or 10 in the day nothing is sent;
- *   - the run again (refreshRun): an organisation that now reads failing or
- *     not configured is not attempted (smtp_not_ready, with its record row
- *     and the alert mark);
- *   - the organisation's claims in flight (CLAIM_IN_FLIGHT_MS, at most five
- *     for one account and kind): with the fresh 24-hour count, past the
- *     daily limit is not attempted (daily_limit, with its record row and the
- *     alert mark), and so is a full page of claims, which cannot be counted.
- * A claim that cannot be written, or an account count that cannot be read,
- * sends nothing. A fresh status or a count of claims that cannot be read
- * applies no daily limit to this request (rule FP4): the run keeps what it
- * read first, and one fixed line names the read. The account limits have no
- * such fallback. Every call is charged to the run. Never throws.
- */
-export async function claimCredentialMail(
-  run: MailRun,
-  args: { event: CredentialEvent; to: { user_id: string; email: string } },
-  opts: { link: boolean }
-): Promise<CredentialClaim> {
-  const db = svc();
-  const warn = (step: string, code?: string) =>
-    console.warn(JSON.stringify({ event: "credential_claim", org_id: run.organizationId, kind: args.event, step, ...(code ? { code } : {}) }));
-  const at = run.now();
+/** One notification_log insert of a public request's own row (its claim or its in-flight row): `queued`, no context. false when it was not written. */
+async function writeQueuedRow(db: SupabaseClient, run: MailRun, args: { event: CredentialEvent; to: { user_id: string; email: string } }, word: string): Promise<{ ok: true } | { ok: false; code: string }> {
   spendCalls(run.budget, MAIL_CALL_COSTS.logInsert);
   try {
     const { error } = await db.from("notification_log").insert(
@@ -414,59 +388,100 @@ export async function claimCredentialMail(
         to: args.to,
         subjectTemplate: DEFAULT_TEMPLATES[args.event]?.subject ?? "",
         status: "queued",
-        error: CREDENTIAL_CLAIM_ERROR,
+        error: word,
         context: {},
       })
     );
-    if (error) {
-      warn("claim_failed", String(error.code ?? "unknown"));
+    return error ? { ok: false, code: String(error.code ?? "unknown") } : { ok: true };
+  } catch {
+    return { ok: false, code: "thrown" };
+  }
+}
+
+/**
+ * Claim a public reset code or sign-in link on the organisation's own SMTP
+ * before it is made (ADR 0029, the notes of 2026-11-22). In this order:
+ *   - for a link: its claim, a `queued` row with the word `claim` and no
+ *     context; then the account's claims again, two exact counts
+ *     (countLinkClaims), its own claim among them: past 5 in the hour or 10
+ *     in the day nothing is sent;
+ *   - the in-flight row, a `queued` row with IN_FLIGHT_WORD and no context,
+ *     written only by a request that passed its account's count (for a code,
+ *     its closed code row is its account's claim, so it is called only once
+ *     that row has passed its own count);
+ *   - two reads together: the run again (refreshRun), and an exact count of
+ *     the organisation's in-flight rows from CLAIM_IN_FLIGHT_MS ago on, its
+ *     own among them;
+ *   - an organisation that now reads failing or not configured is not
+ *     attempted (smtp_not_ready, with its record row and the alert mark);
+ *   - with a daily limit in the run, whether the run was read again or not:
+ *     the run's 24-hour count plus the in-flight rows above the limit is not
+ *     attempted (daily_limit, with its record row and the alert mark). So
+ *     the daily limit counts the rows sent and the rows of requests that
+ *     passed their account's count, never a claim.
+ * A claim or an in-flight row that cannot be written, or an account count
+ * that cannot be read, sends nothing. A status read again that fails keeps
+ * the run's first reading (status_unread); in-flight rows that cannot be
+ * counted are not a reading of the limit: no check is made here, no record
+ * row is written and no alert is marked for it (claims_unread), and the
+ * run's own gate applies the 24-hour count, as rule FP4 has it. The account
+ * limits have no such fallback. Every call is charged to the run. Never
+ * throws.
+ */
+export async function claimCredentialMail(
+  run: MailRun,
+  args: { event: CredentialEvent; to: { user_id: string; email: string } },
+  opts: { link: boolean }
+): Promise<CredentialClaim> {
+  const db = svc();
+  const warn = (step: string, code?: string) =>
+    console.warn(JSON.stringify({ event: "credential_claim", org_id: run.organizationId, kind: args.event, step, ...(code ? { code } : {}) }));
+  const at = run.now();
+  if (opts.link) {
+    const claim = await writeQueuedRow(db, run, args, CREDENTIAL_CLAIM_ERROR);
+    if (!claim.ok) {
+      warn("claim_failed", claim.code);
       return { ok: false, why: "claim_failed" };
     }
-  } catch {
-    warn("claim_failed", "thrown");
-    return { ok: false, why: "claim_failed" };
-  }
-
-  const nowMs = run.now();
-  spendCalls(run.budget, (opts.link ? 2 : 0) + 1);
-  const settle = <T,>(p: PromiseLike<T>): Promise<T | "thrown"> => Promise.resolve(p).catch(() => "thrown" as const);
-  const [account, status, flight] = await Promise.all([
-    opts.link ? accountRequests(countLinkClaims(db, args.to.user_id), nowMs, true) : Promise.resolve("none" as const),
-    refreshRun(run),
-    settle(
-      db
-        .from("notification_log")
-        .select("to_user_id, event_type")
-        .eq("organization_id", run.organizationId)
-        .eq("status", "queued")
-        .gte("sent_at", new Date(nowMs - CLAIM_IN_FLIGHT_MS).toISOString())
-        .order("sent_at", { ascending: false })
-        .limit(CLAIMS_IN_FLIGHT_PAGE)
-    ),
-  ]);
-
-  if (account !== "none") {
+    spendCalls(run.budget, 2);
+    const account = await accountRequests(countLinkClaims(db, args.to.user_id), run.now(), true);
     if (!account) {
       warn("limit_read_failed");
       return { ok: false, why: "limit_read_failed" };
     }
     if (account.hour > MAX_REQUESTS_PER_HOUR || (account.day ?? 0) > MAX_REQUESTS_PER_DAY) return { ok: false, why: "account_limit" };
   }
+  const flight = await writeQueuedRow(db, run, args, IN_FLIGHT_WORD);
+  if (!flight.ok) {
+    warn("claim_failed", flight.code);
+    return { ok: false, why: "claim_failed" };
+  }
+
+  spendCalls(run.budget, 1);
+  const flightSince = new Date(run.now() - CLAIM_IN_FLIGHT_MS).toISOString();
+  const [status, inFlight] = await Promise.all([
+    refreshRun(run),
+    exactCount(() =>
+      db
+        .from("notification_log")
+        .select("id", { count: "exact", head: true })
+        .eq("organization_id", run.organizationId)
+        .eq("status", "queued")
+        .eq("error", IN_FLIGHT_WORD)
+        .gte("sent_at", flightSince)
+    ),
+  ]);
 
   const reading = runReading(run);
   if (reading === "failing" || reading === "not_configured") {
     await recordCredentialNotAttempted(run, args, "smtp_not_ready");
     return { ok: false, why: "smtp_not_ready" };
   }
-  const flightRead = flight !== "thrown" && !flight.error && Array.isArray(flight.data);
   if (status === "unreadable") warn("status_unread");
-  if (!flightRead) warn("claims_unread");
-  if (run.limit && status === "ok" && flightRead) {
-    const claims = flight.data as Array<{ to_user_id: string | null; event_type: string }>;
-    if (claims.length >= CLAIMS_IN_FLIGHT_PAGE || run.sent24h + claimsInFlight(claims) > run.limit.limit) {
-      await recordCredentialNotAttempted(run, args, "daily_limit");
-      return { ok: false, why: "daily_limit" };
-    }
+  if (inFlight === null) warn("claims_unread");
+  if (run.limit && inFlight !== null && run.sent24h + inFlight > run.limit.limit) {
+    await recordCredentialNotAttempted(run, args, "daily_limit");
+    return { ok: false, why: "daily_limit" };
   }
   return { ok: true, at };
 }

@@ -42,7 +42,10 @@
  * The claim each public code or link writes before it is made (the note of
  * 2026-11-22): the tenant's is a queued notification_log row with the error
  * word claim and no context, the platform's a pending platform_email_log
- * row. Neither holds a credential.
+ * row. The in-flight row a request writes once it passed its account's
+ * count (the later note of 2026-11-22) is a queued row with the word
+ * in_flight and no context, or the platform's in_flight row. None of them
+ * holds a credential.
  *
  * Every credential check is a boolean or a count: a failing check never
  * prints a value.
@@ -168,7 +171,7 @@ const logRows = () => requests.filter((q) => q.path === "/rest/v1/notification_l
 const smtpRaw = () => requests.filter((q) => q.path === "/functions/v1/send-smtp").map((q) => q.raw).join("\n");
 const smtpPayloads = () => requests.filter((q) => q.path === "/functions/v1/send-smtp").map((q) => q.body as { subject: string; text: string });
 
-async function checkLog(label: string, opts: { rows: number; secrets: string[]; storedKeys: string[]; mailed?: boolean; claims?: number }) {
+async function checkLog(label: string, opts: { rows: number; secrets: string[]; storedKeys: string[]; mailed?: boolean; claims?: number; inFlight?: number }) {
   const { STORED_CONTEXT_KEYS } = await import("../../lib/notifications/send");
   const allowed = new Set<string>(STORED_CONTEXT_KEYS);
   const rows = logRows();
@@ -179,11 +182,16 @@ async function checkLog(label: string, opts: { rows: number; secrets: string[]; 
   eq(`${label}: no log row holds the credential (any column)`, rows.some((r) => opts.secrets.some((s) => r.raw.includes(s))), false);
   eq(`${label}: no log row holds a token_hash`, rows.some((r) => /token_hash/i.test(r.raw)), false);
   eq(`${label}: every stored context key is allow-listed`, rows.every((r) => Object.keys((r.body.context ?? {}) as Row).every((k) => allowed.has(k))), true);
-  // The outcome's row: a claim written before it (queued) has no context.
+  // The outcome's row: a claim or an in-flight row written before it (queued) has no context.
   const outcome = rows.find((r) => r.body.status !== "queued") ?? rows[0];
   eq(`${label}: the stored context keys`, Object.keys((outcome?.body.context ?? {}) as Row).sort(), [...opts.storedKeys].sort());
-  const claims = rows.filter((r) => r.body.status === "queued");
-  eq(`${label}: ${opts.claims ?? 0} claim row(s), each with the error word claim and no context`, claims.length === (opts.claims ?? 0) && claims.every((r) => r.body.error === "claim" && Object.keys((r.body.context ?? {}) as Row).length === 0), true);
+  const queued = rows.filter((r) => r.body.status === "queued");
+  const claims = queued.filter((r) => r.body.error === "claim");
+  const inFlight = queued.filter((r) => r.body.error === "in_flight");
+  eq(`${label}: ${opts.claims ?? 0} claim row(s)`, claims.length, opts.claims ?? 0);
+  eq(`${label}: ${opts.inFlight ?? 0} in-flight row(s), and no other queued row`, [inFlight.length === (opts.inFlight ?? 0), queued.length === claims.length + inFlight.length].every(Boolean), true);
+  eq(`${label}: each claim and in-flight row has no context and holds no credential`,
+    queued.every((r) => Object.keys((r.body.context ?? {}) as Row).length === 0 && !opts.secrets.some((s) => r.raw.includes(s)) && !/token_hash/i.test(r.raw)), true);
 }
 
 function reset(opts: { users?: Array<{ id: string; email: string }>; members?: string[]; admins?: string[]; settings?: Row; template?: Row | null; status?: Row } = {}) {
@@ -333,7 +341,8 @@ async function main() {
       // The code is random: read it from the email (the template's "# {OTP_Code}" line).
       const code = /^# (\d{6})$/m.exec(smtpPayloads()[0]?.text ?? "")?.[1] ?? "";
       eq("the email carries a 6-digit code", code.length === 6, true);
-      await checkLog("password_reset", { rows: 2, claims: 1, secrets: code ? [code] : ["(no code)"], storedKeys: ["org_name", "otp_minutes"] });
+      // A code's claim is its closed code row: its one queued row is the in-flight row.
+      await checkLog("password_reset", { rows: 2, claims: 0, inFlight: 1, secrets: code ? [code] : ["(no code)"], storedKeys: ["org_name", "otp_minutes"] });
     }
 
     console.log("\nPOST /api/auth/magic-link: the tenant sign-in link");
@@ -343,7 +352,7 @@ async function main() {
       const res = await route.POST(new Request("http://lms.test/api/auth/magic-link", { method: "POST", body: JSON.stringify({ email: "member@example.test", orgSlug: "org" }) }));
       eq("200 { ok: true }", res.status === 200 && (await res.json()).ok === true, true);
       await runHanded();
-      await checkLog("magic_link", { rows: 2, claims: 1, secrets: [TOKEN_HASH], storedKeys: [] });
+      await checkLog("magic_link", { rows: 3, claims: 1, inFlight: 1, secrets: [TOKEN_HASH], storedKeys: [] });
     }
 
     console.log("\nthe platform's reset code and sign-in link for an administrator (ADR 0029 section F)");
@@ -372,7 +381,7 @@ async function main() {
           const secret = event === "platform_reset_code" ? (/(?:^|\\n|\n)(\d{6})(?:\\n|\n)/.exec(mail)?.[1] ?? "(no code)") : TOKEN_HASH;
           eq(`${label}: 200, and the platform's mail carries the credential`, res.status === 200 && mail.includes(secret), true);
           const rows = requests.filter((q) => q.path === "/rest/v1/platform_email_log" && q.method === "POST").map((q) => q.raw);
-          eq(`${label}: two platform_email_log rows, the claim and the outcome, of the event`, rows.map((r) => [String((JSON.parse(r) as Row).event_type), String((JSON.parse(r) as Row).error_code)]).flat(), [event, "pending", event, "null"]);
+          eq(`${label}: three platform_email_log rows, the claim, the in-flight row and the outcome, of the event`, rows.map((r) => [String((JSON.parse(r) as Row).event_type), String((JSON.parse(r) as Row).error_code)]).flat(), [event, "pending", event, "in_flight", event, "null"]);
           eq(`${label}: the row holds neither the credential nor an address`, rows.some((r) => r.includes(secret) || r.includes("@")), false);
           eq(`${label}: the answer holds no credential`, answer.includes(secret), false);
           eq(`${label}: no notification_log row`, logRows().length, 0);

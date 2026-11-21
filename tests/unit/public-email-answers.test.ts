@@ -17,8 +17,10 @@
  *     (the ready answer); settings that cannot be read are 503 for all;
  *   - only an account that was found starts the job;
  *   - the job: a member on a ready organisation gets the organisation's own
- *     mail, its claim written first (a queued row with no context; the
- *     platform's, a pending row: the note of 2026-11-22); a member of
+ *     mail, a link's claim written first (a queued row with no context; the
+ *     platform's, a pending row: the note of 2026-11-22), then the in-flight
+ *     row of a request that passed its account's count (the later note of
+ *     2026-11-22); a member of
  *     another organisation gets nothing; an administrator
  *     and an administrator a platform owner invited get the platform's mail,
  *     also on a not-ready page; a not-ready organisation attempts nothing,
@@ -198,10 +200,13 @@ async function main() {
       const tenantSent = () => tenantSends().filter((r) => (r.body as Row).host === "smtp.tenant.stub").length;
       const platformSent = () => tenantSends().filter((r) => (r.body as Row).host === "smtp.platform.stub").length;
 
+      // A link's rows: its claim, its in-flight row, its outcome; a code's claim is its closed code row, so its rows are the in-flight row and the outcome.
+      const tenantRows = (userId: string) => [...(kind.tenantEvent === "magic_link" ? [[kind.tenantEvent, "queued", userId]] : []), [kind.tenantEvent, "queued", userId], [kind.tenantEvent, "sent", userId]];
+      const queuedWords = kind.tenantEvent === "magic_link" ? [["claim", "{}"], ["in_flight", "{}"]] : [["in_flight", "{}"]];
       await job(U.member.email, { orgSlug: SLUG });
-      eq("a member on a ready organisation: one mail through its own SMTP, its claim and then its row, no platform mail",
-        [tenantSent(), logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), platformSent(), platformRows().length], [1, [[kind.tenantEvent, "queued", U.member.id], [kind.tenantEvent, "sent", U.member.id]], 0, 0]);
-      eq("…the claim is the error word claim with no context", logInserts().filter((r) => r.status === "queued").map((r) => [r.error, JSON.stringify(r.context)]), [["claim", "{}"]]);
+      eq(`a member on a ready organisation: one mail through its own SMTP, ${kind.tenantEvent === "magic_link" ? "its claim, its in-flight row" : "its in-flight row"} and then its row, no platform mail`,
+        [tenantSent(), logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), platformSent(), platformRows().length], [1, tenantRows(U.member.id), 0, 0]);
+      eq("…its queued rows carry the word claim or in_flight and no context", logInserts().filter((r) => r.status === "queued").map((r) => [r.error, JSON.stringify(r.context)]), queuedWords);
       eq("…a sign-in link is minted once, for the account looked up", linksMinted().length, kind.tenantEvent === "magic_link" ? 1 : 0);
 
       await job(UNKNOWN, { orgSlug: SLUG });
@@ -216,13 +221,14 @@ async function main() {
       for (const [label, over] of [["a ready", {}], ["a not-ready", { settings: null }]] as Array<[string, Parameters<typeof freshWorld>[0]]>) {
         await job(U.admin.email, { orgSlug: SLUG }, over, PLATFORM_ENV);
         eq(`an administrator on ${label} page: the platform's mail (Q1 before Q3), no tenant attempt`,
-          [platformRows().map((r) => [r.event_type, r.status, r.organization_id, r.to_user_id]), tenantSent()], [[[kind.platformEvent, "suppressed", ORG, U.admin.id], [kind.platformEvent, "sent", ORG, U.admin.id]], 0]);
+          [platformRows().map((r) => [r.event_type, r.status, r.error_code, r.organization_id, r.to_user_id]), tenantSent()],
+          [[[kind.platformEvent, "suppressed", "pending", ORG, U.admin.id], [kind.platformEvent, "suppressed", "in_flight", ORG, U.admin.id], [kind.platformEvent, "sent", null, ORG, U.admin.id]], 0]);
         await job(U.ownerInvited.email, { orgSlug: SLUG }, over, PLATFORM_ENV);
         eq(`…an administrator a platform owner invited, with no account row yet, on ${label} page: the platform's mail`,
-          [platformRows().map((r) => [r.event_type, r.status, r.organization_id]), tenantSent()], [[[kind.platformEvent, "suppressed", ORG], [kind.platformEvent, "sent", ORG]], 0]);
+          [platformRows().map((r) => [r.event_type, r.status, r.organization_id]), tenantSent()], [[[kind.platformEvent, "suppressed", ORG], [kind.platformEvent, "suppressed", ORG], [kind.platformEvent, "sent", ORG]], 0]);
       }
       await job(U.owner.email, {}, {}, PLATFORM_ENV);
-      eq("a platform owner on the page with no organisation: the platform's mail, with no organisation (its claim, then its row)", platformRows().map((r) => [r.event_type, r.status, r.error_code, r.organization_id]), [[kind.platformEvent, "suppressed", "pending", null], [kind.platformEvent, "sent", null, null]]);
+      eq("a platform owner on the page with no organisation: the platform's mail, with no organisation (its claim, its in-flight row, then its row)", platformRows().map((r) => [r.event_type, r.status, r.error_code, r.organization_id]), [[kind.platformEvent, "suppressed", "pending", null], [kind.platformEvent, "suppressed", "in_flight", null], [kind.platformEvent, "sent", null, null]]);
       await job(U.member.email, {}, {}, PLATFORM_ENV);
       eq("a learner on the page with no organisation: nothing minted, sent or marked", [linksMinted().length, tenantSends().length, platformRows().length, marks().length], [0, 0, 0, 0]);
 
@@ -248,7 +254,7 @@ async function main() {
       eq("a limit that cannot be read: nothing made, nothing sent", [tenantSends().length, linksMinted().length], [0, 0]);
 
       await job(U.invited.email, { orgSlug: SLUG });
-      eq("the invitation rule: an invited account with no membership gets the inviting organisation's mail", logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), [[kind.tenantEvent, "queued", U.invited.id], [kind.tenantEvent, "sent", U.invited.id]]);
+      eq("the invitation rule: an invited account with no membership gets the inviting organisation's mail", logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), tenantRows(U.invited.id));
       base(kind);
       world.members.push({ organization_id: OTHER_ORG, user_id: U.invited.id, role: "user", status: "active" });
       await job(U.invited.email, { orgSlug: SLUG }, {}, {}, true);
@@ -257,7 +263,7 @@ async function main() {
       world.orgs.find((o) => o.id === OTHER_ORG)!.deleted_at = "2026-11-01T00:00:00Z";
       world.members.push({ organization_id: OTHER_ORG, user_id: U.invited.id, role: "user", status: "active" });
       await job(U.invited.email, { orgSlug: SLUG }, {}, {}, true);
-      eq("…whose only membership is in a deleted organisation: the inviting organisation's mail", logInserts().map((r) => [r.event_type, r.status]), [[kind.tenantEvent, "queued"], [kind.tenantEvent, "sent"]]);
+      eq("…whose only membership is in a deleted organisation: the inviting organisation's mail", logInserts().map((r) => [r.event_type, r.status, r.to_user_id]), tenantRows(U.invited.id));
 
       for (const [label, over] of [["memberships", { failing: new Set(["organization_members"]) }], ["invitations", { failing: new Set(["invitations"]) }], ["platform owners", { failing: new Set(["platform_owners"]) }]] as Array<[string, Parameters<typeof freshWorld>[0]]>) {
         await job(U.member.email, { orgSlug: SLUG }, over, PLATFORM_ENV);
@@ -266,10 +272,10 @@ async function main() {
 
       if (kind.tenantEvent === "magic_link") {
         const { lines } = await job(U.member.email, { orgSlug: SLUG }, { linkUserId: () => U.outsider.id });
-        eq("a link whose account differs from the one looked up: nothing sent, and only its claim written", [linksMinted().length, tenantSends().length, logInserts().map((r) => r.status)], [1, 0, ["queued"]]);
+        eq("a link whose account differs from the one looked up: nothing sent, and only its claim and its in-flight row written", [linksMinted().length, tenantSends().length, logInserts().map((r) => [r.status, r.error])], [1, 0, [["queued", "claim"], ["queued", "in_flight"]]]);
         eq("…and an error class is logged", lines.some((l) => l.includes("account_mismatch")), true);
         await job(U.admin.email, { orgSlug: SLUG }, { linkUserId: () => U.outsider.id }, PLATFORM_ENV);
-        eq("…the same for a platform-served account", [tenantSends().length, platformRows().map((r) => r.error_code)], [0, ["pending"]]);
+        eq("…the same for a platform-served account", [tenantSends().length, platformRows().map((r) => r.error_code)], [0, ["pending", "in_flight"]]);
         await job(U.member.email, { orgSlug: SLUG, next: "/tenant-a/courses/c1/launch?mode=preview" });
         const sent = String((tenantSends()[0]?.body as Row | undefined)?.html ?? "");
         eq("a member's link carries the page they asked for, through safeNextPath", sent.includes(encodeURIComponent("/tenant-a/courses/c1/launch?mode=preview")), true);

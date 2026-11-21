@@ -105,7 +105,8 @@ async function main() {
       const admin = await send({ email: ADMIN.email, ...extra });
       eq("an administrator: the same answer as the learner", admin.body === learner.body && admin.status === learner.status, true);
       const rows = platformRows();
-      eq("…one platform sign-in mail (its claim, then its row), and no tenant mail", [rows.map((r) => [r.event_type, r.status]), tenantMail()], [[["platform_sign_in_link", "suppressed"], ["platform_sign_in_link", "sent"]], 0]);
+      eq("…one platform sign-in mail (its claim, its in-flight row, then its row), and no tenant mail", [rows.map((r) => [r.event_type, r.status, r.error_code]), tenantMail()],
+        [[["platform_sign_in_link", "suppressed", "pending"], ["platform_sign_in_link", "suppressed", "in_flight"], ["platform_sign_in_link", "sent", null]], 0]);
       const html = String((tenantSends()[0]?.body as Row | undefined)?.html ?? "");
       eq("…its link signs in and lands on /select-org", html.includes("token_hash=") && html.includes("next=%2Fselect-org"), true);
     }

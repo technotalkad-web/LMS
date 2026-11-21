@@ -103,11 +103,11 @@ export default async function PlatformEmailPage() {
   const [health, lastRead, weekRead, overview, jobDays, beatRead, names] = await Promise.all([
     // The layout's banner read the same reading in this render: shared, not repeated.
     platformEmailHealthForRender(),
-    // The last send: a claim (pending) is no send, so it is never shown here.
+    // The last send: a claim (pending) and an in-flight row (in_flight) are no send, so neither is shown here.
     svc
       .from("platform_email_log")
       .select("sent_at, event_type, status, error_code")
-      .or("error_code.is.null,error_code.neq.pending")
+      .or("error_code.is.null,and(error_code.neq.pending,error_code.neq.in_flight)")
       .order("sent_at", { ascending: false })
       .limit(1),
     svc
