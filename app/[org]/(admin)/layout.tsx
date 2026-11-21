@@ -9,7 +9,7 @@ import { Breadcrumbs } from "./_components/breadcrumbs";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { readTenantMailNotice, type TenantMailNotice } from "@/lib/notifications/smtp-state";
+import { readTenantMailNotice, smtpSettingsPath, type TenantMailNotice } from "@/lib/notifications/smtp-state";
 
 /**
  * The banner of section E (ADR 0029; rule FP4) for the organisation's
@@ -131,8 +131,8 @@ export default async function AdminLayout({
           className={`px-4 py-2 text-sm border-b ${mailBanner.tone === "critical" ? "bg-red-50 text-red-800 border-red-200" : "bg-amber-50 text-amber-900 border-amber-200"}`}
         >
           {mailBanner.text}{" "}
-          <Link href={`/${org.slug}/settings`} className="underline font-medium">
-            Open Settings
+          <Link href={smtpSettingsPath(org.slug)} className="underline font-medium">
+            Open the SMTP settings
           </Link>
         </div>
       )}

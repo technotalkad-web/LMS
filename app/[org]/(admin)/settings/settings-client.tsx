@@ -150,6 +150,18 @@ export type LrsConfigView = {
   last_test_error: string | null;
 };
 
+type SettingsTab = "workspace" | "smtp" | "branding" | "templates";
+const SETTINGS_TABS: readonly SettingsTab[] = ["workspace", "smtp", "branding", "templates"];
+
+/**
+ * The tab Settings opens on, from the page's `?tab=` (ADR 0029 section E:
+ * the email banner and its Attention Center item open the SMTP tab). One of
+ * the four tabs' keys, else Workspace.
+ */
+export function settingsTabOf(value: string | null | undefined): SettingsTab {
+  return SETTINGS_TABS.find((t) => t === value) ?? "workspace";
+}
+
 export function SettingsClient({
   orgSlug,
   settings,
@@ -160,6 +172,7 @@ export function SettingsClient({
   sso,
   lrs,
   dashboardBackgrounds = [],
+  initialTab,
 }: {
   orgSlug: string;
   settings: Settings;
@@ -171,13 +184,17 @@ export function SettingsClient({
   lrs: LrsConfigView;
   /** 0074 dashboard background themes. */
   dashboardBackgrounds?: DashboardBackground[];
+  /** The page's `?tab=`, read through settingsTabOf. */
+  initialTab?: string;
 }) {
   const router = useRouter();
-  const [tab, setTab] = useState<
-    "workspace" | "smtp" | "branding" | "templates"
-  >("workspace");
+  const [tab, setTab] = useState<SettingsTab>(() => settingsTabOf(initialTab));
+  // A link to another tab while Settings is already open (the banner's link,
+  // say) changes only the query: follow it.
+  useEffect(() => {
+    if (initialTab !== undefined) setTab(settingsTabOf(initialTab));
+  }, [initialTab]);
 
-  type SettingsTab = "workspace" | "smtp" | "branding" | "templates";
   const settingsTabs: Tab<SettingsTab>[] = [
     { key: "workspace", label: "Workspace", icon: <SettingsIcon className="w-4 h-4" /> },
     { key: "smtp", label: "SMTP", icon: <Mail className="w-4 h-4" /> },

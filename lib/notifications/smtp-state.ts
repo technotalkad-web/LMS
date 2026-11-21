@@ -1111,6 +1111,15 @@ export async function settleSettingsTest(run: MailRun, outcome: SendOutcome, rec
   if (!wasFailing) await markAlertDue(run, "flip");
 }
 
+/**
+ * The SMTP tab of an organisation's Settings (section E): where the banner,
+ * the Attention Center item and the alert mail send its administrators.
+ * The Settings page opens on the tab its `?tab=` names.
+ */
+export function smtpSettingsPath(orgSlug: string): string {
+  return `/${orgSlug}/settings?tab=smtp`;
+}
+
 /* ------------------------------------------------------------------- the alert */
 
 export type DueAlertResult =
@@ -1281,7 +1290,7 @@ export async function sendDueAlert(opts: {
     return { kind: "failed", step: "claim" };
   }
   const slug = typeof org.slug === "string" && /^[a-z0-9][a-z0-9-]*$/i.test(org.slug) ? org.slug : null;
-  const settingsUrl = slug ? `${base}/${slug}/settings` : `${base}/select-org`;
+  const settingsUrl = slug ? `${base}${smtpSettingsPath(slug)}` : `${base}/select-org`;
   spendCalls(b, recipients.length * 3);
   const outcomes = await Promise.all(
     recipients.map(async (to) => {

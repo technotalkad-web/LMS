@@ -10,7 +10,7 @@ import { heldWebhookItem, heldWebhookSummary } from "@/lib/integrations/webhook-
 import { classifyAttempt, type PgError } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews } from "@/lib/scoring/context-read";
 import { NOT_APPLIED_TITLE, attentionContextLine, ignoredPassCount, readIgnoredRecord } from "@/lib/xapi/ignored-pass";
-import { readTenantMailNotice, type TenantMailNotice } from "@/lib/notifications/smtp-state";
+import { readTenantMailNotice, smtpSettingsPath, type TenantMailNotice } from "@/lib/notifications/smtp-state";
 import {
   ATTENTION_PROVIDERS,
   PRIORITY_RANK,
@@ -499,7 +499,8 @@ async function ignoredPassItems(svc: AnyClient, orgId: string, orgSlug: string, 
  */
 export function tenantSmtpItem(notice: TenantMailNotice | null, orgSlug: string, priority: AttentionPriority, nowIso: string): AttentionItem | null {
   if (!notice) return null;
-  const base = { type: "tenant-smtp", who: null, href: `/${orgSlug}/settings`, inline: null, dismissible: false } as const;
+  // Section E: the item links to the SMTP tab of Settings.
+  const base = { type: "tenant-smtp", who: null, href: smtpSettingsPath(orgSlug), inline: null, dismissible: false } as const;
   switch (notice.kind) {
     case "not_configured":
       return { ...base, key: "tenant-smtp:not_configured", priority, title: "Email is not set up: no email reaches your learners", context: "Set the SMTP host, port and From address on the SMTP tab of Settings.", occurredAt: nowIso, actionLabel: "Set up SMTP" };

@@ -28,10 +28,15 @@ const EVENTS: NotificationEvent[] = [
 
 export default async function SettingsPage({
   params,
+  searchParams,
 }: {
   params: Promise<{ org: string }>;
+  searchParams?: Promise<Record<string, string | undefined>>;
 }) {
   const { org: orgSlug } = await params;
+  // The tab to open (?tab=smtp from the email banner and its Attention
+  // Center item); SettingsClient keeps only one of its four keys.
+  const { tab: initialTab } = (await searchParams) ?? {};
   const { org, role } = await requireOrgAccess(orgSlug);
   if (!canManage(role)) {
     redirect(`/${orgSlug}/dashboard?denied=1`);
@@ -212,6 +217,7 @@ export default async function SettingsPage({
         templates={templates}
         orgName={org.name}
         workspace={workspace}
+        initialTab={initialTab}
         sso={{
           enabled: (extraRow?.sso_enabled as boolean | null | undefined) ?? false,
           enforced: (extraRow?.sso_enforced as boolean | null | undefined) ?? false,

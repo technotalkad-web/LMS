@@ -114,7 +114,7 @@ async function main() {
       eq("one alert: at most five administrators whose membership counts, super owners first (both owners, then the first three admins)", [r.kind, platformSends().map((s) => String(s.to)).sort()], ["sent", ["a-admin-1@tenant.stub", "a-admin-2@tenant.stub", "a-admin-3@tenant.stub", "s-owner-1@tenant.stub", "s-owner-2@tenant.stub"]]);
       eq(`…${ALERT_MAX_RECIPIENTS} platform mails with the reading and the class, and no tenant mail`, [platformSends().length, tenantSends().length, String(platformSends()[0]?.text).includes("refused the sign-in"), r.kind === "sent" ? r.reading : null], [5, 0, true, "failing"]);
       eq("…claimed: alert_due_at emptied, last_alert_at set", [world.state?.alert_due_at, typeof world.state?.last_alert_at], [null, "string"]);
-      eq("…the settings address is the organisation's on the platform address", String(platformSends()[0]?.text).includes(`${BASE}/tenant-a/settings`), true);
+      eq("…the settings address is the SMTP tab of the organisation's Settings on the platform address", String(platformSends()[0]?.text).includes(`${BASE}/tenant-a/settings?tab=smtp`), true);
       eq("…the platform log holds user ids, never an address", JSON.stringify(world.platformLog).includes("@"), false);
       const again = await dueAlert();
       eq("the next call finds nothing due", [again.kind, platformSends().length], ["none", 5]);

@@ -229,8 +229,8 @@ async function readerCases() {
     eq("the provider is in the registry, critical by default, and first", [ATTENTION_PROVIDERS[0]?.type, ATTENTION_PROVIDERS[0]?.defaultPriority], ["tenant-smtp", "critical"]);
     freshWorld({ settings: null, status: "missing" });
     const nc = await collect(new Map([["tenant-smtp:not_configured", "2999-01-01T00:00:00.000Z"]]));
-    eq("settings incomplete, 0114 not pasted: one critical item, not configured, linking to Settings, that cannot be marked as read",
-      nc.map((i) => [i.key, i.priority, i.href, i.dismissible]), [["tenant-smtp:not_configured", "critical", "/tenant-a/settings", false]]);
+    eq("settings incomplete, 0114 not pasted: one critical item, not configured, linking to the SMTP tab of Settings, that cannot be marked as read",
+      nc.map((i) => [i.key, i.priority, i.href, i.dismissible]), [["tenant-smtp:not_configured", "critical", "/tenant-a/settings?tab=smtp", false]]);
     freshWorld({ status: "missing" });
     eq("settings complete, 0114 not pasted: no item", (await collect()).length, 0);
     freshWorld({ status: "fail" });
@@ -258,6 +258,9 @@ function bannerAndTabText(): void {
   eq("the banner has a case for it: a warning that names the limit and says routine email is never sent, not \"for today\"",
     [off.length > 0, /tone: "warning"/.test(off), /never sent/.test(off), /for today/.test(off)], [true, true, true, false]);
   const tab = fs.readFileSync(path.join(root, "app", "[org]", "(admin)", "settings", "settings-client.tsx"), "utf8");
+  eq("the banner's link opens the SMTP tab of Settings (section E), as the Attention item's does", [/<Link href=\{smtpSettingsPath\(org\.slug\)\}/.test(layout), /href=\{`\/\$\{org\.slug\}\/settings`\}[^>]*>\s*Open/.test(layout)], [true, false]);
+  eq("…and Settings opens on the tab the page names: the page passes ?tab= and the client starts on it",
+    [/initialTab=\{initialTab\}/.test(fs.readFileSync(path.join(root, "app", "[org]", "(admin)", "settings", "page.tsx"), "utf8")), /useState<SettingsTab>\(\(\) => settingsTabOf\(initialTab\)\)/.test(tab)], [true, true]);
   eq("the SMTP tab says so when the line where routine mail stops is 0", /mailState\.routineStop === 0\s*\?\s*" At this limit reminders, announcements and assignment email are never sent/.test(tab), true);
 }
 
