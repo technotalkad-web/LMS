@@ -1,20 +1,28 @@
 #!/usr/bin/env node
 // =============================================================================
 // scripts/measure-platform-send.mjs: the platform sender's timing measurement
-// (ADR 0029 section G and step 7 of its pull request A; ops/RUNBOOK.md §6.3a
-// step 5).
+// (ADR 0029 section G, step 7 of its pull request A and gate G2 of its pull
+// request B; ops/RUNBOOK.md §6.3a step 5).
 // =============================================================================
 //
-// The platform sender stops waiting for one send after 8 s
-// (lib/email/platform-sender.ts, PLATFORM_SEND_TIMEOUT_MS). That figure is a
-// starting value: this script sends up to 50 messages through the send-smtp
-// Edge Function on STAGING, one after another, with the platform mailbox's
-// settings, and reports the median and the 95th-percentile time. A
-// 95th percentile above 4 s is reported before ADR 0029 pull request B.
+// The app stops waiting for one send after 15 s (lib/email/smtp-function.ts,
+// SMTP_SEND_WAIT_MS, which the platform sender's PLATFORM_SEND_TIMEOUT_MS
+// repeats). This script sends up to 50 messages through the send-smtp Edge
+// Function on STAGING with one mailbox's settings and reports the median and
+// the 95th percentile of each send's own time. It has two forms:
+//   - One after another (pull request A's measurement). A 95th percentile
+//     above 4 s is reported before ADR 0029 pull request B.
+//   - Several at once, --at-once N (gate G2): 24 sends unless --count says
+//     otherwise, in waves of N that start together, the next wave after the
+//     whole wave has answered and the gap has passed. A 95th percentile of
+//     at most 7.5 s, half the app's wait, means N is the answer. Above it,
+//     measure again with N halved, on another day; when half of N is less
+//     than 2, runs send one at a time. A failed send leaves the gate unread.
 //
-// OWNER-RUN, STAGING ONLY, ONCE. It refuses any Supabase project but staging.
-// Every message goes from the platform mailbox to its own address (the
-// address in PLATFORM_SMTP_FROM): nobody else is mailed. The text is fixed.
+// OWNER-RUN, STAGING ONLY, AT MOST ONCE A DAY. It refuses any Supabase project
+// but staging. Every message goes from the mailbox in the settings to its own
+// address (the address in PLATFORM_SMTP_FROM): nobody else is mailed. The
+// text is fixed.
 // These sends do not go through the platform sender, so platform_email_log
 // does not record them and the daily ceiling does not count them: 50 is at
 // most a tenth of the smallest daily cap the owner may choose (about 500).
@@ -35,33 +43,48 @@
 //   read -rs PLATFORM_SMTP_USER && export PLATFORM_SMTP_USER
 //   read -rs PLATFORM_SMTP_PASSWORD && export PLATFORM_SMTP_PASSWORD
 //   read -rs PLATFORM_SMTP_FROM && export PLATFORM_SMTP_FROM
-// Use the staging values (the same ones the staging deployment holds).
+// Use the staging values (the same ones the staging deployment holds). For
+// gate G2 the mailbox is the staging test mailbox that the gates use, never a
+// production mailbox: where staging's platform sender does not send from that
+// mailbox, these variables hold the test mailbox's settings instead.
 //
 // RUN:
 //   node scripts/measure-platform-send.mjs --dry-run   # checks the settings, sends nothing
 //   node scripts/measure-platform-send.mjs             # 50 sends, 2 s apart
+// RUN, gate G2 (on a day the script has not yet run):
+//   node scripts/measure-platform-send.mjs --at-once 4 --dry-run   # prints the plan, sends nothing
+//   node scripts/measure-platform-send.mjs --at-once 4             # 24 sends, 4 at a time, 2 s between waves
+// If the last line says to measure again, run the same command with the
+// --at-once figure it names, on another day.
 // FLAGS:
-//   --count N    sends to make, 1 to 50 (default 50)
-//   --gap-ms M   pause between sends in milliseconds, at least 500 (default 2000)
+//   --count N    sends to make, 1 to 50 (default 50; 24 with --at-once)
+//   --gap-ms M   pause between sends, or between waves with --at-once, in
+//                milliseconds, at least 500 (default 2000)
+//   --at-once N  sends that start together in each wave, 1 to 8 (gate G2)
 //   --dry-run    check the settings and print the plan; send nothing
 //
 // Afterwards unset the variables (unset SUPABASE_SERVICE_ROLE_KEY
 // PLATFORM_SMTP_USER PLATFORM_SMTP_PASSWORD PLATFORM_SMTP_FROM) and record
 // the printed summary with the ADR 0029 record.
 //
-// EXIT: 0 every send delivered; 1 at least one send failed (the summary is
-// still printed); 2 refused (not staging, a setting missing or invalid);
-// 3 bad flags.
+// EXIT: 0 every send delivered (with --at-once, the last line says whether
+// gate G2 passed); 1 at least one send failed (the summary is still printed);
+// 2 refused (not staging, a setting missing or invalid); 3 bad flags.
 // =============================================================================
 
 // The staging project (scripts/e2e-in-runner.sh and scripts/lifecycle-nightly.sh name it too).
 const STAGING_REF = "zeaclbapadosqqttexxh";
 const MAX_COUNT = 50;
+/** Gate G2: the most sends started together, and the count when --count is not given. */
+const MAX_AT_ONCE = 8;
+const AT_ONCE_COUNT = 24;
 /** Longer than send-smtp's own 25 s, so the script sees its answer. */
 const PER_SEND_WAIT_MS = 30_000;
-/** The app's wait for one send, and the figure to report above (ADR 0029 section G). */
-const APP_WAIT_MS = 8_000;
+/** The app's wait for one send (lib/email/smtp-function.ts SMTP_SEND_WAIT_MS), and the figure to report above (ADR 0029 section G). */
+const APP_WAIT_MS = 15_000;
 const REPORT_ABOVE_MS = 4_000;
+/** Gate G2's line: a 95th percentile of at most half the app's wait. */
+const G2_PASS_MS = 7_500;
 const RESERVED = /(^|\.)(test|example|invalid|localhost)$|(^|\.)example\.(com|net|org)$/i;
 
 function die(code, msg) {
@@ -70,13 +93,21 @@ function die(code, msg) {
 }
 
 function parseFlags(argv) {
-  const out = { count: MAX_COUNT, gapMs: 2000, dryRun: false };
+  const out = { count: MAX_COUNT, gapMs: 2000, atOnce: null, dryRun: false };
+  let countGiven = false;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--dry-run") out.dryRun = true;
-    else if (a === "--count") out.count = Number(argv[++i]);
-    else if (a === "--gap-ms") out.gapMs = Number(argv[++i]);
+    else if (a === "--count") {
+      out.count = Number(argv[++i]);
+      countGiven = true;
+    } else if (a === "--gap-ms") out.gapMs = Number(argv[++i]);
+    else if (a === "--at-once") out.atOnce = Number(argv[++i]);
     else die(3, `unknown flag ${a}`);
+  }
+  if (out.atOnce !== null) {
+    if (!Number.isInteger(out.atOnce) || out.atOnce < 1 || out.atOnce > MAX_AT_ONCE) die(3, `--at-once: a whole number from 1 to ${MAX_AT_ONCE}`);
+    if (!countGiven) out.count = AT_ONCE_COUNT;
   }
   if (!Number.isInteger(out.count) || out.count < 1 || out.count > MAX_COUNT) die(3, `--count: a whole number from 1 to ${MAX_COUNT}`);
   if (!Number.isInteger(out.gapMs) || out.gapMs < 500) die(3, "--gap-ms: a whole number of at least 500");
@@ -134,7 +165,12 @@ function scrub(text) {
   return s.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 160);
 }
 
-console.log(`▶ staging send-smtp; ${flags.count} send(s), ${flags.gapMs} ms apart; from the platform mailbox to its own address`);
+const waves = flags.atOnce === null ? null : Math.ceil(flags.count / flags.atOnce);
+if (flags.atOnce === null) {
+  console.log(`▶ staging send-smtp; ${flags.count} send(s), ${flags.gapMs} ms apart; from the platform mailbox to its own address`);
+} else {
+  console.log(`▶ staging send-smtp, gate G2; ${flags.count} send(s), ${flags.atOnce} at a time in ${waves} wave(s), ${flags.gapMs} ms between waves; from the mailbox in the settings to its own address`);
+}
 if (flags.dryRun) {
   console.log("✓ dry run: the settings are present and the project is staging. Nothing was sent.");
   process.exit(0);
@@ -167,11 +203,26 @@ async function sendOnce(n) {
 }
 
 const results = [];
-for (let n = 1; n <= flags.count; n++) {
-  const r = await sendOnce(n);
-  results.push(r);
-  console.log(`  ${String(n).padStart(2)}  ${r.ok ? "delivered" : "failed   "}  ${String(r.ms).padStart(6)} ms${r.ok ? "" : `  ${r.why}`}`);
-  if (n < flags.count) await new Promise((resolve) => setTimeout(resolve, flags.gapMs));
+if (flags.atOnce === null) {
+  for (let n = 1; n <= flags.count; n++) {
+    const r = await sendOnce(n);
+    results.push(r);
+    console.log(`  ${String(n).padStart(2)}  ${r.ok ? "delivered" : "failed   "}  ${String(r.ms).padStart(6)} ms${r.ok ? "" : `  ${r.why}`}`);
+    if (n < flags.count) await new Promise((resolve) => setTimeout(resolve, flags.gapMs));
+  }
+} else {
+  // Gate G2: each wave's sends start together; each one times itself (sendOnce).
+  for (let w = 1; w <= waves; w++) {
+    const first = (w - 1) * flags.atOnce + 1;
+    const numbers = [];
+    for (let n = first; n <= Math.min(flags.count, first + flags.atOnce - 1); n++) numbers.push(n);
+    const wave = await Promise.all(numbers.map((n) => sendOnce(n)));
+    wave.forEach((r, k) => {
+      results.push(r);
+      console.log(`  ${String(numbers[k]).padStart(2)}  wave ${String(w).padStart(2)}  ${r.ok ? "delivered" : "failed   "}  ${String(r.ms).padStart(6)} ms${r.ok ? "" : `  ${r.why}`}`);
+    });
+    if (w < waves) await new Promise((resolve) => setTimeout(resolve, flags.gapMs));
+  }
 }
 
 const delivered = results.filter((r) => r.ok).map((r) => r.ms).sort((a, b) => a - b);
@@ -187,10 +238,30 @@ console.log(`measured ${results.length} send(s) on staging: ${delivered.length} 
 if (delivered.length > 0) {
   console.log(`delivered, ms: min ${delivered[0]}, p50 ${p50}, p95 ${p95}, max ${delivered[delivered.length - 1]}`);
 }
-console.log(`every send: above ${REPORT_ABOVE_MS} ms ${all.filter((ms) => ms > REPORT_ABOVE_MS).length}, above the app's ${APP_WAIT_MS} ms wait ${all.filter((ms) => ms > APP_WAIT_MS).length}`);
-if (p95 === null) {
-  console.log("p95: none (no send was delivered); fix the failures above, then run again.");
+if (flags.atOnce === null) {
+  console.log(`every send: above ${REPORT_ABOVE_MS} ms ${all.filter((ms) => ms > REPORT_ABOVE_MS).length}, above the app's ${APP_WAIT_MS} ms wait ${all.filter((ms) => ms > APP_WAIT_MS).length}`);
+  if (p95 === null) {
+    console.log("p95: none (no send was delivered); fix the failures above, then run again.");
+  } else {
+    console.log(`p95 above ${REPORT_ABOVE_MS} ms: ${p95 > REPORT_ABOVE_MS ? "YES: report it before ADR 0029 pull request B" : "no"}`);
+  }
 } else {
-  console.log(`p95 above ${REPORT_ABOVE_MS} ms: ${p95 > REPORT_ABOVE_MS ? "YES: report it before ADR 0029 pull request B" : "no"}`);
+  const n = flags.atOnce;
+  console.log(`every send: above gate G2's ${G2_PASS_MS} ms ${all.filter((ms) => ms > G2_PASS_MS).length}, above the app's ${APP_WAIT_MS} ms wait ${all.filter((ms) => ms > APP_WAIT_MS).length}`);
+  if (failed > 0 || p95 === null) {
+    // A send refused while others went at once would leave a p95 of the fast ones only.
+    console.log(`gate G2, ${n} at a time: NOT READ: ${failed} send(s) failed. Fix the failures above, then run the same command again on another day.`);
+  } else if (p95 <= G2_PASS_MS) {
+    console.log(`gate G2, ${n} at a time: median ${p50} ms, p95 ${p95} ms, at most ${G2_PASS_MS} ms: PASS. N is ${n}.`);
+  } else {
+    const half = Math.floor(n / 2);
+    const next =
+      half >= 2
+        ? `N is not ${n}; measure again with --at-once ${half}, on another day.`
+        : n >= 2
+          ? `N is not ${n}; runs send one at a time (N is 1).`
+          : "One at a time is above the line too; runs send one at a time, and the figure is recorded with the ADR 0029 record.";
+    console.log(`gate G2, ${n} at a time: median ${p50} ms, p95 ${p95} ms, above ${G2_PASS_MS} ms: NOT PASSED. ${next}`);
+  }
 }
 process.exit(failed > 0 ? 1 : 0);
