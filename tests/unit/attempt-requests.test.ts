@@ -609,6 +609,32 @@ async function ticketCases() {
       (out as { email?: unknown }).email, { recipients_unreadable: true });
   }
   {
+    // ADR 0029 gate G3: the grants are one insert. One learner's grant made
+    // since the read (23505) fails that insert; each row is then inserted on
+    // its own, so that learner is failed and the other granted, as before.
+    const insertOf = (q: FQ) => q.ops.find((o) => o.op === "insert")?.args[0];
+    const f = fakeDb(withPreviews(true), (q) => {
+      const p = insertOf(q);
+      if (!p) return null;
+      return Array.isArray(p) || (p as FRow).user_id === "u5" ? { code: "23505", message: "duplicate key value violates unique constraint" } : null;
+    });
+    const out = await ticketOf(f.db);
+    eq("one learner's grant already made: the refused insert of both, then one insert each; that learner failed, the other granted",
+      [f.inserts.map((i) => (Array.isArray(i.payload) ? `both ${(i.payload as FRow[]).map((r) => r.user_id).join(",")}` : (i.payload as FRow).user_id)), byUid(out).u1, byUid(out).u5],
+      [["both u1,u5", "u1", "u5"], "granted", "failed: already has an open request or grant"]);
+  }
+  {
+    // An older source CHECK (23514): the insert of both degrades as one, to a bulk-style grant, as each row's own insert did.
+    const f = fakeDb(withPreviews(true), (q) => {
+      const p = q.ops.find((o) => o.op === "insert")?.args[0];
+      return Array.isArray(p) && (p as FRow[]).some((r) => r.source !== "bulk") ? { code: "23514", message: "new row violates check constraint" } : null;
+    });
+    const out = await ticketOf(f.db);
+    eq("23514 on the insert of both: one more insert of both with source bulk; both granted",
+      [f.inserts.map((i) => (i.payload as FRow[]).map((r) => r.source)), byUid(out).u1, byUid(out).u5],
+      [[["ticket", "ticket"], ["bulk", "bulk"]], "granted", "granted"]);
+  }
+  {
     // Nothing granted: no mail to speak of, and no outcome in the answer.
     const f = fakeDb(TABLES(), (q) => (q.table === "course_versions" ? BOOM : null));
     const out = await ticket(f.db);

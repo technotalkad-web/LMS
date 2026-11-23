@@ -71,6 +71,13 @@ const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<R
   const key = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).get("apikey");
   calls.push({ method, path: url.pathname, table: url.pathname.replace("/rest/v1/", ""), body, service: key === process.env.SUPABASE_SERVICE_ROLE_KEY });
   if (url.pathname === "/auth/v1/user") return new Response(JSON.stringify(USER), { status: 200, headers: { "content-type": "application/json" } });
+  // A new group gets its id from the server (the world's generic table gives
+  // none), and .single() reads it as one object, as the server answers it.
+  if (url.pathname === "/rest/v1/org_groups" && method === "POST" && body && !Array.isArray(body)) {
+    const res = await worldStub(input, { ...init, body: JSON.stringify({ id: `0e100000-0000-4000-8000-${String(calls.length).padStart(12, "0")}`, ...(body as Row) }) });
+    const rows = (await res.json()) as Row[];
+    return new Response(JSON.stringify(rows[0] ?? null), { status: res.status, headers: { "content-type": "application/json" } });
+  }
   return worldStub(input, init);
 };
 
@@ -116,7 +123,8 @@ function seed(over: { attempts?: boolean } = {}) {
         : [],
       attempt_requests: [],
       // The master values, and each vertical's system group already there, every other one deactivated.
-      org_field_options: VERTICALS.map((value, i) => ({ id: `0f000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`, organization_id: ORG, field: "business_vertical", value, parent_id: null })),
+      // V21 is master data with no group yet.
+      org_field_options: [...VERTICALS, "V21"].map((value, i) => ({ id: `0f000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`, organization_id: ORG, field: "business_vertical", value, parent_id: null })),
       org_groups: VERTICALS.map((v, i) => ({
         id: groupId(i), organization_id: ORG, name: `${v} (everyone)`, group_type: "dynamic", rules: { verticals: [v] },
         is_active: i % 2 === 0, system_key: `scope:${v}|`,
@@ -186,6 +194,19 @@ async function main() {
       // group row, 67 and 57.
       eq("the calls before the first send: 21, whatever the number of pairs", beforeFirstSend(), 21);
       eq(`…the route's own calls before its mail part: 11, one more than ADMIN_REQUEST_OWN_CALLS (${ADMIN_REQUEST_OWN_CALLS}) assumes`, ownCalls(), 11);
+    }
+    {
+      // A pair with no group yet, named twice beside one that has its group:
+      // one read of both, the new group created once, as before.
+      seed();
+      const r = await post(courseRoute, "http://lms.test/api/assignments", { courseId: COURSE, scopes: [{ vertical: "V01" }, { vertical: "V21" }, { vertical: "V21" }] });
+      const created = world.tables.org_groups.filter((g) => g.system_key === "scope:V21|");
+      const groupRows = world.tables.course_assignments.filter((x) => x.assignee_type === "group").map((x) => String(x.group_id));
+      eq("a new pair named twice beside one already there: one read, one group created (active, dynamic, its rule), two group rows assigned",
+        [r.status, r.body.assigned, calls.filter((c) => c.table === "org_groups" && c.method === "GET" && !c.service).length,
+          calls.filter((c) => c.table === "org_groups" && c.method === "POST").length,
+          created.map((g) => [g.is_active, g.group_type, JSON.stringify(g.rules), g.name]), groupRows.sort()],
+        [200, 2, 1, 1, [[true, "dynamic", JSON.stringify({ verticals: ["V21"] }), "V21 (everyone)"]], [groupId(0), String(created[0]?.id)].sort()]);
     }
 
     console.log(`\nPOST /api/learning-path-assignments: ${N} named learners`);

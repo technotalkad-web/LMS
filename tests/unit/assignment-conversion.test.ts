@@ -67,18 +67,25 @@ const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._loa
  *         ('self' or 'admin'); a POST naming one answers 23505.
  *   dupNonUser: a team, org or group row is already there too.
  *   conversion: how the update naming source = 'self' answers.
+ *   unseen: learners whose row is there but written after the read of the
+ *         rows already there (a race): the read misses them, the insert
+ *         meets their 23505.
+ *   badInsert: a learner whose insert fails with another error (23503).
  */
 type World = {
   rows: Record<string, "self" | "admin">;
   dupNonUser: boolean;
   conversion: "ok" | "PGRST204" | "42703" | "42501";
+  unseen: string[];
+  badInsert: string | null;
 };
-const base = (): World => ({ rows: {}, dupNonUser: false, conversion: "ok" });
+const base = (): World => ({ rows: {}, dupNonUser: false, conversion: "ok", unseen: [], badInsert: null });
 let world: World = base();
 let requests: Req[] = [];
 
 const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const DUP = { code: "23505", message: "duplicate key value violates unique constraint", details: null, hint: null };
+const FK = { code: "23503", message: "insert or update violates foreign key constraint", details: null, hint: null };
 const conversionError = (table: string) => ({
   PGRST204: [400, { code: "PGRST204", message: `Could not find the 'source' column of '${table}' in the schema cache`, details: null, hint: null }],
   "42703": [400, { code: "42703", message: `column ${table}.source does not exist`, details: null, hint: null }],
@@ -123,7 +130,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if ((table === "course_assignments" || table === "learning_path_assignments") && method === "GET") {
     const type = /assignee_type=eq\.(\w+)/.exec(query)?.[1];
     const listed = (col: string) => (new RegExp(`${col}=in\\.\\(([^)]*)\\)`).exec(query)?.[1] ?? "").split(",").filter(Boolean);
-    if (type === "user") return json(listed("user_id").filter((u) => u in world.rows).map((user_id) => ({ user_id })));
+    if (type === "user") return json(listed("user_id").filter((u) => u in world.rows && !world.unseen.includes(u)).map((user_id) => ({ user_id })));
     if (!world.dupNonUser) return json([]);
     if (type === "team") return json(listed("team_id").map((team_id) => ({ team_id })));
     if (type === "group") return json(listed("group_id").map((group_id) => ({ group_id })));
@@ -135,6 +142,7 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     const list = (Array.isArray(body) ? body : [body]) as Row[];
     const dup = (row: Row) => (row.assignee_type === "user" ? (row.user_id as string) in world.rows : world.dupNonUser);
     if (list.some(dup)) return json(DUP, 409);
+    if (world.badInsert && list.some((row) => row.user_id === world.badInsert)) return json(FK, 409);
     return json(list.map((row) => ({ id: `row-${String(row.user_id ?? row.team_id ?? row.assignee_type)}`, ...row })), 201);
   }
   if ((table === "course_assignments" || table === "learning_path_assignments") && method === "PATCH") {
@@ -270,6 +278,25 @@ async function main() {
       eq("42501: 400 with the message", [r.status, r.body.error], [400, `permission denied for table ${CA}`]);
     }
 
+    console.log("\nPOST /api/assignments: the insert of all rows meets an error (ADR 0029 gate G3)");
+    {
+      // A race: the learner's row was written after the read, so the insert
+      // of all rows answers 23505 and each row is then inserted on its own.
+      const r = await course({ rows: { "u-self": "self" }, unseen: ["u-self"] }, { userIds: ["u-self", "u-new"], dueAt: DUE, releaseAt: RELEASE });
+      eq("a row written since the read: the refused insert of all rows, then one insert per row, the date update and the conversion", writesOf(r.rs, CA), [
+        "insert u-self,u-new", "insert u-self", "insert u-new", `dates ${JSON.stringify({ due_at: DUE, release_at: RELEASE })}`, "conversion",
+      ]);
+      eq("…the answer one insert per row gave: one assigned, one rescheduled; the conversion names the learner already there; the new one emailed",
+        [r.status, r.body.assigned, r.body.rescheduled, filtersOf(r.rs.find(isConversion)!).filter((f) => f.startsWith("user_id")), emailedOf(r.rs)],
+        [200, 1, 1, ["user_id=in.(u-self)"], ["u-new"]]);
+    }
+    {
+      const r = await course({ badInsert: "u-bad" }, { userIds: ["u-new", "u-bad"] });
+      eq("another error on the insert of all rows: 400 with its message, no insert row by row, no conversion, no mail",
+        [r.status, r.body.error, writesOf(r.rs, CA), emailedOf(r.rs)],
+        [400, FK.message, ["insert u-new,u-bad"], []]);
+    }
+
     // ------------------------------------------------------------------
     console.log("\nassignCourseDirect (lib/assignments/direct.ts)");
     const assign = async (w: Partial<World>, userIds: string[], dueAt: string | null, notify = true) => {
@@ -323,6 +350,19 @@ async function main() {
         ["u-new", "assigned", null],
       ], ["u-new"]]);
     }
+    {
+      // ADR 0029 gate G3: the insert of all rows fails for one learner; each
+      // row is then inserted on its own, so the others are still assigned.
+      const r = await assign({ badInsert: "u-bad" }, ["u-new", "u-bad", "u-two"], null);
+      eq("one learner's insert fails: the refused insert of all rows, then one insert per row", writesOf(r.rs, CA), [
+        "insert u-new,u-bad,u-two", "insert u-new", "insert u-bad", "insert u-two",
+      ]);
+      eq("…that learner failed with the message, the others assigned and emailed", [r.results, emailedOf(r.rs)], [[
+        ["u-new", "assigned", null],
+        ["u-bad", "failed", FK.message],
+        ["u-two", "assigned", null],
+      ], ["u-new,u-two"]]);
+    }
 
     console.log("\nconvertSelfEnrolments: chunks of 150, no state between calls");
     {
@@ -375,6 +415,14 @@ async function main() {
     {
       const r = await path({ rows: { "u-self": "self" }, conversion: "42501" }, { userIds: ["u-self"] });
       eq("42501: 400 with the message", [r.status, r.body.error], [400, `permission denied for table ${LPA}`]);
+    }
+    {
+      const r = await path({ rows: { "u-self": "self" }, unseen: ["u-self"] }, { userIds: ["u-self", "u-new"] });
+      eq("a row written since the read (gate G3): the refused insert of all rows, one insert per row, then the conversion; one assigned",
+        [r.status, r.body.assigned, writesOf(r.rs, LPA)], [200, 1, ["insert u-self,u-new", "insert u-self", "insert u-new", "conversion"]]);
+      const bad = await path({ badInsert: "u-bad" }, { userIds: ["u-new", "u-bad"] });
+      eq("another error on the insert of all rows: 400 with its message, nothing more written",
+        [bad.status, bad.body.error, writesOf(bad.rs, LPA)], [400, FK.message, ["insert u-new,u-bad"]]);
     }
   } finally {
     globalThis.fetch = realFetch;
