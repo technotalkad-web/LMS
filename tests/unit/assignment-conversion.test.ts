@@ -117,11 +117,25 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (table === "learning_paths") return json([{ id: PATH, organization_id: ORG, name: "Path P" }]);
   if (table === "teams") return json([{ id: "t-1" }]);
   if (table === "content_scopes") return json([]);
+  // The routes' read of the rows already there (writeAssignmentRows in
+  // lib/assignments/direct.ts): one read per assignee type, as the server
+  // answers it from the rows above.
+  if ((table === "course_assignments" || table === "learning_path_assignments") && method === "GET") {
+    const type = /assignee_type=eq\.(\w+)/.exec(query)?.[1];
+    const listed = (col: string) => (new RegExp(`${col}=in\\.\\(([^)]*)\\)`).exec(query)?.[1] ?? "").split(",").filter(Boolean);
+    if (type === "user") return json(listed("user_id").filter((u) => u in world.rows).map((user_id) => ({ user_id })));
+    if (!world.dupNonUser) return json([]);
+    if (type === "team") return json(listed("team_id").map((team_id) => ({ team_id })));
+    if (type === "group") return json(listed("group_id").map((group_id) => ({ group_id })));
+    if (type === "org") return json([{ id: "row-org" }]);
+    return json([]);
+  }
   if ((table === "course_assignments" || table === "learning_path_assignments") && method === "POST") {
-    const row = body as Row;
-    const dup = row.assignee_type === "user" ? (row.user_id as string) in world.rows : world.dupNonUser;
-    if (dup) return json(DUP, 409);
-    return json([{ id: `row-${String(row.user_id ?? row.team_id ?? row.assignee_type)}`, ...row }], 201);
+    // One row or several in one insert: a row already there fails the whole insert (23505).
+    const list = (Array.isArray(body) ? body : [body]) as Row[];
+    const dup = (row: Row) => (row.assignee_type === "user" ? (row.user_id as string) in world.rows : world.dupNonUser);
+    if (list.some(dup)) return json(DUP, 409);
+    return json(list.map((row) => ({ id: `row-${String(row.user_id ?? row.team_id ?? row.assignee_type)}`, ...row })), 201);
   }
   if ((table === "course_assignments" || table === "learning_path_assignments") && method === "PATCH") {
     if (!query.includes("source=eq.self")) return json([{ id: "row-dated" }]);
@@ -143,10 +157,18 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
 };
 
 const isConversion = (q: Req) => q.method === "PATCH" && q.query.includes("source=eq.self");
-/** Every write in order: an insert by its assignee, a date update, or the conversion. */
+/**
+ * Every write in order: an insert by its assignees (one insert may hold
+ * several rows, ADR 0029 gate G3), a date update, or the conversion. A row
+ * already there is found by the read before the insert, so it is never in
+ * an insert.
+ */
 const writesOf = (rs: Req[], table: string) =>
   rs.filter((q) => q.table === table && q.method !== "GET").map((q) => {
-    if (q.method === "POST") { const b = q.body as Row; return `insert ${String(b.user_id ?? b.team_id ?? b.group_id ?? b.assignee_type)}`; }
+    if (q.method === "POST") {
+      const rows = (Array.isArray(q.body) ? q.body : [q.body]) as Row[];
+      return `insert ${rows.map((b) => String(b.user_id ?? b.team_id ?? b.group_id ?? b.assignee_type)).join(",")}`;
+    }
     return isConversion(q) ? "conversion" : `dates ${JSON.stringify(q.body)}`;
   });
 /** The conversion's filters, read from its query string. */
@@ -182,7 +204,7 @@ async function main() {
     console.log("\nPOST /api/assignments: with the column");
     {
       const r = await course({ rows: { "u-self": "self" } }, { userIds: ["u-self"] });
-      eq("an undated assign of a self-enrolled learner: the insert, then one conversion and no date update", writesOf(r.rs, CA), ["insert u-self", "conversion"]);
+      eq("an undated assign of a self-enrolled learner: no insert (the row is read as there), one conversion and no date update", writesOf(r.rs, CA), ["conversion"]);
       const c = r.rs.find(isConversion)!;
       eq("…the conversion writes source 'admin' and the admin as assigned_by, nothing else", c.body, { source: "admin", assigned_by: USER.id });
       eq("…it names the course, the org, a user row, the learner and source = 'self'", filtersOf(c), [
@@ -194,14 +216,14 @@ async function main() {
     {
       const r = await course({ rows: { "u-self": "self" } }, { userIds: ["u-self"], dueAt: DUE, releaseAt: RELEASE });
       eq("a dated assign: today's date update first, then the conversion", writesOf(r.rs, CA), [
-        "insert u-self", `dates ${JSON.stringify({ due_at: DUE, release_at: RELEASE })}`, "conversion",
+        `dates ${JSON.stringify({ due_at: DUE, release_at: RELEASE })}`, "conversion",
       ]);
       eq("…the conversion does not write the dates again", r.rs.find(isConversion)!.body, { source: "admin", assigned_by: USER.id });
       eq("…200, rescheduled as today", [r.status, r.body.rescheduled], [200, 1]);
     }
     {
       const r = await course({ rows: { "u-adm": "admin" } }, { userIds: ["u-adm"] });
-      eq("an admin row re-assigned without dates: the conversion matches nothing and no date is written", writesOf(r.rs, CA), ["insert u-adm", "conversion"]);
+      eq("an admin row re-assigned without dates: the conversion matches nothing and no date is written", writesOf(r.rs, CA), ["conversion"]);
       eq("…200", r.status, 200);
     }
     {
@@ -213,7 +235,7 @@ async function main() {
     {
       const r = await course({ dupNonUser: true }, { assignToOrg: true, teamIds: ["t-1"], dueAt: DUE });
       eq("an org and a team row already there: today's date updates, no conversion", writesOf(r.rs, CA), [
-        "insert org", `dates ${JSON.stringify({ due_at: DUE, release_at: null })}`, "insert t-1", `dates ${JSON.stringify({ due_at: DUE, release_at: null })}`,
+        `dates ${JSON.stringify({ due_at: DUE, release_at: null })}`, `dates ${JSON.stringify({ due_at: DUE, release_at: null })}`,
       ]);
       const none = await course({}, { userIds: ["u-new"] });
       eq("nothing already there: no conversion call", none.rs.filter(isConversion).length, 0);
@@ -226,7 +248,7 @@ async function main() {
       const r = await course({}, { userIds: ["u-new", "u-gone"] });
       eq("an active and an inactive learner named directly: both assigned, only the active one emailed",
         [r.status, r.body.assigned, writesOf(r.rs, CA), emailedOf(r.rs), logged(r.rs)],
-        [200, 2, ["insert u-new", "insert u-gone"], ["u-new"], ["u-new"]]);
+        [200, 2, ["insert u-new,u-gone"], ["u-new"], ["u-new"]]);
       const org = await course({}, { assignToOrg: true });
       eq("an org-wide row: every active member emailed, the inactive one not", [org.status, logged(org.rs)], [200, ["u-adm", "u-new", "u-self"]]);
     }
@@ -234,12 +256,12 @@ async function main() {
     console.log("\nPOST /api/assignments: without the column (today's sequence)");
     for (const code of ["PGRST204", "42703"] as const) {
       const dated = await course({ rows: { "u-self": "self" }, conversion: code }, { userIds: ["u-self"], dueAt: DUE, releaseAt: RELEASE });
-      eq(`${code}, dated: today's insert and date update, then the one refused conversion`, writesOf(dated.rs, CA), [
-        "insert u-self", `dates ${JSON.stringify({ due_at: DUE, release_at: RELEASE })}`, "conversion",
+      eq(`${code}, dated: today's date update, then the one refused conversion`, writesOf(dated.rs, CA), [
+        `dates ${JSON.stringify({ due_at: DUE, release_at: RELEASE })}`, "conversion",
       ]);
       eq(`…${code}: today's answer`, [dated.status, dated.body.assigned, dated.body.rescheduled], [200, 0, 1]);
       const plain = await course({ rows: { "u-self": "self" }, conversion: code }, { userIds: ["u-self"] });
-      eq(`${code}, undated: today's insert (a no-op 23505), the refused conversion, nothing else`, [plain.status, writesOf(plain.rs, CA)], [200, ["insert u-self", "conversion"]]);
+      eq(`${code}, undated: no insert (the row is there), the refused conversion, nothing else`, [plain.status, writesOf(plain.rs, CA)], [200, ["conversion"]]);
     }
 
     console.log("\nPOST /api/assignments: any other error is not swallowed");
@@ -262,7 +284,7 @@ async function main() {
     };
     {
       const r = await assign({ rows: { "u-self": "self", "u-adm": "admin" } }, ["u-self", "u-adm", "u-new"], null);
-      eq("an undated assign: three inserts, then one conversion naming the two already there", writesOf(r.rs, CA), ["insert u-self", "insert u-adm", "insert u-new", "conversion"]);
+      eq("an undated assign: one insert of the new learner, then one conversion naming the two already there", writesOf(r.rs, CA), ["insert u-new", "conversion"]);
       const c = r.rs.find(isConversion)!;
       eq("…source 'admin', the admin, on the service client", [c.body, c.apikey], [{ source: "admin", assigned_by: USER.id }, SERVICE]);
       eq("…its filters", filtersOf(c), ["assignee_type=eq.user", `course_id=eq.${COURSE}`, `organization_id=eq.${ORG}`, "source=eq.self", "user_id=in.(u-self,u-adm)"]);
@@ -275,8 +297,8 @@ async function main() {
     }
     {
       const r = await assign({ rows: { "u-self": "self", "u-adm": "admin" } }, ["u-self", "u-adm"], DUE, false);
-      eq("a due-date change (a ticket's extend_due): today's date update for each, then the conversion", writesOf(r.rs, CA), [
-        "insert u-self", `dates ${JSON.stringify({ due_at: DUE })}`, "insert u-adm", `dates ${JSON.stringify({ due_at: DUE })}`, "conversion",
+      eq("a due-date change (a ticket's extend_due): one date update for both, then the conversion", writesOf(r.rs, CA), [
+        `dates ${JSON.stringify({ due_at: DUE })}`, "conversion",
       ]);
       eq("…both count for extend_due: converted, and already with the date updated", r.results, [
         ["u-self", "assigned", "self-enrolment converted to an assignment"],
@@ -286,8 +308,8 @@ async function main() {
     }
     for (const code of ["PGRST204", "42703"] as const) {
       const r = await assign({ rows: { "u-self": "self", "u-adm": "admin" }, conversion: code }, ["u-self", "u-adm"], DUE, false);
-      eq(`${code}: today's inserts and date updates, then the one refused conversion`, writesOf(r.rs, CA), [
-        "insert u-self", `dates ${JSON.stringify({ due_at: DUE })}`, "insert u-adm", `dates ${JSON.stringify({ due_at: DUE })}`, "conversion",
+      eq(`${code}: the one date update, then the one refused conversion`, writesOf(r.rs, CA), [
+        `dates ${JSON.stringify({ due_at: DUE })}`, "conversion",
       ]);
       eq(`…${code}: today's results`, r.results, [
         ["u-self", "already", "already assigned — due date updated"],
@@ -326,7 +348,7 @@ async function main() {
     console.log("\nPOST /api/learning-path-assignments: with the column");
     {
       const r = await path({ rows: { "u-self": "self" } }, { userIds: ["u-self"] });
-      eq("an undated assign of a self-enrolled learner: the insert, then one conversion", writesOf(r.rs, LPA), ["insert u-self", "conversion"]);
+      eq("an undated assign of a self-enrolled learner: no insert (the row is there), then one conversion", writesOf(r.rs, LPA), ["conversion"]);
       const c = r.rs.find(isConversion)!;
       eq("…source 'admin' and the admin; no due date given, none written", c.body, { source: "admin", assigned_by: USER.id });
       eq("…it names the path, the org, a user row, the learner and source = 'self'", filtersOf(c), [
@@ -335,18 +357,18 @@ async function main() {
       eq("…200", [r.status, r.body.assigned], [200, 0]);
       const dated = await path({ rows: { "u-self": "self" } }, { userIds: ["u-self"], dueAt: DUE });
       eq("a dated assign: the conversion carries the admin's due date (the route writes no date on a 23505)", [writesOf(dated.rs, LPA), dated.rs.find(isConversion)!.body], [
-        ["insert u-self", "conversion"], { source: "admin", assigned_by: USER.id, due_at: DUE },
+        ["conversion"], { source: "admin", assigned_by: USER.id, due_at: DUE },
       ]);
       const adm = await path({ rows: { "u-adm": "admin" } }, { userIds: ["u-adm"], dueAt: DUE });
-      eq("an admin row: the conversion matches nothing; no other write (today's no-op)", [adm.status, writesOf(adm.rs, LPA)], [200, ["insert u-adm", "conversion"]]);
+      eq("an admin row: the conversion matches nothing; no other write (today's no-op)", [adm.status, writesOf(adm.rs, LPA)], [200, ["conversion"]]);
       const team = await path({ dupNonUser: true }, { teamIds: ["t-1"], assignToOrg: true });
-      eq("a team and an org row already there: no conversion call", [team.status, writesOf(team.rs, LPA)], [200, ["insert org", "insert t-1"]]);
+      eq("a team and an org row already there: no conversion call, and no insert (both are read as there)", [team.status, writesOf(team.rs, LPA)], [200, []]);
     }
 
     console.log("\nPOST /api/learning-path-assignments: without the column (today's no-op)");
     for (const code of ["PGRST204", "42703"] as const) {
       const r = await path({ rows: { "u-self": "self" }, conversion: code }, { userIds: ["u-self"], dueAt: DUE });
-      eq(`${code}: today's insert, the refused conversion, nothing else; 200`, [r.status, r.body.assigned, writesOf(r.rs, LPA)], [200, 0, ["insert u-self", "conversion"]]);
+      eq(`${code}: no insert (the row is there), the refused conversion, nothing else; 200`, [r.status, r.body.assigned, writesOf(r.rs, LPA)], [200, 0, ["conversion"]]);
     }
 
     console.log("\nPOST /api/learning-path-assignments: any other error is not swallowed");

@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { loadOrgGovernance } from "@/lib/org/field-options";
-import { checkScopeTarget, ensureScopeGroup } from "@/lib/org/scope-groups";
+import { checkScopeTarget, ensureScopeGroups } from "@/lib/org/scope-groups";
 import { describeScopes, loadScopesFor, scopeLabel, scopesCover, type ScopePair } from "@/lib/content/scopes";
 import { createClient } from "@/lib/supabase/server";
 import { CHECK_FAILED } from "@/lib/auth/api-admin";
@@ -11,7 +11,7 @@ import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@
 import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
 import { assigneeRecipientsStrict } from "@/lib/org/groups";
-import { convertSelfEnrolments } from "@/lib/assignments/direct";
+import { convertSelfEnrolments, rescheduleAssignments, writeAssignmentRows } from "@/lib/assignments/direct";
 
 /**
  *   POST /api/assignments
@@ -180,8 +180,8 @@ export async function POST(request: Request) {
       if (!t.ok) return NextResponse.json({ error: t.error }, { status: 400 });
       scopeTargets.push(t.pair);
     }
-    for (const pair of scopeTargets) {
-      const g = await ensureScopeGroup(supabase, org.id, pair, user.id);
+    // One read of the pairs' groups, not one per pair (ADR 0029 gate G3).
+    for (const g of await ensureScopeGroups(supabase, org.id, scopeTargets, user.id)) {
       if ("error" in g) {
         const msg = /system_key|does not exist|schema cache/.test(g.error) ? "Assigning to a vertical / department needs migration 0096" : g.error;
         return NextResponse.json({ error: msg }, { status: 400 });
@@ -269,42 +269,35 @@ export async function POST(request: Request) {
   let rescheduled = 0;
   /** Learners whose direct row was already there: each may be their own self-enrolment (converted below). */
   const alreadyUserIds: string[] = [];
-  // select("*") for 0069 deploy safety (group_id).
+  /** The rows already there (the unique index), for their new dates. */
+  const already: Row[] = [];
+  // The rows in one insert per 150 (ADR 0029 gate G3: one insert per named
+  // learner passed the platform's 50 calls from 11 learners on); each row's
+  // outcome is what its own insert answered, and the first error other than
+  // a duplicate answers 400, as before. select("*") for 0069 deploy safety
+  // (group_id).
   const SELECT_COLS = "*";
-  for (const row of rows) {
-    const { data, error } = await supabase
-      .from("course_assignments")
-      .insert(row)
-      .select(SELECT_COLS)
-      .maybeSingle();
-    if (data) {
-      inserted.push(data);
-      continue;
-    }
-    if (!error) continue;
-    if (error.code !== "23505") {
-      return NextResponse.json({ error: error.message }, { status: 400 });
-    }
+  const written = await writeAssignmentRows(supabase, "course_assignments", { column: "course_id", id: course.id }, rows, SELECT_COLS, { stopAtError: true });
+  if (written.error) {
+    return NextResponse.json({ error: written.error.message }, { status: 400 });
+  }
+  written.outcomes.forEach((o, i) => {
+    if (o.kind === "inserted") inserted.push(o.data);
+    if (o.kind !== "duplicate") return;
+    const row = rows[i];
     if (row.assignee_type === "user" && row.user_id) alreadyUserIds.push(row.user_id);
-    // Already assigned (unique index). Re-assigning is how an admin changes
-    // the schedule, so apply the new dates instead of silently doing nothing.
-    // No notification: the learner was already told about this assignment.
-    if (dueAt === null && releaseAt === null) continue;
-    let q = supabase
-      .from("course_assignments")
-      .update({ due_at: dueAt, release_at: releaseAt })
-      .eq("course_id", row.course_id)
-      .eq("organization_id", row.organization_id)
-      .eq("assignee_type", row.assignee_type);
-    q = row.user_id ? q.eq("user_id", row.user_id) : q.is("user_id", null);
-    q = row.team_id ? q.eq("team_id", row.team_id) : q.is("team_id", null);
-    // Only group rows carry group_id (pre-0069 DBs never see the column).
-    if (row.group_id) q = q.eq("group_id", row.group_id);
-    const { data: updated, error: updErr } = await q.select("id");
-    if (updErr) {
-      return NextResponse.json({ error: updErr.message }, { status: 400 });
+    already.push(row);
+  });
+  // Already assigned (unique index). Re-assigning is how an admin changes
+  // the schedule, so apply the new dates instead of silently doing nothing:
+  // one update per assignee type, with each row's own filters. No
+  // notification: the learner was already told about this assignment.
+  if (already.length > 0 && !(dueAt === null && releaseAt === null)) {
+    const dated = await rescheduleAssignments(supabase, "course_assignments", { column: "course_id", id: course.id, orgId: org.id }, already, { due_at: dueAt, release_at: releaseAt });
+    if (dated.error) {
+      return NextResponse.json({ error: dated.error.message ?? "Could not update the dates" }, { status: 400 });
     }
-    rescheduled += updated?.length ?? 0;
+    rescheduled = dated.updated;
   }
 
   // ADR 0024 step 24 (P2-6 item 2): a learner who only pressed Start on an

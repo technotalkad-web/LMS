@@ -389,6 +389,10 @@ function fakeDb(tables: Record<string, FRow[]>, fault: Fault = () => null) {
   return { db, queries, inserts, updates };
 }
 
+/** The rows of every insert, one insert or several (ADR 0029 gate G3: a call's grants are one insert). */
+const insertedRows = (f: { inserts: Array<{ table: string; payload: unknown }> }) =>
+  f.inserts.flatMap((i) => (Array.isArray(i.payload) ? (i.payload as FRow[]) : [i.payload as FRow]));
+
 const ORG = "org-1";
 const COURSE = "course-1";
 const VERSION = "ver-1";
@@ -559,7 +563,7 @@ async function ticketCases() {
     const out = await ticketOf(f.db);
     eq("with 0107: only the learners who failed for real are granted; a Preview alone or a failed Preview beside a real pass is not a failure",
       byUid(out), { u1: "granted", u4: "skipped: has not failed this module", u5: "granted", u6: "skipped: has not failed this module" });
-    eq("…attempts_used counts the real attempt only", f.inserts.map((i) => [(i.payload as FRow).user_id, (i.payload as FRow).attempts_used]), [["u1", 1], ["u5", 1]]);
+    eq("…attempts_used counts the real attempt only", insertedRows(f).map((r) => [r.user_id, r.attempts_used]), [["u1", 1], ["u5", 1]]);
     eq("…one attempts read, with context_kind neq preview", f.queries.filter(isAttempts).map(filterOf), ["preview"]);
   }
   {
@@ -598,7 +602,7 @@ async function ticketCases() {
     }
     const lines = warned.filter((l) => l.includes("mail_recipients_unreadable"));
     eq("the members that count cannot be read: both grants stand, read once, no member read, one log line with the organisation's id",
-      [byUid(out).u1, byUid(out).u5, f.inserts.length, f.queries.filter((q) => q.table === "organizations").length,
+      [byUid(out).u1, byUid(out).u5, insertedRows(f).length, f.queries.filter((q) => q.table === "organizations").length,
         f.queries.filter((q) => q.table === "organization_members").length, lines.length, lines.every((l) => l.includes(ORG) && !l.includes("@"))],
       ["granted", "granted", 2, 1, 0, 1, true]);
     eq("…and the answer says nobody was emailed because the recipients could not be read (the inbox shows it)",

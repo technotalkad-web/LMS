@@ -156,6 +156,8 @@ export async function grantExtraAttempts(
   let run: MailRun | undefined;
   /** The granted learners' mails, for the answer (rule T4). */
   let mailed: MailCounts = mailCounts([]);
+  /** The learners to grant, each with their place in `results` and their row. */
+  const grants: Array<{ at: number; uid: string; row: Record<string, unknown> }> = [];
   for (const uid of ids) {
     const mine = byUser.get(uid) ?? [];
     const retakeIds = retakes.get(`${uid}:${course.id}`)?.retakeIds ?? new Set<string>();
@@ -180,26 +182,63 @@ export async function grantExtraAttempts(
       decided_at: nowIso,
       expires_at: expiresAt,
     };
-    // Degrade only as far as the database requires: an older source CHECK
-    // rejects 'ticket' / 'manager' (23514 → record as a bulk-style grant;
-    // decided_by still names the admin), pre-0085 has no attempts_used (42703).
-    let row: Record<string, unknown> = { ...base, attempts_used: sc.scoredAttempts };
-    let { error } = await svc.from("attempt_requests").insert(row);
+    grants.push({ at: results.length, uid, row: { ...base, attempts_used: sc.scoredAttempts } });
+    // Granted unless the insert below says otherwise.
+    results.push({ userId: uid, status: "granted" });
+  }
+
+  // The grants (ADR 0029 gate G3: one call, not one per learner). Degrade
+  // only as far as the database requires: an older source CHECK rejects
+  // 'ticket' / 'manager' (23514 → record as a bulk-style grant; decided_by
+  // still names the admin), pre-0085 has no attempts_used (42703). The one
+  // insert holds every row, so it degrades as each row's own insert would.
+  // Any error it still answers is each learner's own again: then each row
+  // is inserted on its own, as before, and a learner whose row fails (23505:
+  // a grant made since the read) is failed while the others are granted.
+  /** The calls the grants' inserts made, for the mail's budget. */
+  let insertCalls = 0;
+  const insertGrant = async (first: Record<string, unknown> | Record<string, unknown>[]) => {
+    let rows = Array.isArray(first) ? first : [first];
+    const send = () => {
+      insertCalls++;
+      return svc.from("attempt_requests").insert(Array.isArray(first) ? rows : rows[0]);
+    };
+    let { error } = await send();
     for (let i = 0; error && i < 2; i++) {
       const code = (error as { code?: string }).code;
-      if (code === "23514" && row.source !== "bulk") row = { ...row, source: "bulk" };
-      else if (code === "42703" && "attempts_used" in row) {
-        const { attempts_used: _dropped, ...rest } = row;
-        void _dropped;
-        row = rest;
+      if (code === "23514" && rows.some((r) => r.source !== "bulk")) rows = rows.map((r) => ({ ...r, source: "bulk" }));
+      else if (code === "42703" && rows.some((r) => "attempts_used" in r)) {
+        rows = rows.map((r) => {
+          const { attempts_used: _dropped, ...rest } = r;
+          void _dropped;
+          return rest;
+        });
       } else break;
-      ({ error } = await svc.from("attempt_requests").insert(row));
+      ({ error } = await send());
     }
-    if (error) {
-      results.push({ userId: uid, status: "failed", reason: (error as { code?: string }).code === "23505" ? "already has an open request or grant" : "the grant could not be saved" });
-      continue;
+    return error;
+  };
+  const failedGrant = (g: (typeof grants)[number], error: unknown): PerLearnerResult => ({
+    userId: g.uid,
+    status: "failed",
+    reason: (error as { code?: string }).code === "23505" ? "already has an open request or grant" : "the grant could not be saved",
+  });
+  if (grants.length === 1) {
+    const error = await insertGrant(grants[0].row);
+    if (error) results[grants[0].at] = failedGrant(grants[0], error);
+  } else if (grants.length > 1) {
+    const batchError = await insertGrant(grants.map((g) => g.row));
+    if (batchError) {
+      for (const g of grants) {
+        const error = await insertGrant(g.row);
+        if (error) results[g.at] = failedGrant(g, error);
+      }
     }
-    results.push({ userId: uid, status: "granted" });
+  }
+
+  for (const g of grants) {
+    if (results[g.at].status !== "granted") continue;
+    const uid = g.uid;
     // ADR 0030 rule 10: the organisation's members that count, read once for
     // this call at its first grant. A failed read of them or of the
     // addresses mails nobody and records the skip once; the grants stand.
@@ -214,7 +253,7 @@ export async function grantExtraAttempts(
     // Rule 10: a learner whose membership does not count gets no mail, and
     // no run is opened for nobody.
     if (!counting.has(uid)) continue;
-    run ??= await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS + ids.length }), db: svc });
+    run ??= await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS + insertCalls }), db: svc });
     const who = people.get(uid);
     const one = await notifyLearnerOfDecision(svc, {
       orgId: args.orgId, orgName: args.orgName, orgSlug: args.orgSlug, origin: args.origin,

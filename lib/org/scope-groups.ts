@@ -68,6 +68,60 @@ export async function ensureScopeGroup(
     if (!row.is_active) await svc.from("org_groups").update({ is_active: true, updated_at: new Date().toISOString() }).eq("id", row.id);
     return { id: row.id };
   }
+  return createScopeGroup(svc, orgId, pair, createdBy);
+}
+
+/**
+ * ensureScopeGroup for each of an assignment's pairs (at most 20 a request),
+ * in their order, stopping at the first error as the routes did: the groups
+ * already there are read in one call and the deactivated ones among them
+ * re-activated in one, not one read (and update) per pair (ADR 0029 gate
+ * G3: an administrator's request that also mails stays within its calls). A
+ * pair whose group is not there yet is created as before, one pair at a
+ * time. One pair, or a key a filter list cannot carry (a double quote or a
+ * backslash in a master value), takes ensureScopeGroup itself.
+ */
+export async function ensureScopeGroups(
+  svc: SupabaseClient,
+  orgId: string,
+  pairs: ScopePair[],
+  createdBy: string | null
+): Promise<Array<{ id: string } | { error: string }>> {
+  const out: Array<{ id: string } | { error: string }> = [];
+  const keys = [...new Set(pairs.map(scopeGroupKey))];
+  if (keys.length < 2 || keys.some((k) => /["\\]/.test(k))) {
+    for (const pair of pairs) {
+      const g = await ensureScopeGroup(svc, orgId, pair, createdBy);
+      out.push(g);
+      if ("error" in g) break;
+    }
+    return out;
+  }
+  const { data, error } = await svc.from("org_groups").select("id, is_active, system_key").eq("organization_id", orgId).in("system_key", keys);
+  if (error) return [{ error: error.message }];
+  const rows = (data ?? []) as Array<{ id: string; is_active: boolean; system_key: string }>;
+  const there = new Map(rows.map((r) => [r.system_key, r.id]));
+  const inactive = rows.filter((r) => !r.is_active).map((r) => r.id);
+  if (inactive.length) await svc.from("org_groups").update({ is_active: true, updated_at: new Date().toISOString() }).in("id", inactive);
+  for (const pair of pairs) {
+    const key = scopeGroupKey(pair);
+    const id = there.get(key);
+    const g = id ? { id } : await createScopeGroup(svc, orgId, pair, createdBy);
+    out.push(g);
+    if ("error" in g) break;
+    there.set(key, g.id);
+  }
+  return out;
+}
+
+/** Create the system group for a pair that has none (ensureScopeGroup's second half). */
+async function createScopeGroup(
+  svc: SupabaseClient,
+  orgId: string,
+  pair: ScopePair,
+  createdBy: string | null
+): Promise<{ id: string } | { error: string }> {
+  const system_key = scopeGroupKey(pair);
   const rules = { verticals: [pair.vertical], ...(pair.department ? { departments: [pair.department] } : {}) };
   const base = {
     organization_id: orgId,

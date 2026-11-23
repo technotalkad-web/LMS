@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { loadOrgGovernance } from "@/lib/org/field-options";
-import { checkScopeTarget, ensureScopeGroup } from "@/lib/org/scope-groups";
+import { checkScopeTarget, ensureScopeGroups } from "@/lib/org/scope-groups";
 import { describeScopes, loadScopesFor, scopeLabel, scopesCover, type ScopePair } from "@/lib/content/scopes";
 import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { countingMemberIds } from "@/lib/auth/org-membership";
@@ -10,7 +10,7 @@ import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@
 import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
 import { assigneeRecipientsStrict } from "@/lib/org/groups";
-import { convertSelfEnrolments } from "@/lib/assignments/direct";
+import { convertSelfEnrolments, writeAssignmentRows } from "@/lib/assignments/direct";
 
 /**
  *   POST /api/learning-path-assignments
@@ -128,8 +128,8 @@ export async function POST(request: Request) {
       if (!t.ok) return NextResponse.json({ error: t.error }, { status: 400 });
       scopeTargets.push(t.pair);
     }
-    for (const pair of scopeTargets) {
-      const g = await ensureScopeGroup(supabase, org.id, pair, userId);
+    // One read of the pairs' groups, not one per pair (ADR 0029 gate G3).
+    for (const g of await ensureScopeGroups(supabase, org.id, scopeTargets, userId)) {
       if ("error" in g) {
         const msg = /system_key|does not exist|schema cache/.test(g.error) ? "Assigning to a vertical / department needs migration 0096" : g.error;
         return NextResponse.json({ error: msg }, { status: 400 });
@@ -225,19 +225,21 @@ export async function POST(request: Request) {
   const inserted: unknown[] = [];
   /** Learners whose direct row was already there: each may be their own self-enrolment (converted below). */
   const alreadyUserIds: string[] = [];
-  for (const row of rows) {
-    const { data, error } = await supabase
-      .from("learning_path_assignments")
-      .insert(row)
-      .select("id, assignee_type, user_id, team_id, due_at, assigned_at")
-      .maybeSingle();
-    if (data) inserted.push(data);
-    else if (error && error.code !== "23505") {
-      return NextResponse.json({ error: error.message }, { status: 400 });
-    } else if (error && row.assignee_type === "user" && row.user_id) {
-      alreadyUserIds.push(row.user_id);
-    }
+  // The rows in one insert per 150 (ADR 0029 gate G3: one insert per named
+  // learner passed the platform's 50 calls from 11 learners on); each row's
+  // outcome is what its own insert answered, and the first error other than
+  // a duplicate answers 400, as before.
+  const written = await writeAssignmentRows(
+    supabase, "learning_path_assignments", { column: "path_id", id: body.pathId }, rows,
+    "id, assignee_type, user_id, team_id, due_at, assigned_at", { stopAtError: true }
+  );
+  if (written.error) {
+    return NextResponse.json({ error: written.error.message }, { status: 400 });
   }
+  written.outcomes.forEach((o, i) => {
+    if (o.kind === "inserted") inserted.push(o.data);
+    else if (o.kind === "duplicate" && rows[i].assignee_type === "user" && rows[i].user_id) alreadyUserIds.push(rows[i].user_id!);
+  });
 
   // ADR 0024 step 24 (P2-6 item 2): a learner who only pressed Start on an
   // "Everyone" path holds a self row; this assignment converts it (source

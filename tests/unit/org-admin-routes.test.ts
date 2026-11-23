@@ -277,6 +277,11 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
     }
     return list(MEMBERS.filter((r) => matches(r, q)));
   }
+  // The POST routes' read of the rows already there (writeAssignmentRows in
+  // lib/assignments/direct.ts, on the admin's session) finds none: every POST
+  // case here is a first assignment. The rows below are for the deletes and
+  // the service role's reads.
+  if (session && q.has("assignee_type") && (p === "/rest/v1/course_assignments" || p === "/rest/v1/learning_path_assignments")) return list([]);
   if (p === "/rest/v1/course_assignments") return list([COURSE_ASSIGNMENT, COURSE_TEAM_ASSIGNMENT].filter((r) => matches(r, q)));
   // The service role reads it too: the notify_update pass of a path's courses lists the path's audience.
   if (p === "/rest/v1/learning_path_assignments") return list([PATH_ASSIGNMENT, PATH_TEAM_ASSIGNMENT].filter((r) => matches(r, q)));
@@ -295,6 +300,8 @@ const writes = () => requests.filter((r) => r.host === SUPABASE_HOST && r.path.s
 const ssoAdmin = () => requests.filter((r) => r.path.startsWith("/auth/v1/admin/sso/providers")).map((r) => `${r.method} ${r.path.replace("/auth/v1/admin/sso/providers", "") || "/"}`);
 const cloudflare = () => requests.filter((r) => r.host === CLOUDFLARE_HOST).map((r) => `${r.method} ${r.path.replace(/^.*\/custom_hostnames/, "") || "/"}`);
 const sessionWrites = (table: string, method: string) => writes().filter((r) => r.path === `/rest/v1/${table}` && r.method === method && r.key !== SERVICE_KEY);
+/** The rows of a table's session inserts, one insert or several (ADR 0029 gate G3: an assignment's rows are one insert). */
+const insertedRows = (table: string) => sessionWrites(table, "POST").flatMap((w) => (Array.isArray(w.body) ? (w.body as Row[]) : [w.body as Row]));
 
 async function main() {
   process.env.NEXT_PUBLIC_SUPABASE_URL = SUPABASE;
@@ -434,7 +441,7 @@ async function main() {
         const res = await pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, assignToOrg: true, userIds: ["u-2"] }));
         const b = (await res.json()) as Row;
         eq(`path assign as ${r}: 200, two rows (org + user), the notification pass ran (service key)`,
-          [res.status, b.assigned, sessionWrites("learning_path_assignments", "POST").length, serviceCalls().length > 0], [200, 2, 2, true]);
+          [res.status, b.assigned, insertedRows("learning_path_assignments").length, serviceCalls().length > 0], [200, 2, 2, true]);
       }
       {
         const out = await call(CALLS[7], { role: r });
@@ -474,7 +481,7 @@ async function main() {
     {
       world({ role: "admin" });
       const res = await pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, userIds: ["u-2", "u-x"], teamIds: ["t1", "t9"] }));
-      const inserted = sessionWrites("learning_path_assignments", "POST").map((w) => w.body as Row);
+      const inserted = insertedRows("learning_path_assignments");
       eq("named users and teams of another org are dropped: one user row (u-2), one team row (t1)",
         [res.status, inserted.map((r) => r.user_id ?? r.team_id)], [200, ["u-2", "t1"]]);
       const svcText = serviceCalls().map((r) => r.query.toString()).join(" ");
@@ -622,7 +629,7 @@ async function main() {
       {
         world({ role: "admin" });
         const res = await pathAssign.POST(post("/api/learning-path-assignments", { orgSlug: "org", pathId: PATH, userIds: ["u-2", "u-3", "u-4"] }));
-        const named = sessionWrites("learning_path_assignments", "POST").map((w) => (w.body as Row).user_id);
+        const named = insertedRows("learning_path_assignments").map((r) => r.user_id);
         eq("POST /api/learning-path-assignments, three people named directly: all three assigned, only the active one told",
           [res.status, named, mailed()], [200, ["u-2", "u-3", "u-4"], ["u-2"]]);
       }
