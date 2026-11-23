@@ -375,12 +375,17 @@ const GRANT_COLUMNS = "id, used_attempt_id, used_at, expires_at, created_at, dec
  * link; only then is a missing relation (isSchemaMissing, pre-0083) "no
  * grants"; any other error, or an answer with neither rows nor an error,
  * throws GrantReadError.
+ *
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each read,
+ * the re-read without `reissued_from` included, so a request that counts
+ * its calls counts what this makes.
  */
 export async function grantSnapshotFor(
   svc: AnyClient,
   userId: string,
   courseId: string,
-  nowIso: string = new Date().toISOString()
+  nowIso: string = new Date().toISOString(),
+  countCall?: () => unknown
 ): Promise<GrantSnapshot> {
   // Its own abort signal: Next memoizes identical GET fetches within one
   // server render, and the launch page reads the grants again after
@@ -388,14 +393,16 @@ export async function grantSnapshotFor(
   // signal opts the read out of that cache. Elsewhere it costs nothing: the
   // course and attempt pages read the grants once per render, and route
   // handlers have no such cache.
-  const read = (columns: string) =>
-    svc
+  const read = (columns: string) => {
+    countCall?.();
+    return svc
       .from("attempt_requests")
       .select(columns)
       .eq("user_id", userId)
       .eq("course_id", courseId)
       .eq("status", "approved")
       .abortSignal(new AbortController().signal);
+  };
   let res: { data: unknown; error: PgError } = await read(`${GRANT_COLUMNS}, reissued_from`);
   if (res.error && isMissingColumn(res.error, "reissued_from")) res = await read(GRANT_COLUMNS);
   if (res.error) {

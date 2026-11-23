@@ -1,6 +1,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, sendNotification, type MailCounts, type MailOutcome } from "@/lib/notifications/send";
 import {
+  ADMIN_REQUEST_OWN_CALLS,
   GROUP_TAIL_CALLS,
   MAIL_CALL_COSTS,
   hasRoom,
@@ -36,6 +37,16 @@ import { resolveOrgMembership } from "@/lib/auth/org-membership";
  */
 const ADMIN_READ_ROLES = ["super_owner", "owner", "admin"];
 
+/**
+ * The administrators' mail about a new manager ticket, in one run.
+ *
+ * ADR 0029 rule FP2: `budget` is the request's, its count holding the calls
+ * the request made before this (POST /api/tickets counts from its first
+ * call, the middleware's). The reads made here are counted on it where they
+ * are made, and the run is opened on it, so the mail is sized on the calls
+ * really made; what it has no room for is left. Without one, the count
+ * starts at the route's own calls.
+ */
 export async function notifyAdminsOfTicket(
   svc: SupabaseClient,
   args: {
@@ -48,9 +59,14 @@ export async function notifyAdminsOfTicket(
     categoryLabel: string;
     lines: string[];
     note: string | null;
+    /** The request's budget, its count holding the request's calls so far. */
+    budget?: MailBudget;
   }
 ): Promise<void> {
   try {
+    const budget = args.budget ?? requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+    // The administrators: one call (at most 25 rows).
+    spendCalls(budget, 1);
     const { data: admins, error: adminsErr } = await svc
       .from("organization_members")
       .select("user_id")
@@ -67,6 +83,8 @@ export async function notifyAdminsOfTicket(
     // inbox and the Attention Center carry the ticket for everyone else).
     const ids = (admins as Array<{ user_id: string }>).map((a) => a.user_id).slice(0, 25);
     if (ids.length === 0) return;
+    // Their addresses: one call (25 ids fit one).
+    spendCalls(budget, 1);
     const emails = await resolveEmailsStrict(svc, ids);
     if (emails === "unreadable") {
       await recordRecipientsUnreadable("ticket-admins", args.orgId);
@@ -79,7 +97,7 @@ export async function notifyAdminsOfTicket(
       args.lines.map((l) => `- ${l}`).join("\n") +
       (args.note ? `\n\n> ${args.note}` : "") +
       `\n\nReview it in Tickets → Manager requests and act from the ticket.`;
-    const run = await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: 8 }), db: svc });
+    const run = await openRun({ organizationId: args.orgId, budget, db: svc });
     await sendMany(run, [...emails], ([uid, email]) => ({
       event: "custom_broadcast",
       to: { user_id: uid, email },
@@ -99,6 +117,8 @@ export async function notifyAdminsOfTicket(
 const MEMBERSHIP_CALLS = 2;
 /** The calls the requester's mail reads before its send: their membership and their address. */
 export const REQUESTER_READ_CALLS = MEMBERSHIP_CALLS + 1;
+/** The least the requester's mail makes when it goes: its three reads, its send and its log row (ADR 0029, note of 2026-11-24). */
+export const REQUESTER_HELD_CALLS = REQUESTER_READ_CALLS + MAIL_CALL_COSTS.send + MAIL_CALL_COSTS.logInsert;
 
 /**
  * The requester's outcome when the request had no room left for their mail

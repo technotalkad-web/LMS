@@ -32,9 +32,17 @@
  * end to end here, and each whole request, with the middleware's call,
  * stays within the 40 of rule FP2: one budget counted from the request's
  * first call, each call where it is made, and one run, the requester's
- * mail of a ticket included. With no room left, the requester's mail is
- * left, never read or attempted, and the answer says so (`left`). A ticket
- * naming one learner still mails both.
+ * mail of a ticket included. The requester's room is held back with the
+ * ticket's close (ADR 0029, note of 2026-11-24), so at every size a ticket
+ * can name the requester is emailed: a large ticket emails 4 learners on a
+ * grant and 11 on an assignment, and up to those sizes every learner. With
+ * no room left after all (by the count or by the clock), the requester's
+ * mail is left, never read or attempted, and the answer says so (`left`);
+ * two cases call actOnTicket with such a budget.
+ *
+ * A learner's request for another attempt (POST /api/attempt-requests) and
+ * a manager's new ticket (POST /api/tickets) mail up to 25 administrators;
+ * each counts from its first call too, and stays within the 40.
  *
  * No database, no network.
  *
@@ -43,7 +51,9 @@
 import Module from "node:module";
 import { createClient } from "@supabase/supabase-js";
 import { ORG, SUPABASE, eq, finish, freshWorld, installStub, removeStub, stub as worldStub, world, type Row, type World } from "./mail-world";
-import { ADMIN_REQUEST_OWN_CALLS } from "../../lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, REQUEST_SEND_WINDOW_MS, requestBudget } from "../../lib/notifications/smtp-state";
+import { MAX_TICKET_PEOPLE } from "../../lib/tickets/types";
+import type { TicketRow } from "../../lib/tickets/auth";
 
 const ANON = "stub-anon-key";
 const ADMIN = "0c000000-0000-4000-8000-0000000000ad";
@@ -68,8 +78,10 @@ const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._loa
 };
 
 /** Every call in order, the session's and the service role's, the mail's included. */
-type Call = { method: string; path: string; table: string; body: unknown; service: boolean };
+type Call = { method: string; path: string; table: string; query: string; body: unknown; service: boolean };
 let calls: Call[] = [];
+/** The tables whose one-row insert reads its new row back as one object (.single() or .maybeSingle()), with the id the server gives it. */
+const SINGLE_INSERTS: Record<string, string> = { org_groups: "0e100000", help_tickets: "0e200000", attempt_requests: "0e300000" };
 const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
@@ -77,13 +89,16 @@ const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<R
   if (typeof init?.body === "string") {
     try { body = JSON.parse(init.body); } catch { body = init.body; }
   }
-  const key = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).get("apikey");
-  calls.push({ method, path: url.pathname, table: url.pathname.replace("/rest/v1/", ""), body, service: key === process.env.SUPABASE_SERVICE_ROLE_KEY });
+  const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+  const key = headers.get("apikey");
+  const table = url.pathname.replace("/rest/v1/", "");
+  calls.push({ method, path: url.pathname, table, query: decodeURIComponent(url.search), body, service: key === process.env.SUPABASE_SERVICE_ROLE_KEY });
   if (url.pathname === "/auth/v1/user") return new Response(JSON.stringify(USER), { status: 200, headers: { "content-type": "application/json" } });
-  // A new group gets its id from the server (the world's generic table gives
-  // none), and .single() reads it as one object, as the server answers it.
-  if (url.pathname === "/rest/v1/org_groups" && method === "POST" && body && !Array.isArray(body)) {
-    const res = await worldStub(input, { ...init, body: JSON.stringify({ id: `0e100000-0000-4000-8000-${String(calls.length).padStart(12, "0")}`, ...(body as Row) }) });
+  // A new group, ticket or attempt request read back gets its id from the
+  // server (the world's generic table gives none), and .single() or
+  // .maybeSingle() reads it as one object, as the server answers it.
+  if (SINGLE_INSERTS[table] && method === "POST" && body && !Array.isArray(body) && /return=representation/.test(headers.get("prefer") ?? "")) {
+    const res = await worldStub(input, { ...init, body: JSON.stringify({ id: `${SINGLE_INSERTS[table]}-0000-4000-8000-${String(calls.length).padStart(12, "0")}`, ...(body as Row) }) });
     const rows = (await res.json()) as Row[];
     return new Response(JSON.stringify(rows[0] ?? null), { status: res.status, headers: { "content-type": "application/json" } });
   }
@@ -158,6 +173,46 @@ function seed(over: { attempts?: boolean; ticket?: Row } = {}) {
         id: groupId(i), organization_id: ORG, name: `${v} (everyone)`, group_type: "dynamic", rules: { verticals: [v] },
         is_active: i % 2 === 0, system_key: `scope:${v}|`,
       })),
+    },
+    rpc: { effective_attempt_policies: () => [] },
+  });
+  calls = [];
+}
+
+/** The 25 administrators of the requests that mail them (`admin-1@` to `admin-25@`). */
+const ADMINS = Array.from({ length: 25 }, (_, i) => `0c000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`);
+/**
+ * An organisation of 25 administrators, with working mail, for the two
+ * requests that mail them: a learner's request for another attempt and a
+ * manager's ticket. The session's user (ADMIN's id; role "user" here) is the
+ * learner who asks, with one failed official attempt on COURSE, and the line
+ * manager of the first MAX_TICKET_PEOPLE learners, whom the ticket names.
+ * `others`: that many more members (role "user", no manager), so a large
+ * organisation's hierarchy is read in more than one page of 1,000 rows.
+ */
+function seedAdmins(others = 0) {
+  freshWorld({
+    members: [
+      { organization_id: ORG, user_id: ADMIN, role: "user", status: "active" },
+      ...ADMINS.map((user_id) => ({ organization_id: ORG, user_id, role: "admin", status: "active" })),
+      ...LEARNERS.slice(0, MAX_TICKET_PEOPLE).map((user_id) => ({ organization_id: ORG, user_id, role: "user", status: "active", line_manager_id: ADMIN })),
+      ...Array.from({ length: others }, (_, i) => ({ organization_id: ORG, user_id: `0f100000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`, role: "user", status: "active" })),
+    ] as World["members"],
+    profiles: Object.fromEntries([
+      [ADMIN, "caller@tenant.stub"],
+      ...ADMINS.map((u, i) => [u, `admin-${i + 1}@tenant.stub`]),
+      ...LEARNERS.slice(0, MAX_TICKET_PEOPLE).map((u, i) => [u, `learner-${i + 1}@tenant.stub`]),
+    ]),
+    tables: {
+      help_tickets: [],
+      courses: [{ id: COURSE, organization_id: ORG, title: "Course K", is_active: true, pass_required: false }],
+      course_versions: [{ id: VERSION, course_id: COURSE }],
+      course_attempts: [{
+        id: "0a100000-0000-4000-8000-0000000000ad", user_id: ADMIN, organization_id: ORG, course_version_id: VERSION,
+        status: "completed", score: 0.4, started_at: "2026-10-01T09:00:00Z", completed_at: "2026-10-01T10:00:00Z",
+        completion_status: "completed", success_status: "failed", is_revision: false, context_kind: "individual",
+      }],
+      attempt_requests: [],
     },
     rpc: { effective_attempt_policies: () => [] },
   });
@@ -308,7 +363,17 @@ async function main() {
     const closed = () => world.tables.help_tickets.map((t) => [t.status, t.outcome]);
     const runsOpened = () => calls.filter((c) => c.table === "rpc/tenant_mail_status").length;
     const last = () => { const c = calls[calls.length - 1]; return c ? `${c.method} ${c.table}` : null; };
-    const counts = (o: unknown) => { const x = o as Row; return [x.emailed, x.not_emailed, x.not_confirmed, x.left ?? null]; };
+    /** The request's last `n` calls; a send names its recipient. */
+    const tail = (n: number) => calls.slice(-n).map((c) => (c.path === "/functions/v1/send-smtp" ? `send to ${String((c.body as Row | null)?.to ?? "")}` : `${c.method} ${c.table}`));
+    const counts = (o: unknown) => { const x = (o ?? {}) as Row; return [x.emailed, x.not_emailed, x.not_confirmed, x.left ?? null]; };
+    /** A ticket naming `people`, acted on end to end: the answer's two mail outcomes, the sends, and the whole request's calls with the middleware's. */
+    const actFor = async (action: "grant_retry" | "assign", people: string[]) => {
+      seed({ attempts: action === "grant_retry", ticket: ticketRow(action === "grant_retry" ? "grant_retry" : "assign_content", people) });
+      const r = await actOn(action === "grant_retry" ? { action, expires_in_days: 30 } : { action });
+      return { status: r.status, email: counts(r.body.email), requester: counts(r.body.requester_email), learners: learnerSends(), requesterSent: requesterSends(), total: calls.length + MIDDLEWARE_CALLS };
+    };
+    /** Up to these many people a ticket's action emails every learner and the requester (ADR 0029, note of 2026-11-24, part 1). */
+    const EVERYBODY_UP_TO = { grant_retry: 4, assign: 11 } as const;
 
     // The learners' mail is sized on the calls really made before its run.
     // Over the stub, 20 calls before a grant's first send: the session, the
@@ -319,12 +384,14 @@ async function main() {
     // 13 before an assignment's: 4, 1, the assignment's own 4 (the course,
     // the rows already there, the one insert, the addresses), the run's
     // opening 3 and the template 1. The budget also holds the middleware's
-    // call, which the stub does not run, and the two closing calls, held
-    // back. So 6 and 15 learners are mailed (11 and 15 before, past the 40),
-    // and the requester's mail has no room left: it is left, and the answer
-    // says so. On a grant the requester is left from 5 learners on, on an
-    // assignment from 12.
-    for (const [action, firstSend, mailed, total] of [["grant_retry", 20, 6, 36], ["assign", 13, 15, 37]] as const) {
+    // call, which the stub does not run, the two closing calls, and the
+    // requester's five (REQUESTER_HELD_CALLS: their three reads, the send
+    // and its log row), held back so the learners' mail is sized without
+    // them (ADR 0029, note of 2026-11-24). So 4 and 11 learners are mailed,
+    // and the requester is mailed last, in the same run. Before that hold
+    // (cf34281) 6 and 15 learners were mailed and the requester was left
+    // from 5 people on a grant and from 12 on an assignment.
+    for (const [action, firstSend, mailed, total] of [["grant_retry", 20, 4, 37], ["assign", 13, 11, 37]] as const) {
       console.log(`\nPOST /api/tickets/[id]/act, "${action}": a ticket naming ${N} learners`);
       seed({ attempts: action === "grant_retry", ticket: ticketRow(action === "grant_retry" ? "grant_retry" : "assign_content", LEARNERS) });
       const r = await actOn(action === "grant_retry" ? { action, expires_in_days: 30 } : { action });
@@ -338,9 +405,75 @@ async function main() {
       eq("…one run: the organisation's mail state read once", runsOpened(), 1);
       eq(`…${firstSend} calls before the first send, as counted`, beforeFirstSend(), firstSend);
       eq(`the learners: ${mailed} emailed, ${N - mailed} reported as not emailed`, [learnerSends(), ...counts(r.body.email)], [mailed, mailed, N - mailed, 0, null]);
-      eq("the requester's mail: left for room, reported as not emailed with `left`, never attempted",
-        [requesterSends(), ...counts(r.body.requester_email)], [0, 0, 1, 0, 1]);
-      eq("…and nothing of it was read: the request's last call is the thread message", last(), "POST help_ticket_messages");
+      eq("the requester emailed, in the same run", [requesterSends(), ...counts(r.body.requester_email)], [1, 1, 0, 0, null]);
+      eq("…the request's last calls are the requester's send and its log row", tail(2), ["send to manager@tenant.stub", "POST notification_log"]);
+    }
+
+    for (const action of ["grant_retry", "assign"] as const) {
+      const all = EVERYBODY_UP_TO[action];
+      console.log(`\nPOST /api/tickets/[id]/act, "${action}": the edges, ${all} and ${all + 1} people`);
+      const a = await actFor(action, LEARNERS.slice(0, all));
+      eq(`${all} people: every learner emailed, and the requester, within 40`,
+        [a.status, a.learners, a.email, a.requesterSent, a.requester, a.total <= 40], [200, all, [all, 0, 0, null], 1, [1, 0, 0, null], true]);
+      const b = await actFor(action, LEARNERS.slice(0, all + 1));
+      eq(`${all + 1} people: the requester emailed, exactly one learner left (not emailed), within 40`,
+        [b.status, b.learners, b.email, b.requesterSent, b.requester, b.total <= 40], [200, all, [all, 1, 0, null], 1, [1, 0, 0, null], true]);
+    }
+
+    // Every size a ticket can name (MAX_TICKET_PEOPLE), on both actions.
+    for (const action of ["grant_retry", "assign"] as const) {
+      console.log(`\nPOST /api/tickets/[id]/act, "${action}": every size from 1 to ${MAX_TICKET_PEOPLE} people`);
+      const requesterNotEmailed: number[] = [];
+      const past40: number[] = [];
+      const unbalanced: number[] = [];
+      const notEverybody: number[] = [];
+      const measured: string[] = [];
+      for (let n = 1; n <= MAX_TICKET_PEOPLE; n++) {
+        const a = await actFor(action, LEARNERS.slice(0, n));
+        const [emailed, notEmailed, notConfirmed] = a.email as number[];
+        if (a.status !== 200 || a.requesterSent !== 1 || JSON.stringify(a.requester) !== JSON.stringify([1, 0, 0, null])) requesterNotEmailed.push(n);
+        if (a.total > 40) past40.push(n);
+        if (emailed + notEmailed + notConfirmed !== n || a.learners !== emailed) unbalanced.push(n);
+        if (n <= EVERYBODY_UP_TO[action] && emailed !== n) notEverybody.push(n);
+        measured.push(`${n}:${emailed}/${a.total}`);
+      }
+      console.log(`  (size:learners emailed/calls) ${measured.join(" ")}`);
+      eq("at every size the requester is emailed", requesterNotEmailed, []);
+      eq("…every request within 40, with the middleware's call", past40, []);
+      eq("…the learners emailed and not emailed add up to the learners the action mails, and each emailed one had a send", unbalanced, []);
+      eq(`…up to ${EVERYBODY_UP_TO[action]} people every learner is emailed`, notEverybody, []);
+    }
+
+    // The answer `left: 1` keeps its cases now that a large ticket no longer
+    // gives it: a request with no room left for the requester's mail, by its
+    // count or by its clock. A decline, so no learner is mailed and no row
+    // can come from anyone else.
+    {
+      const { actOnTicket } = await import("../../lib/tickets/actions");
+      const requesterReads = () => calls.filter((c) => (c.table === "organization_members" || c.table === "profiles") && c.query.includes(MANAGER)).length;
+      const budgets = [
+        ["by the count: 30 calls spent before the action", () => requestBudget({ spent: 30 })],
+        [`by the clock: past its ${REQUEST_SEND_WINDOW_MS / 1000} seconds`, () => {
+          let t = 0;
+          const b = requestBudget({ spent: MIDDLEWARE_CALLS, now: () => t });
+          t = REQUEST_SEND_WINDOW_MS + 1;
+          return b;
+        }],
+      ] as const;
+      for (const [label, budget] of budgets) {
+        console.log(`\nactOnTicket, "decline": no room for the requester's mail, ${label}`);
+        seed({ ticket: ticketRow("grant_retry", LEARNERS.slice(0, 3)) });
+        const out = await actOnTicket(svc, {
+          ticket: { ...world.tables.help_tickets[0] } as unknown as TicketRow, admin: { id: ADMIN },
+          org: { id: ORG, name: "Tenant A", slug: "tenant-a" }, origin: "http://lms.test", action: "decline", note: "Not this quarter",
+          budget: budget(),
+        });
+        if ("error" in out) throw new Error(out.error);
+        eq("the ticket closed with its outcome and its thread message", [closed(), world.tables.help_ticket_messages.length], [[["closed", "declined"]], 1]);
+        eq("…the requester's mail left: emailed 0, not emailed 1, `left` 1", counts(out.requester_email), [0, 1, 0, 1]);
+        eq("…no read of the requester, no send to them, no notification_log row: the last call is the thread message",
+          [requesterReads(), requesterSends(), world.log.length, last()], [0, 0, 0, "POST help_ticket_messages"]);
+      }
     }
 
     for (const [action, total] of [["grant_retry", 31], ["assign", 24]] as const) {
@@ -378,6 +511,59 @@ async function main() {
       eq(`200, all ${N} granted in one insert, one run`, [res.status, body.granted, insertsInto("attempt_requests").length, runsOpened()], [200, N, 1, 1]);
       eq("the whole request, with the middleware's call: 37 calls, within 40 (41 before)", [calls.length + MIDDLEWARE_CALLS, calls.length + MIDDLEWARE_CALLS <= 40], [37, true]);
       eq(`…17 calls before the first send; 9 learners emailed, ${N - 9} reported as not emailed`, [beforeFirstSend(), learnerSends(), ...counts(body.email)], [17, 9, 9, N - 9, 0, null]);
+    }
+
+    // A learner's request for another attempt (POST /api/attempt-requests)
+    // and a manager's ticket (POST /api/tickets) each mail the organisation's
+    // administrators in one run (notifyAdminsOfRequest, notifyAdminsOfTicket).
+    // Their budgets assumed 8 calls before the run, where the requests had
+    // made more. Measured before, over this stub, with 25 administrators and
+    // the middleware's call: the learner's request 44 calls, 19
+    // administrators emailed, its first send sized at a count of 11 where 18
+    // calls had been made; the ticket 40 calls, 19 emailed (14 made, 11
+    // counted), and 41 calls with 19 emailed for an organisation of over
+    // 1,000 members. Each now counts from the request's first call (the
+    // middleware's), each call where it is made, every page included, so
+    // the whole request stays within the 40 of rule FP2 and the
+    // administrators it has no room for are left (the run's tail kept: 4
+    // calls a group).
+    const adminSends = () => sendsTo((to) => to.startsWith("admin-"));
+    {
+      console.log("\nPOST /api/attempt-requests: a learner asks for another attempt; 25 administrators");
+      const requestRoute = await import("../../app/api/attempt-requests/route");
+      seedAdmins();
+      const res = await requestRoute.POST(new Request("http://lms.test/api/attempt-requests", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ orgSlug: "tenant-a", courseId: COURSE, reason: "One more, please" }) }));
+      const body = (await res.json()) as Row;
+      eq("200, the request saved, the administrators' mail in one run", [res.status, body.ok, world.tables.attempt_requests.map((x) => [x.user_id, x.status]), runsOpened()], [200, true, [[ADMIN, "pending"]], 1]);
+      // The session, the membership 2, the course, its versions, the
+      // attempts, the grants, the policy, the insert, attempts_used, the
+      // name, the administrators that count 2, their addresses, the run's
+      // opening 3: 17 before the first send.
+      eq("the whole request, with the middleware's call: 36 calls, within 40 (44 before)", [calls.length + MIDDLEWARE_CALLS, calls.length + MIDDLEWARE_CALLS <= 40], [36, true]);
+      eq("…17 calls before the first send; 13 of the 25 administrators emailed, the rest left (19 before)", [beforeFirstSend(), adminSends()], [17, 13]);
+    }
+    const raiseTicket = async () => {
+      const ticketsRoute = await import("../../app/api/tickets/route");
+      const res = await ticketsRoute.POST(new Request("http://lms.test/api/tickets", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ orgSlug: "tenant-a", category: "grant_retry", context: { userIds: LEARNERS.slice(0, MAX_TICKET_PEOPLE), contentKind: "course", contentId: COURSE } }),
+      }));
+      return { status: res.status, body: (await res.json()) as Row };
+    };
+    for (const [label, others, total, first, mailed, before] of [
+      ["", 0, 37, 13, 17, "40 calls, 19 emailed"],
+      [", in an organisation of over 1,000 members (the hierarchy read in two pages)", 1_000, 37, 14, 16, "41 calls, 19 emailed"],
+    ] as const) {
+      console.log(`\nPOST /api/tickets: a manager raises a ticket naming ${MAX_TICKET_PEOPLE} people; 25 administrators${label}`);
+      seedAdmins(others);
+      const r = await raiseTicket();
+      eq("200, the ticket saved, the administrators' mail in one run",
+        [r.status, typeof r.body.subject, world.tables.help_tickets.map((x) => [x.user_id, x.source, x.category]), runsOpened()], [200, "string", [[ADMIN, "manager", "grant_retry"]], 1]);
+      // The session, the membership 2, the hierarchy (a call a page), the
+      // course, the names, the insert, the manager's own name, the
+      // administrators, their addresses, the run's opening 3.
+      eq(`the whole request, with the middleware's call: ${total} calls, within 40 (before: ${before})`, [calls.length + MIDDLEWARE_CALLS, calls.length + MIDDLEWARE_CALLS <= 40], [total, true]);
+      eq(`…${first} calls before the first send; ${mailed} of the 25 administrators emailed, the rest left`, [beforeFirstSend(), adminSends()], [first, mailed]);
     }
   } finally {
     console.warn = realWarn;

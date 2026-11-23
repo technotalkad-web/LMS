@@ -44,20 +44,27 @@ export const LEVEL_LABELS: Record<1 | 2 | 3, string> = {
   3: "L3 manager",
 };
 
-/** All members of an org (every status, so inactive managers are detectable), paginated. */
+/**
+ * All members of an org (every status, so inactive managers are detectable), paginated.
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call, a
+ * page's re-read without the department column included.
+ */
 export async function fetchHierarchyMembers(
   svc: SupabaseClient,
-  orgId: string
+  orgId: string,
+  countCall?: () => unknown
 ): Promise<HierarchyMember[]> {
   const out: HierarchyMember[] = [];
   for (let from = 0; ; from += 1000) {
-    const q = (cols: string) =>
-      svc
+    const q = (cols: string) => {
+      countCall?.();
+      return svc
         .from("organization_members")
         .select(cols)
         .eq("organization_id", orgId)
         .order("user_id") // stable pages: offset pagination without ORDER BY can skip/duplicate rows
         .range(from, from + 999);
+    };
     let res = await q("user_id, status, line_manager_id, indirect_manager_id, l3_manager_id, employee_id, designation, business_vertical, department");
     // 0096 deploy safety: no department column yet.
     if (res.error && /department/.test(res.error.message)) res = await q("user_id, status, line_manager_id, indirect_manager_id, l3_manager_id, employee_id, designation, business_vertical");

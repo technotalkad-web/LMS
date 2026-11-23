@@ -198,10 +198,10 @@ console.log("\nPOST /api/attempt-requests: the page's rule, strict reads, before
   eq("the attempts columns name status", /const ATTEMPT_COLUMNS = "[^"]*\bstatus\b[^"]*";/.test(src), true);
   eq("the attempts read adds is_revision through the narrower-select fallback",
     /readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",[\s\S]*?\.from\("course_attempts"\)[\s\S]*?ATTEMPT_COLUMNS\s*\)/.test(src), true);
-  eq("ADR 0024 P2-5: the query sits in the preview filter, one fresh decision for the request",
-    /const previews: ContextFilterState = \{ applies: null \};\s*const \{ data: attRows, error: attErr \} = await readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",\s*\(columns\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(s\.from\("course_attempts"\)\.select\(columns\)\.eq\("user_id", user\.id\)\.in\("course_version_id", vIds\), apply\)/.test(src), true);
-  eq("versions, attempts and grants are error-checked inside one try: grantSnapshotFor, then computeScoring",
-    inOrder(src, ["try {", 'from("course_versions")', "if (verErr || !verRows) throw", "if (attErr || !attRows) throw", "grantSnapshotFor(s, user.id, course.id)", "computeScoring(attempts, policy, snapshot.retakeIds)", "} catch (e) {", '{ error: "records_unreadable" }, { status: 503 }']), true);
+  eq("ADR 0024 P2-5: the query sits in the preview filter, one fresh decision for the request (ADR 0029 rule FP2: each call counted where it is built)",
+    /const previews: ContextFilterState = \{ applies: null \};\s*const \{ data: attRows, error: attErr \} = await readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",\s*\(columns\) =>\s*readWithContextFilter\(previews, \(apply\) => \{\s*spendCalls\(budget, 1\);\s*return withoutPreviews\(s\.from\("course_attempts"\)\.select\(columns\)\.eq\("user_id", user\.id\)\.in\("course_version_id", vIds\), apply\);/.test(src), true);
+  eq("versions, attempts and grants are error-checked inside one try: grantSnapshotFor (its reads counted), then computeScoring",
+    inOrder(src, ["try {", 'from("course_versions")', "if (verErr || !verRows) throw", "if (attErr || !attRows) throw", "grantSnapshotFor(s, user.id, course.id, undefined, countCalls(budget))", "computeScoring(attempts, policy, snapshot.retakeIds)", "} catch (e) {", '{ error: "records_unreadable" }, { status: 503 }']), true);
   eq("requestDecision( and both 409s come before the insert",
     inOrder(src, ["requestDecision({ scoring, attempts })", "REQUEST_MESSAGES.no_official_result }, { status: 409 }", "REQUEST_MESSAGES.retake_live }, { status: 409 }", ".insert({"]), true);
   eq("the fail-soft grantRetakeIdsFor is gone, and one attempts read remains (attempts_used reuses the scoring)",

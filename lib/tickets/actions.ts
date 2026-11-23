@@ -2,7 +2,7 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { grantExtraAttempts } from "@/lib/attempts/grant";
 import { assignCourseDirect } from "@/lib/assignments/direct";
 import { isActionError, type ActionError, type PerLearnerResult } from "@/lib/actions/types";
-import { notifyRequesterOfTicket, type RequesterMailOutcome } from "./notify";
+import { REQUESTER_HELD_CALLS, notifyRequesterOfTicket, type RequesterMailOutcome } from "./notify";
 import type { MailOutcome } from "@/lib/notifications/send";
 import { ADMIN_REQUEST_OWN_CALLS, requestBudget, spendCalls, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { OUTCOME_LABEL, type TicketOutcome } from "./types";
@@ -25,9 +25,15 @@ const TICKET_CLOSE_CALLS = 2;
  * here is counted on it: the people still active, the action's own reads
  * and writes, and its learners' mail, in a run it hands back. The ticket's
  * close and its thread message are held back on the count before the
- * action, so the learners' mail is sized without them. The requester's mail
- * then goes in the same run (opened here when the action mailed nobody),
- * or, with no room left, is left and answered as such (`left`).
+ * action, and so is the requester's room (REQUESTER_HELD_CALLS: the least
+ * their mail makes when it goes; ADR 0029, note of 2026-11-24), so the
+ * learners' mail is sized without them. The requester's hold is given back
+ * just before their mail, which then counts its own calls where it makes
+ * them (fewer when their membership does not count or no address is
+ * found); the close's two are always made. The requester's mail goes in
+ * the same run (opened here when the action mailed nobody), or, with no
+ * room left (the clock, or a last group that needed more of its tail), is
+ * left and answered as such (`left`).
  */
 export async function actOnTicket(
   svc: SupabaseClient,
@@ -49,6 +55,8 @@ export async function actOnTicket(
   // Held back: the close and its thread message come after the action's
   // mail, whatever it does (they are not counted again when made).
   spendCalls(budget, TICKET_CLOSE_CALLS);
+  // Held back too: the requester's room, given back before their mail.
+  spendCalls(budget, REQUESTER_HELD_CALLS);
   // The request's one run, when the action opened one for its learners' mail.
   let run: MailRun | undefined;
   // The context was verified when the ticket was raised; people may have left
@@ -148,7 +156,9 @@ export async function actOnTicket(
   });
   // The requester's mail, in the request's one run and budget, and its
   // outcome for the administrator (rule T4): left, and said so, when the
-  // learners' mail took the room.
+  // request has no room for it after all. Its hold is given back first: it
+  // counts its own calls where it makes them.
+  spendCalls(budget, -REQUESTER_HELD_CALLS);
   const requesterEmail = await notifyRequesterOfTicket(
     svc,
     {

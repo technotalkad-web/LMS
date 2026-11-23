@@ -20,7 +20,7 @@
  */
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, sendMany, sendNotification, type MailOutcome } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { countingMemberIds, resolveOrgMembership } from "@/lib/auth/org-membership";
 // Type only: the forced restart takes its notifier as an argument.
 import type { ForceRestartNotify } from "./force-restart";
@@ -48,6 +48,13 @@ const ADMIN_READ_ROLES = ["super_owner", "owner", "admin"];
  * asked for another attempt, in one run. A failed read of the
  * administrators or of their addresses mails nobody and records the skip:
  * the request itself still shows in the queue and the Attention Center.
+ *
+ * ADR 0029 rule FP2: `budget` is the request's, its count holding the calls
+ * the request made before this (POST /api/attempt-requests counts from its
+ * first call, the middleware's). The reads made here are counted on it
+ * where they are made, every page included, and the run is opened on it,
+ * so the mail is sized on the calls really made; what it has no room for is
+ * left. Without one, the count starts at the route's own calls.
  */
 export async function notifyAdminsOfRequest(
   svc: AnyClient,
@@ -60,17 +67,23 @@ export async function notifyAdminsOfRequest(
     learnerEmail: string;
     learnerName?: string | null;
     reason: string | null;
+    /** The request's budget, its count holding the request's calls so far. */
+    budget?: MailBudget;
   }
 ): Promise<void> {
   try {
-    // Rule 10: the administrators whose membership counts.
-    const admins = await countingMemberIds(svc, args.orgId, ADMIN_READ_ROLES);
+    const budget = args.budget ?? requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+    // Rule 10: the administrators whose membership counts (the organisation
+    // and each page of its rows, counted where they are read).
+    const admins = await countingMemberIds(svc, args.orgId, ADMIN_READ_ROLES, countCalls(budget));
     if (admins === "unreadable") {
       await recordRecipientsUnreadable("attempt-request", args.orgId);
       return;
     }
     const ids = [...admins];
     if (ids.length === 0) return;
+    // The addresses: one call for each 150 administrators.
+    spendCalls(budget, Math.ceil(ids.length / 150));
     const emails = await resolveEmailsStrict(svc, ids);
     if (emails === "unreadable") {
       await recordRecipientsUnreadable("attempt-request", args.orgId);
@@ -82,7 +95,7 @@ export async function notifyAdminsOfRequest(
       `**${who}** has requested another attempt at **${args.courseTitle}**.\n\n` +
       (args.reason ? `> ${args.reason}\n\n` : "") +
       `Review and approve or decline it in the Attempt Requests queue.`;
-    const run = await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: 8 }), db: svc });
+    const run = await openRun({ organizationId: args.orgId, budget, db: svc });
     await sendMany(run, [...emails], ([uid, email]) => ({
       event: "custom_broadcast",
       to: { user_id: uid, email },
