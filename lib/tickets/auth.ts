@@ -47,6 +47,8 @@ export type TicketCaller = {
   ticket: TicketRow;
   /** admin = may act / reply as the org; requester = the person who raised it. */
   party: "admin" | "requester";
+  /** The calls this check made (the session, the ticket, the membership), for a request that counts its calls (ADR 0029 rule FP2). */
+  calls: number;
 };
 
 /**
@@ -58,21 +60,26 @@ export type TicketCaller = {
  */
 export async function loadTicketForCaller(ticketId: string): Promise<TicketCaller | ActionError> {
   const session = await createClient();
+  let calls = 1;
   const { data: { user } } = await session.auth.getUser();
   if (!user) return { error: "Unauthorized", status: 401 };
   const svc = svcClient();
   let ticket: TicketRow | null = null;
   {
+    calls++;
     const full = await svc.from("help_tickets").select(TICKET_COLUMNS).eq("id", ticketId).maybeSingle();
     if (!full.error) ticket = full.data as TicketRow | null;
     else {
       // Pre-0095: the manager columns do not exist yet; read the old shape.
+      calls++;
       const old = await svc.from("help_tickets").select("id, organization_id, user_id, subject, body, status, priority, admin_note, created_at").eq("id", ticketId).maybeSingle();
       const o = old.data as Omit<TicketRow, "source" | "category" | "context" | "requested_by_level" | "outcome"> | null;
       ticket = o ? { ...o, source: "learner", category: null, context: null, requested_by_level: null, outcome: null } : null;
     }
   }
   if (!ticket) return { error: "Ticket not found", status: 404 };
+  // The organisation and the caller's member row, read together.
+  calls += 2;
   const m = await resolveOrgMembership<{ id: string; name: string; slug: string }>(
     svc,
     { id: ticket.organization_id },
@@ -84,5 +91,5 @@ export async function loadTicketForCaller(ticketId: string): Promise<TicketCalle
     m === "none" ? null : isAdminRole(m.role) ? "admin" : ticket.user_id === user.id ? "requester" : null;
   if (m === "none" || !party) return { error: "Ticket not found", status: 404 };
   const o = m.org;
-  return { svc, user: { id: user.id, email: user.email ?? null }, org: { id: o.id, name: o.name, slug: o.slug }, ticket, party };
+  return { svc, user: { id: user.id, email: user.email ?? null }, org: { id: o.id, name: o.name, slug: o.slug }, ticket, party, calls };
 }

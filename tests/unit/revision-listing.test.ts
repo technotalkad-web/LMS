@@ -152,7 +152,7 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
       // reissued_from through the paged fallback, in id order, one decision for
       // every chunk, an empty answer an error; no unpaged chunk read is left.
       ["the paged grant reader: grantSnapshotForUsers pages every chunk in id order through readPagedWithOptionalColumn",
-        /const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,300}?readPagedWithOptionalColumn<GrantPairRow>\(\s*"reissued_from",\s*\(columns, from, to\) => \{\s*const q = svc\.from\("attempt_requests"\)\.select\(columns\)[^;]*;\s*return \(inQuery \? q\.in\("course_id", inQuery\) : q\)\.order\("id"\)\.range\(from, to\);\s*\},\s*`\$\{GRANT_COLUMNS\}, user_id, course_id`,\s*\{ state: decided, nullIsError: true \}\s*\);/],
+        /const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,300}?readPagedWithOptionalColumn<GrantPairRow>\(\s*"reissued_from",\s*\(columns, from, to\) => \{\s*countCall\?\.\(\);\s*const q = svc\.from\("attempt_requests"\)\.select\(columns\)[^;]*;\s*return \(inQuery \? q\.in\("course_id", inQuery\) : q\)\.order\("id"\)\.range\(from, to\);\s*\},\s*`\$\{GRANT_COLUMNS\}, user_id, course_id`,\s*\{ state: decided, nullIsError: true \}\s*\);/],
     ],
   },
   "lib/attempts/force-restart.ts": {

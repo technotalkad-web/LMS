@@ -163,6 +163,13 @@ function budget(kind: MailBudget["kind"], windowMs: number, callLimit: number, o
  */
 export const ADMIN_REQUEST_OWN_CALLS = 10;
 
+/**
+ * The middleware's call on every request a person makes signed in (its
+ * session read, lib/supabase/middleware.ts), made before the route runs. A
+ * request that counts its own calls from the start counts this one first.
+ */
+export const MIDDLEWARE_CALLS = 1;
+
 /** The budgets of a request an administrator makes. `spent`: the route's own calls before its mail. */
 export function requestBudget(opts: { spent?: number; now?: () => number } = {}): MailBudget {
   return budget("request", REQUEST_SEND_WINDOW_MS, CALL_SUM_LIMIT, opts);
@@ -1090,7 +1097,7 @@ export type RunMailIO<T> = {
 };
 
 /** The calls a group of `sends` may need, beyond the sends: its log insert, a state write and an alert mark. */
-const GROUP_TAIL_CALLS = MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite + MAIL_CALL_COSTS.alertMark;
+export const GROUP_TAIL_CALLS = MAIL_CALL_COSTS.logInsert + MAIL_CALL_COSTS.stateWrite + MAIL_CALL_COSTS.alertMark;
 
 /**
  * The run's one loop (rule T4): every loop of tenant mail goes through it,

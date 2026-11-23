@@ -1,6 +1,16 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, sendNotification, type MailOutcome } from "@/lib/notifications/send";
-import { openRun, recordRecipientsUnreadable, requestBudget } from "@/lib/notifications/smtp-state";
+import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, sendNotification, type MailCounts, type MailOutcome } from "@/lib/notifications/send";
+import {
+  GROUP_TAIL_CALLS,
+  MAIL_CALL_COSTS,
+  hasRoom,
+  openRun,
+  recordRecipientsUnreadable,
+  requestBudget,
+  spendCalls,
+  type MailBudget,
+  type MailRun,
+} from "@/lib/notifications/smtp-state";
 import { resolveEmailsStrict } from "@/lib/users/emails";
 import { resolveOrgMembership } from "@/lib/auth/org-membership";
 
@@ -20,7 +30,9 @@ import { resolveOrgMembership } from "@/lib/auth/org-membership";
  * failed read of the recipients or of their addresses is never "nobody".
  * Nobody is mailed, the skip is recorded (recordRecipientsUnreadable), and
  * the ticket itself still shows in the inbox and the Attention Center. The
- * administrators' mail is one run (rule FP7); the requester's is one send.
+ * administrators' mail is one run (rule FP7); the requester's is one send,
+ * in the request's own run when the request mails others too (a ticket's
+ * action: one run per request).
  */
 const ADMIN_READ_ROLES = ["super_owner", "owner", "admin"];
 
@@ -83,6 +95,19 @@ export async function notifyAdminsOfTicket(
   }
 }
 
+/** The requester's membership: the organisation and the member row, read together. */
+const MEMBERSHIP_CALLS = 2;
+/** The calls the requester's mail reads before its send: their membership and their address. */
+export const REQUESTER_READ_CALLS = MEMBERSHIP_CALLS + 1;
+
+/**
+ * The requester's outcome when the request had no room left for their mail
+ * (ADR 0029 rules T4 and FP2): one mail not emailed, and `left` says why.
+ * Never dropped in silence. Only this answer carries `left`.
+ */
+export type RequesterMailOutcome = MailOutcome | (MailCounts & { left: 1 });
+const LEFT_FOR_ROOM: MailCounts & { left: 1 } = { recipients_unreadable: false, emailed: 0, not_emailed: 1, not_confirmed: 0, left: 1 };
+
 /**
  * The requester's mail about their ticket. Their address is read here, by
  * the strict reader, after the caller's save; a failed read of it, or of
@@ -93,6 +118,15 @@ export async function notifyAdminsOfTicket(
  * emailed because the recipient could not be read. A requester whose
  * membership does not count is not mailed and not counted (rule 10). Null
  * when the mail part itself failed.
+ *
+ * `budget` and `run`: the request's, when it sent other mail before this
+ * one (a ticket's action), so the request is one run with one count (rule
+ * FP2). The reads are then counted on it, and are made only while it has
+ * room for them, for the run's opening when no run is open yet, and for
+ * one send with its group's tail; the mail goes in that run, opened on the
+ * budget when the request had none. A mail with no room is left: not
+ * attempted, no row, and answered as not emailed with `left`. Without
+ * them, the mail is one send on its own, as before.
  */
 export async function notifyRequesterOfTicket(
   svc: SupabaseClient,
@@ -106,9 +140,16 @@ export async function notifyRequesterOfTicket(
     /** What happened, in one line: "Retry granted", "Reply from your admin", … */
     headline: string;
     message: string | null;
-  }
-): Promise<MailOutcome | null> {
+  },
+  opts: { budget?: MailBudget; run?: MailRun } = {}
+): Promise<RequesterMailOutcome | null> {
   try {
+    const budget = opts.run?.budget ?? opts.budget;
+    if (budget) {
+      const opening = opts.run ? 0 : MAIL_CALL_COSTS.open;
+      if (!hasRoom(budget, REQUESTER_READ_CALLS + opening + MAIL_CALL_COSTS.send + GROUP_TAIL_CALLS)) return LEFT_FOR_ROOM;
+      spendCalls(budget, MEMBERSHIP_CALLS);
+    }
     // Rule 10: a requester whose membership does not count gets no mail.
     const m = await resolveOrgMembership(svc, { id: args.orgId }, args.requester.id);
     if (m === "unreadable") {
@@ -116,6 +157,8 @@ export async function notifyRequesterOfTicket(
       return RECIPIENTS_UNREADABLE;
     }
     if (m === "none") return mailCounts([]);
+    // The address: one call.
+    if (budget) spendCalls(budget, 1);
     const emails = await resolveEmailsStrict(svc, [args.requester.id]);
     if (emails === "unreadable") {
       await recordRecipientsUnreadable("ticket-requester", args.orgId);
@@ -128,18 +171,22 @@ export async function notifyRequesterOfTicket(
       `**${args.headline}** on your ticket **${args.subject}**.` +
       (args.message ? `\n\n> ${args.message}` : "") +
       `\n\nOpen Help & Support to see the full thread.`;
-    const sent = await sendNotification({
-      organizationId: args.orgId,
-      event: "custom_broadcast",
-      to: { user_id: args.requester.id, email },
-      context: { org_name: args.orgName, direct_link: link },
-      override: {
-        subject: `${args.headline}: ${args.subject}`,
-        body_md: body,
-        buttons: link ? [{ label: "Open Help & Support", url: link }] : [],
+    const run = budget ? (opts.run ?? (await openRun({ organizationId: args.orgId, budget, db: svc }))) : undefined;
+    const sent = await sendNotification(
+      {
+        organizationId: args.orgId,
+        event: "custom_broadcast",
+        to: { user_id: args.requester.id, email },
+        context: { org_name: args.orgName, direct_link: link },
+        override: {
+          subject: `${args.headline}: ${args.subject}`,
+          body_md: body,
+          buttons: link ? [{ label: "Open Help & Support", url: link }] : [],
+        },
       },
-    });
-    return mailCounts([sent]);
+      run ? { run } : {}
+    );
+    return sent.errorClass === "left" ? LEFT_FOR_ROOM : mailCounts([sent]);
   } catch (e) {
     console.error(JSON.stringify({ event: "ticket_mail_failed", site: "ticket-requester", org_id: args.orgId, error: e instanceof Error ? e.name : "unknown" }));
     return null;

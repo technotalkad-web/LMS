@@ -27,6 +27,15 @@
  * ADMIN_REQUEST_OWN_CALLS. (A request that also names vertical targets makes
  * more of its own: 12 here, see its case.)
  *
+ * A manager's ticket acted on (POST /api/tickets/[id]/act, "grant a retry"
+ * and "assign") and the bulk grant (POST /api/attempt-requests/bulk) run
+ * end to end here, and each whole request, with the middleware's call,
+ * stays within the 40 of rule FP2: one budget counted from the request's
+ * first call, each call where it is made, and one run, the requester's
+ * mail of a ticket included. With no room left, the requester's mail is
+ * left, never read or attempted, and the answer says so (`left`). A ticket
+ * naming one learner still mails both.
+ *
  * No database, no network.
  *
  * Run:  npx tsx tests/unit/assignment-batch.test.ts   (or npm run test:unit)
@@ -98,15 +107,35 @@ const ownCalls = () => {
 const VERTICALS = Array.from({ length: 20 }, (_, i) => `V${String(i + 1).padStart(2, "0")}`);
 const groupId = (i: number) => `0e000000-0000-4000-8000-${String(i + 1).padStart(12, "0")}`;
 
+/** The manager who raised the ticket of the ticket cases, and the ticket. */
+const MANAGER = "0c000000-0000-4000-8000-0000000000e0";
+const TICKET = "0d000000-0000-4000-8000-0000000000a7";
+/** The middleware's one call (its session read) on every request, which the stub does not run. */
+const MIDDLEWARE_CALLS = 1;
+/** A ticket naming `people`, raised by MANAGER, about COURSE. */
+const ticketRow = (category: "grant_retry" | "assign_content", people: string[]): Row => ({
+  id: TICKET, organization_id: ORG, user_id: MANAGER, subject: "Team K", body: null, status: "open", priority: "normal",
+  admin_note: null, source: "manager", category, requested_by_level: 1, outcome: null, outcome_at: null,
+  created_at: "2026-11-20T09:00:00Z", updated_at: "2026-11-20T09:00:00Z", closed_at: null,
+  context: { userIds: people, contentKind: "course", contentId: COURSE, contentTitle: "Course K", exception: null, origin: null },
+});
+
 /** An organisation of the admin and 97 active learners, with working mail, a course, its version, and a path. */
-function seed(over: { attempts?: boolean } = {}) {
+function seed(over: { attempts?: boolean; ticket?: Row } = {}) {
   freshWorld({
     members: [
       { organization_id: ORG, user_id: ADMIN, role: "admin", status: "active" },
       ...LEARNERS.map((user_id, i) => ({ organization_id: ORG, user_id, role: "user", status: "active", business_vertical: VERTICALS[i % 20], department: null })),
+      ...(over.ticket ? [{ organization_id: ORG, user_id: MANAGER, role: "user", status: "active" }] : []),
     ] as World["members"],
-    profiles: Object.fromEntries([[ADMIN, "admin@tenant.stub"], ...LEARNERS.map((u, i) => [u, `learner-${i + 1}@tenant.stub`])]),
+    profiles: Object.fromEntries([
+      [ADMIN, "admin@tenant.stub"],
+      ...LEARNERS.map((u, i) => [u, `learner-${i + 1}@tenant.stub`]),
+      ...(over.ticket ? [[MANAGER, "manager@tenant.stub"]] : []),
+    ]),
     tables: {
+      help_tickets: over.ticket ? [{ ...over.ticket }] : [],
+      help_ticket_messages: [],
       courses: [{ id: COURSE, organization_id: ORG, title: "Course K", is_active: true, pass_required: false }],
       learning_paths: [{ id: PATH, organization_id: ORG, name: "Path P", is_active: true }],
       content_scopes: [],
@@ -254,6 +283,101 @@ async function main() {
       // grants, the expiry sweep, the open requests, the addresses, the one
       // insert, the members that count and the run's opening.
       eq("the calls before the first send: 15, whatever the number of learners (one insert per learner before)", beforeFirstSend(), 15);
+    }
+
+    // A ticket's action is one request: the middleware's call, the session,
+    // the ticket, the caller's membership, the people still active, the
+    // action's own reads and writes, the learners' mail, the ticket's close
+    // and its thread message, and the requester's mail. All of it is one
+    // budget and one run, so the whole request stays within the 40 of rule
+    // FP2 (CALL_SUM_LIMIT). Measured before, over this stub: 53 calls for a
+    // grant and 44 for an assignment (54 and 45 with the middleware's), the
+    // grant's mail sized on 11 calls before its run where it had made 18,
+    // and the requester's mail in a second run with a budget of its own.
+    const act = await import("../../app/api/tickets/[id]/act/route");
+    const actOn = async (body: Row) => {
+      const res = await act.POST(
+        new Request(`http://lms.test/api/tickets/${TICKET}/act`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+        { params: Promise.resolve({ id: TICKET }) }
+      );
+      return { status: res.status, body: (await res.json()) as Row };
+    };
+    const sendsTo = (pick: (to: string) => boolean) => calls.filter((c) => c.path === "/functions/v1/send-smtp" && pick(String((c.body as Row | null)?.to ?? ""))).length;
+    const requesterSends = () => sendsTo((to) => to === "manager@tenant.stub");
+    const learnerSends = () => sendsTo((to) => to.startsWith("learner-"));
+    const closed = () => world.tables.help_tickets.map((t) => [t.status, t.outcome]);
+    const runsOpened = () => calls.filter((c) => c.table === "rpc/tenant_mail_status").length;
+    const last = () => { const c = calls[calls.length - 1]; return c ? `${c.method} ${c.table}` : null; };
+    const counts = (o: unknown) => { const x = o as Row; return [x.emailed, x.not_emailed, x.not_confirmed, x.left ?? null]; };
+
+    // The learners' mail is sized on the calls really made before its run.
+    // Over the stub, 20 calls before a grant's first send: the session, the
+    // ticket and the membership 4, the people still active 1, the grant's
+    // own 10 (the course, its versions, the attempts, the policy, the pass
+    // mark, the grants, the expiry sweep, the open requests, the addresses,
+    // the one insert), the members that count 2 and the run's opening 3.
+    // 13 before an assignment's: 4, 1, the assignment's own 4 (the course,
+    // the rows already there, the one insert, the addresses), the run's
+    // opening 3 and the template 1. The budget also holds the middleware's
+    // call, which the stub does not run, and the two closing calls, held
+    // back. So 6 and 15 learners are mailed (11 and 15 before, past the 40),
+    // and the requester's mail has no room left: it is left, and the answer
+    // says so. On a grant the requester is left from 5 learners on, on an
+    // assignment from 12.
+    for (const [action, firstSend, mailed, total] of [["grant_retry", 20, 6, 36], ["assign", 13, 15, 37]] as const) {
+      console.log(`\nPOST /api/tickets/[id]/act, "${action}": a ticket naming ${N} learners`);
+      seed({ attempts: action === "grant_retry", ticket: ticketRow(action === "grant_retry" ? "grant_retry" : "assign_content", LEARNERS) });
+      const r = await actOn(action === "grant_retry" ? { action, expires_in_days: 30 } : { action });
+      const done = action === "grant_retry"
+        ? world.tables.attempt_requests.filter((x) => x.status === "approved").length
+        : world.tables.course_assignments.filter((x) => x.assignee_type === "user").length;
+      eq(`200, all ${N} ${action === "grant_retry" ? "granted" : "assigned"}, the ticket closed with its outcome, its thread message written`,
+        [r.status, done, closed(), world.tables.help_ticket_messages.length],
+        [200, N, [["closed", action === "grant_retry" ? "granted" : "assigned"]], 1]);
+      eq(`the whole request, with the middleware's call: ${total} calls, within 40`, [calls.length + MIDDLEWARE_CALLS, calls.length + MIDDLEWARE_CALLS <= 40], [total, true]);
+      eq("…one run: the organisation's mail state read once", runsOpened(), 1);
+      eq(`…${firstSend} calls before the first send, as counted`, beforeFirstSend(), firstSend);
+      eq(`the learners: ${mailed} emailed, ${N - mailed} reported as not emailed`, [learnerSends(), ...counts(r.body.email)], [mailed, mailed, N - mailed, 0, null]);
+      eq("the requester's mail: left for room, reported as not emailed with `left`, never attempted",
+        [requesterSends(), ...counts(r.body.requester_email)], [0, 0, 1, 0, 1]);
+      eq("…and nothing of it was read: the request's last call is the thread message", last(), "POST help_ticket_messages");
+    }
+
+    for (const [action, total] of [["grant_retry", 31], ["assign", 24]] as const) {
+      console.log(`\nPOST /api/tickets/[id]/act, "${action}": a ticket naming one learner`);
+      seed({ attempts: action === "grant_retry", ticket: ticketRow(action === "grant_retry" ? "grant_retry" : "assign_content", [LEARNERS[0]]) });
+      const r = await actOn(action === "grant_retry" ? { action, expires_in_days: 30 } : { action });
+      eq("200, the learner emailed and the requester emailed, in one run",
+        [r.status, learnerSends(), counts(r.body.email), requesterSends(), counts(r.body.requester_email), runsOpened()],
+        [200, 1, [1, 0, 0, null], 1, [1, 0, 0, null], 1]);
+      eq(`…${total} calls with the middleware's, within 40`, [calls.length + MIDDLEWARE_CALLS, calls.length + MIDDLEWARE_CALLS <= 40], [total, true]);
+    }
+
+    {
+      // No mail of the action's own: the requester's mail opens the request's run on its budget.
+      console.log(`\nPOST /api/tickets/[id]/act, "decline": a ticket naming ${N} learners`);
+      seed({ ticket: ticketRow("grant_retry", LEARNERS) });
+      const r = await actOn({ action: "decline", note: "Not this quarter" });
+      eq("200, declined, nobody named is mailed, the requester emailed in the request's one run",
+        [r.status, closed(), learnerSends(), requesterSends(), counts(r.body.requester_email), runsOpened()],
+        [200, [["closed", "declined"]], 0, 1, [1, 0, 0, null], 1]);
+      eq(`…${calls.length + MIDDLEWARE_CALLS} calls with the middleware's, within 40`, calls.length + MIDDLEWARE_CALLS <= 40, true);
+    }
+
+    // The bulk grant (POST /api/attempt-requests/bulk) was one run, but its
+    // mail was sized from ADMIN_REQUEST_OWN_CALLS (10) where the route had
+    // made 15 calls before its run, the middleware's included: 41 calls,
+    // 11 learners emailed. Its budget now counts from the request's first
+    // call, each call where it is made.
+    {
+      console.log(`\nPOST /api/attempt-requests/bulk: ${N} failed learners`);
+      const bulk = await import("../../app/api/attempt-requests/bulk/route");
+      seed({ attempts: true });
+      const res = await bulk.POST(new Request("http://lms.test/api/attempt-requests/bulk?orgSlug=tenant-a", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ courseId: COURSE, expires_in_days: 30 }) }));
+      const body = (await res.json()) as Row;
+      eq(`200, all ${N} granted in one insert, one run`, [res.status, body.granted, insertsInto("attempt_requests").length, runsOpened()], [200, N, 1, 1]);
+      eq("the whole request, with the middleware's call: 37 calls, within 40 (41 before)", [calls.length + MIDDLEWARE_CALLS, calls.length + MIDDLEWARE_CALLS <= 40], [37, true]);
+      eq(`…17 calls before the first send; 9 learners emailed, ${N - 9} reported as not emailed`, [beforeFirstSend(), learnerSends(), ...counts(body.email)], [17, 9, 9, N - 9, 0, null]);
     }
   } finally {
     console.warn = realWarn;

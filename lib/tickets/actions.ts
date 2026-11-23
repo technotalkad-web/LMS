@@ -2,18 +2,32 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { grantExtraAttempts } from "@/lib/attempts/grant";
 import { assignCourseDirect } from "@/lib/assignments/direct";
 import { isActionError, type ActionError, type PerLearnerResult } from "@/lib/actions/types";
-import { notifyRequesterOfTicket } from "./notify";
+import { notifyRequesterOfTicket, type RequesterMailOutcome } from "./notify";
 import type { MailOutcome } from "@/lib/notifications/send";
+import { ADMIN_REQUEST_OWN_CALLS, requestBudget, spendCalls, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { OUTCOME_LABEL, type TicketOutcome } from "./types";
 import type { TicketRow } from "./auth";
 
 export type TicketAction = "grant_retry" | "assign" | "extend_due" | "decline" | "resolve";
+
+/** The ticket's close and its thread message: two calls after the action, made whatever its mail did. */
+const TICKET_CLOSE_CALLS = 2;
 
 /**
  * An admin acts on a manager's ticket from the inbox (Phase 4a §3): the
  * one-click actions run the same code the admin screens use, then the ticket
  * is closed with an outcome, a thread message and an email to the requester.
  * Nothing here checks the role — the route does (admin only).
+ *
+ * ADR 0029 rule FP2: the request is one budget and one run. `budget` is
+ * the request's, its count holding the calls made before this (the route's
+ * session, ticket and membership, and the middleware's). Every call made
+ * here is counted on it: the people still active, the action's own reads
+ * and writes, and its learners' mail, in a run it hands back. The ticket's
+ * close and its thread message are held back on the count before the
+ * action, so the learners' mail is sized without them. The requester's mail
+ * then goes in the same run (opened here when the action mailed nobody),
+ * or, with no room left, is left and answered as such (`left`).
  */
 export async function actOnTicket(
   svc: SupabaseClient,
@@ -26,14 +40,22 @@ export async function actOnTicket(
     note?: string | null;
     dueAt?: string | null;
     expiresInDays?: number | null;
+    budget?: MailBudget;
   }
-): Promise<ActionError | { outcome: TicketOutcome; summary: string; results: PerLearnerResult[]; email?: MailOutcome | null; requester_email: MailOutcome | null }> {
+): Promise<ActionError | { outcome: TicketOutcome; summary: string; results: PerLearnerResult[]; email?: MailOutcome | null; requester_email: RequesterMailOutcome | null }> {
   const { ticket } = args;
   const note = args.note?.trim() || null;
+  const budget = args.budget ?? requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+  // Held back: the close and its thread message come after the action's
+  // mail, whatever it does (they are not counted again when made).
+  spendCalls(budget, TICKET_CLOSE_CALLS);
+  // The request's one run, when the action opened one for its learners' mail.
+  let run: MailRun | undefined;
   // The context was verified when the ticket was raised; people may have left
   // since. Act only on those still active in the org (the admin acts org-wide).
   let ctx = ticket.context;
   if (ctx && ctx.userIds.length) {
+    spendCalls(budget, 1);
     const { data: rows, error: rowsErr } = await svc
       .from("organization_members")
       .select("user_id")
@@ -68,10 +90,12 @@ export async function actOnTicket(
     const r = await grantExtraAttempts(svc, {
       orgId: args.org.id, orgName: args.org.name, orgSlug: args.org.slug, origin: args.origin,
       decidedBy: args.admin.id, source: "ticket", courseId: ctx.contentId, userIds: ctx.userIds, expiresInDays: args.expiresInDays,
+      budget,
     });
     if (isActionError(r)) return r;
     results = r.results;
     email = r.email;
+    run = r.run;
     const w = wordsFor(results, "granted", "Retry granted to");
     if (w.ok === 0) return { error: `Nobody could be granted a retry: ${w.text.replace(/^.*?· /, "")}`, status: 409 };
     outcome = "granted";
@@ -84,10 +108,12 @@ export async function actOnTicket(
       orgId: args.org.id, orgName: args.org.name, orgSlug: args.org.slug, origin: args.origin,
       assignedBy: args.admin.id, courseId: ctx.contentId, userIds: ctx.userIds, dueAt,
       notify: args.action !== "extend_due",
+      budget,
     });
     if (isActionError(r)) return r;
     results = r.results;
     email = r.email;
+    run = r.run;
     if (args.action === "extend_due") {
       const n = results.filter((x) => x.status === "assigned" || (x.status === "already" && /updated/.test(x.reason ?? ""))).length;
       if (n === 0) return { error: "The due date could not be updated for anyone", status: 409 };
@@ -120,11 +146,17 @@ export async function actOnTicket(
   await svc.from("help_ticket_messages").insert({
     organization_id: args.org.id, ticket_id: ticket.id, author_id: args.admin.id, author_role: "admin", body: adminNote,
   });
-  // The requester's mail, and its outcome for the administrator (rule T4).
-  const requesterEmail = await notifyRequesterOfTicket(svc, {
-    orgId: args.org.id, orgName: args.org.name, orgSlug: args.org.slug, origin: args.origin,
-    requester: { id: ticket.user_id },
-    subject: ticket.subject, headline: OUTCOME_LABEL[outcome], message: adminNote,
-  });
+  // The requester's mail, in the request's one run and budget, and its
+  // outcome for the administrator (rule T4): left, and said so, when the
+  // learners' mail took the room.
+  const requesterEmail = await notifyRequesterOfTicket(
+    svc,
+    {
+      orgId: args.org.id, orgName: args.org.name, orgSlug: args.org.slug, origin: args.origin,
+      requester: { id: ticket.user_id },
+      subject: ticket.subject, headline: OUTCOME_LABEL[outcome], message: adminNote,
+    },
+    { budget, run }
+  );
   return { outcome, summary, results, ...(email !== undefined ? { email } : {}), requester_email: requesterEmail };
 }

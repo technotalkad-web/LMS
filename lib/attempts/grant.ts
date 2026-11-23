@@ -13,7 +13,7 @@ import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from ".
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, type MailRun } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, type MailCounts, type MailOutcome } from "@/lib/notifications/send";
 import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
 
@@ -51,6 +51,15 @@ import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
  * administrator at the screen: how many were emailed and not, or nobody
  * emailed because the recipients could not be read. Absent when nothing
  * was granted.
+ *
+ * ADR 0029 rule FP2: every call this makes is counted on the request's
+ * budget where it is made, every page and fallback included, so the
+ * learners' mail is sized on the calls really made. `budget` is the
+ * caller's when the request does more after this (a ticket's action);
+ * else one for this call, which starts at the route's own calls. The mails
+ * share one run, opened on that budget at the first learner to mail, and
+ * the answer hands it back (`run`) so the rest of the request's mail goes
+ * in the same run.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
@@ -66,10 +75,14 @@ export async function grantExtraAttempts(
     courseId: string | null | undefined;
     userIds: string[];
     expiresInDays?: number | null;
+    /** The request's budget, its count holding the request's calls so far. */
+    budget?: MailBudget;
   }
-): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string; email?: MailOutcome }> {
+): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string; email?: MailOutcome; run?: MailRun }> {
   const ids = [...new Set(args.userIds)];
   if (ids.length === 0) return { error: "No learners named", status: 400 };
+  const budget = args.budget ?? requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+  spendCalls(budget, 1);
   const course = await orgCourse(svc, args.orgId, args.courseId);
   if (!course) return { error: "Course not found", status: 404 };
 
@@ -81,6 +94,7 @@ export async function grantExtraAttempts(
     };
   };
 
+  spendCalls(budget, 1);
   const { data: verRows, error: verErr } = await svc.from("course_versions").select("id").eq("course_id", course.id);
   if (verErr || !verRows) return unreadable("versions");
   const verIds = (verRows as Array<{ id: string }>).map((v) => v.id);
@@ -91,18 +105,20 @@ export async function grantExtraAttempts(
     // readPagedWithOptionalColumn: the first page decides the column list
     // for the rest). Any failed page, or a page with neither rows nor an
     // error, reports every learner failed. Previews are dropped (the header).
+    // Each call is counted where it is built: every page and each fallback.
     const previews: ContextFilterState = { applies: null };
     const attemptsRead = await readPagedWithOptionalColumn<Att>(
       "is_revision",
       (cols, from, to) =>
-        readWithContextFilter(previews, (apply) =>
-          withoutPreviews(
+        readWithContextFilter(previews, (apply) => {
+          spendCalls(budget, 1);
+          return withoutPreviews(
             svc.from("course_attempts").select(cols).eq("organization_id", args.orgId).in("user_id", ids).in("course_version_id", verIds),
             apply
           )
             .order("id")
-            .range(from, to)
-        ) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
+            .range(from, to);
+        }) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
       ATTEMPT_COLUMNS,
       { nullIsError: true }
     );
@@ -111,17 +127,21 @@ export async function grantExtraAttempts(
   }
   const byUser = new Map<string, Att[]>();
   for (const x of attempts) byUser.set(x.user_id, [...(byUser.get(x.user_id) ?? []), x]);
+  // One call each: the policy of one course, and its pass mark.
+  spendCalls(budget, 1);
   const policy = (await resolvePolicy(svc, course.id).catch(() => DEFAULT_POLICY)) ?? DEFAULT_POLICY;
+  spendCalls(budget, 1);
   const passRequired = (await fetchPassRequired(svc, [course.id])).has(course.id);
   let retakes: Map<string, GrantSnapshot>;
   try {
-    retakes = await grantSnapshotForUsers(svc, args.orgId, [course.id], ids);
+    retakes = await grantSnapshotForUsers(svc, args.orgId, [course.id], ids, undefined, countCalls(budget));
   } catch {
     return unreadable("grants");
   }
 
   // A lapsed grant (approved, unused, expired) still occupies the one-open
   // slot; close it so a new grant can be made.
+  spendCalls(budget, 1);
   await svc
     .from("attempt_requests")
     .update({ status: "expired" })
@@ -134,6 +154,7 @@ export async function grantExtraAttempts(
     .then(({ error }) => {
       if (error && (error as { code?: string }).code !== "23514") console.warn("[grant] expiry sweep:", error.message);
     });
+  spendCalls(budget, 1);
   const { data: openRows, error: openErr } = await svc
     .from("attempt_requests")
     .select("user_id, status, used_at")
@@ -150,7 +171,9 @@ export async function grantExtraAttempts(
   const days = args.expiresInDays;
   const expiresAt = expiryFromDays(days === null || (typeof days === "number" && GRANT_EXPIRY_CHOICES.includes(days)) ? days : undefined);
   // The addresses are read for the mail only: a failed read is never "no
-  // address" and never stops a grant. It mails nobody (ADR 0029).
+  // address" and never stops a grant. It mails nobody (ADR 0029). One call
+  // for each 150 learners.
+  spendCalls(budget, Math.ceil(ids.length / 150));
   const people = await namesAndEmails(svc, ids).catch(() => "unreadable" as const);
   let counting: ReadonlySet<string> | "unreadable" | undefined;
   let run: MailRun | undefined;
@@ -195,12 +218,10 @@ export async function grantExtraAttempts(
   // Any error it still answers is each learner's own again: then each row
   // is inserted on its own, as before, and a learner whose row fails (23505:
   // a grant made since the read) is failed while the others are granted.
-  /** The calls the grants' inserts made, for the mail's budget. */
-  let insertCalls = 0;
   const insertGrant = async (first: Record<string, unknown> | Record<string, unknown>[]) => {
     let rows = Array.isArray(first) ? first : [first];
     const send = () => {
-      insertCalls++;
+      spendCalls(budget, 1);
       return svc.from("attempt_requests").insert(Array.isArray(first) ? rows : rows[0]);
     };
     let { error } = await send();
@@ -243,7 +264,7 @@ export async function grantExtraAttempts(
     // this call at its first grant. A failed read of them or of the
     // addresses mails nobody and records the skip once; the grants stand.
     if (counting === undefined) {
-      counting = await countingMemberIds(svc, args.orgId);
+      counting = await countingMemberIds(svc, args.orgId, undefined, countCalls(budget));
       if (counting === "unreadable" || people === "unreadable") {
         counting = "unreadable";
         await recordRecipientsUnreadable("attempt-grant", args.orgId);
@@ -253,7 +274,7 @@ export async function grantExtraAttempts(
     // Rule 10: a learner whose membership does not count gets no mail, and
     // no run is opened for nobody.
     if (!counting.has(uid)) continue;
-    run ??= await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS + insertCalls }), db: svc });
+    run ??= await openRun({ organizationId: args.orgId, budget, db: svc });
     const who = people.get(uid);
     const one = await notifyLearnerOfDecision(svc, {
       orgId: args.orgId, orgName: args.orgName, orgSlug: args.orgSlug, origin: args.origin,
@@ -266,5 +287,5 @@ export async function grantExtraAttempts(
   // Nothing granted: no mail to speak of. A failed read of the recipients:
   // nobody was emailed, and the answer says why.
   if (counting === undefined) return { results, courseTitle: course.title };
-  return { results, courseTitle: course.title, email: counting === "unreadable" ? RECIPIENTS_UNREADABLE : mailed };
+  return { results, courseTitle: course.title, email: counting === "unreadable" ? RECIPIENTS_UNREADABLE : mailed, ...(run ? { run } : {}) };
 }

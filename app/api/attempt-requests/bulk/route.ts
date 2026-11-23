@@ -16,7 +16,7 @@ import {
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
 import { bulkEligibility } from "@/lib/attempts/request-decision";
 import { resolveEmailsStrict } from "@/lib/users/emails";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget } from "@/lib/notifications/smtp-state";
+import { MIDDLEWARE_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, type MailCounts, type MailOutcome } from "@/lib/notifications/send";
 import {
   ADMIN_ROLES,
@@ -66,6 +66,10 @@ function normalizeRole(raw: string | null | undefined): string {
 }
 
 export async function POST(request: Request) {
+  // ADR 0029 rule FP2: the request's one budget, counted from its first
+  // call (the middleware's), each call where it is made, every page and
+  // fallback included, so the mail is sized on the calls really made.
+  const budget = requestBudget({ spent: MIDDLEWARE_CALLS });
   const orgSlug = new URL(request.url).searchParams.get("orgSlug");
   if (!orgSlug) return NextResponse.json({ error: "orgSlug required" }, { status: 400 });
   const body = (await request.json().catch(() => ({}))) as {
@@ -75,12 +79,15 @@ export async function POST(request: Request) {
   if (!body.courseId) return NextResponse.json({ error: "courseId required" }, { status: 400 });
 
   const supabase = await createClient();
+  spendCalls(budget, 1);
   const {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   // ADR 0030: the org and the caller's role, from a membership that counts.
+  // Two calls: the organisation by its slug, then the caller's member row.
+  spendCalls(budget, 2);
   const caller = await resolveOrgMembership<{ id: string; name: string }>(supabase, { slug: orgSlug }, user.id, "id, name");
   if (caller === "unreadable") return NextResponse.json({ error: CHECK_FAILED }, { status: 503 });
   if (caller === "none") return NextResponse.json({ error: "Org not found" }, { status: 404 });
@@ -90,6 +97,7 @@ export async function POST(request: Request) {
   }
 
   const s = svc();
+  spendCalls(budget, 1);
   const { data: course } = await s
     .from("courses")
     .select("id, title")
@@ -105,6 +113,7 @@ export async function POST(request: Request) {
   };
 
   // All version ids of the module (scoring spans versions/languages).
+  spendCalls(budget, 1);
   const { data: verRows, error: verErr } = await s
     .from("course_versions")
     .select("id")
@@ -121,17 +130,18 @@ export async function POST(request: Request) {
   // the rest), so an abandoned or a revision visit's row never counts and a
   // live retake is seen. Any failed page, or a page with neither rows nor an
   // error, answers 503. Previews are dropped (the header), one decision for
-  // every page of this request.
+  // every page of this request. Each call is counted where it is built.
   type Att = ScorableAttempt & { user_id: string };
   const previews: ContextFilterState = { applies: null };
   const attemptsRead = await readPagedWithOptionalColumn<Att>(
     "is_revision",
     (cols, from, to) =>
-      readWithContextFilter(previews, (apply) =>
-        withoutPreviews(s.from("course_attempts").select(cols).eq("organization_id", org.id).in("course_version_id", verIds), apply)
+      readWithContextFilter(previews, (apply) => {
+        spendCalls(budget, 1);
+        return withoutPreviews(s.from("course_attempts").select(cols).eq("organization_id", org.id).in("course_version_id", verIds), apply)
           .order("id")
-          .range(from, to)
-      ) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
+          .range(from, to);
+      }) as unknown as PromiseLike<{ data: Att[] | null; error: PgError }>,
     ATTEMPT_COLUMNS,
     { nullIsError: true }
   );
@@ -144,11 +154,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: true, granted: 0, skipped: 0, skipped_live_retake: 0, failed_total: 0 });
   }
 
+  // One call each: the policy of one course, and its pass mark.
+  spendCalls(budget, 1);
   const policy = await resolvePolicy(s, course.id);
+  spendCalls(budget, 1);
   const passRequired = (await fetchPassRequired(s, [course.id])).has(course.id);
   let snapshots: Map<string, GrantSnapshot>;
   try {
-    snapshots = await grantSnapshotForUsers(s, org.id, [course.id], userIds);
+    snapshots = await grantSnapshotForUsers(s, org.id, [course.id], userIds, undefined, countCalls(budget));
   } catch {
     return unreadable("grants");
   }
@@ -174,6 +187,7 @@ export async function POST(request: Request) {
 
   // Skip learners who already hold an OPEN row (pending, or approved+unused) —
   // the partial unique index enforces one-open-per-learner anyway.
+  spendCalls(budget, 1);
   const { data: openRows, error: openErr } = await s
     .from("attempt_requests")
     .select("user_id, status, used_at")
@@ -211,12 +225,14 @@ export async function POST(request: Request) {
     expires_at: expiresAt,
   }));
   const rows = baseRows.map((r, i) => ({ ...r, attempts_used: usedByUser.get(grantTo[i]) ?? null }));
+  spendCalls(budget, 1);
   let { data: insertedRows, error: insErr } = await s
     .from("attempt_requests")
     .insert(rows)
     .select("user_id");
   // Fail-soft before 0085 lands: retry without the new column.
   if (insErr && (insErr as { code?: string }).code === "42703") {
+    spendCalls(budget, 1);
     ({ data: insertedRows, error: insErr } = await s
       .from("attempt_requests")
       .insert(baseRows)
@@ -231,11 +247,13 @@ export async function POST(request: Request) {
   // grants stand either way. The mails share one run (rule T4), and the
   // answer says how many were emailed and not, or that nobody was because
   // the recipients could not be read (`email`; absent when none was granted).
+  // The addresses: one call for each 150 learners.
+  if (grantedIds.length > 0) spendCalls(budget, Math.ceil(grantedIds.length / 150));
   const [emailMap, origin, counting] = grantedIds.length > 0
     ? await Promise.all([
         resolveEmailsStrict(s, grantedIds),
         originFromRequest(),
-        countingMemberIds(s, org.id as string),
+        countingMemberIds(s, org.id as string, undefined, countCalls(budget)),
       ])
     : [new Map<string, string>(), "", new Set<string>()] as const;
   let email: MailOutcome | undefined;
@@ -243,7 +261,7 @@ export async function POST(request: Request) {
     await recordRecipientsUnreadable("attempt-requests/bulk", org.id as string);
     email = RECIPIENTS_UNREADABLE;
   } else if (grantedIds.some((uid) => counting.has(uid))) {
-    const run = await openRun({ organizationId: org.id as string, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS }), db: s });
+    const run = await openRun({ organizationId: org.id as string, budget, db: s });
     let mailed: MailCounts = mailCounts([]);
     for (const uid of grantedIds) {
       const one = await notifyLearnerOfDecision(s, {

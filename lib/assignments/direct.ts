@@ -1,6 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget } from "@/lib/notifications/smtp-state";
+import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, spendCalls, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
 import { DEFAULT_JOURNEY_TZ } from "@/lib/journey/journey";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
@@ -265,6 +265,13 @@ export async function orgTimezone(svc: SupabaseClient, orgId: string): Promise<s
  * due date instead, and a learner's own self-enrolment becomes an assignment
  * (convertSelfEnrolments). Admin-only since Phase 4a (decision 12): called from the
  * admin API and from a manager's ticket (assign / extend due date).
+ *
+ * ADR 0029 rule FP2: every call this makes is counted on the request's
+ * budget where it is made, so the learners' mail is sized on the calls
+ * really made. `budget` is the caller's when the request does more after
+ * this (a ticket's action); else one for this call, which starts at the
+ * route's own calls. The mail is one run on that budget, and the answer
+ * hands it back (`run`) so the rest of the request's mail goes in it too.
  */
 export async function assignCourseDirect(
   svc: SupabaseClient,
@@ -279,16 +286,23 @@ export async function assignCourseDirect(
     dueAt?: string | null;
     /** false = a due-date change on people who already hold the course: no "you have been assigned" email. */
     notify?: boolean;
+    /** The request's budget, its count holding the request's calls so far. */
+    budget?: MailBudget;
   }
-): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string; dueAt: string | null; email: MailOutcome | null }> {
+): Promise<ActionError | { results: PerLearnerResult[]; courseTitle: string; dueAt: string | null; email: MailOutcome | null; run?: MailRun }> {
   const ids = [...new Set(args.userIds)];
   if (ids.length === 0) return { error: "No learners named", status: 400 };
+  const budget = args.budget ?? requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+  spendCalls(budget, 1);
   const course = await orgCourse(svc, args.orgId, args.courseId);
   if (!course || !course.is_active) return { error: "Course not found", status: 404 };
   let dueAt: string | null = null;
   if (args.dueAt && args.dueAt.trim()) {
     const raw = args.dueAt.trim();
-    const d = /^\d{4}-\d{2}-\d{2}$/.test(raw) ? endOfDayInTz(raw, await orgTimezone(svc, args.orgId)) : new Date(raw);
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(raw);
+    // A date-only due date reads the organisation's time zone: one call.
+    if (dateOnly) spendCalls(budget, 1);
+    const d = dateOnly ? endOfDayInTz(raw, await orgTimezone(svc, args.orgId)) : new Date(raw);
     if (Number.isNaN(d.getTime())) return { error: "dueAt must be a date", status: 400 };
     if (d.getTime() < Date.now()) return { error: "Due date must be today or later", status: 400 };
     dueAt = d.toISOString();
@@ -306,8 +320,7 @@ export async function assignCourseDirect(
     due_at: dueAt, release_at: null, assigned_by: args.assignedBy,
   }));
   const written = await writeAssignmentRows(svc, "course_assignments", { column: "course_id", id: course.id }, rows, "id", { stopAtError: false });
-  /** The calls this assignment's writes made, for the mail's budget. */
-  let writeCalls = written.calls;
+  spendCalls(budget, written.calls);
   written.outcomes.forEach((o, i) => {
     const uid = ids[i];
     if (o.kind === "inserted") { inserted.push(uid); results.push({ userId: uid, status: "assigned" }); return; }
@@ -326,7 +339,7 @@ export async function assignCourseDirect(
       already.map((uid) => ({ organization_id: args.orgId, assignee_type: "user" as const, user_id: uid, team_id: null })),
       { due_at: dueAt }
     );
-    writeCalls += dated.calls;
+    spendCalls(budget, dated.calls);
   }
   // ADR 0024 step 24: a learner who only pressed Start holds a self row; the
   // admin's assignment converts it (the due date above is already on it). A
@@ -340,7 +353,7 @@ export async function assignCourseDirect(
       { orgId: args.orgId, column: "course_id", id: course.id, userIds: already },
       { assignedBy: args.assignedBy }
     );
-    writeCalls += chunk([...new Set(already)], 150).length;
+    spendCalls(budget, chunk([...new Set(already)], 150).length);
     const converted = new Set(conversion.converted);
     for (let i = 0; i < results.length; i++) {
       const r = results[i];
@@ -353,10 +366,13 @@ export async function assignCourseDirect(
   // budgets. The rows are saved; a failed read of the learners' addresses
   // mails nobody, records the skip, and the outcome says so.
   let email: MailOutcome | null = null;
+  let run: MailRun | undefined;
   if (inserted.length && args.notify !== false) {
     email = await (async (): Promise<MailOutcome | null> => {
       let people: Awaited<ReturnType<typeof namesAndEmails>>;
       try {
+        // One call for each 150 learners.
+        spendCalls(budget, Math.ceil(inserted.length / 150));
         people = await namesAndEmails(svc, inserted);
       } catch {
         await recordRecipientsUnreadable("assign-direct", args.orgId);
@@ -368,7 +384,7 @@ export async function assignCourseDirect(
           const who = people.get(uid);
           return who?.email ? [{ uid, name: who.name, email: who.email }] : [];
         });
-        const run = await openRun({ organizationId: args.orgId, budget: requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS + writeCalls }), db: svc });
+        run = await openRun({ organizationId: args.orgId, budget, db: svc });
         const sent = await sendMany(run, learners, (l) => ({
           event: "asset_assignment",
           to: { user_id: l.uid, email: l.email },
@@ -389,5 +405,5 @@ export async function assignCourseDirect(
       }
     })();
   }
-  return { results, courseTitle: course.title, dueAt, email };
+  return { results, courseTitle: course.title, dueAt, email, ...(run ? { run } : {}) };
 }

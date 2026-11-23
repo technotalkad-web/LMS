@@ -484,13 +484,17 @@ const GRANT_CHUNK = 300;
  * never stands as the whole.
  * Keyed `${user_id}:${course_id}`; a pair with no grant is absent (callers
  * read it as an empty snapshot).
+ * `countCall`, when given, is called once for each call the read makes,
+ * every page and the fallback's re-read included: a request that counts
+ * its calls (ADR 0029, rule FP2) counts them there.
  */
 export async function grantSnapshotForUsers(
   svc: AnyClient,
   orgId: string,
   courseIds: string[] | null,
   userIds: string[],
-  nowIso: string = new Date().toISOString()
+  nowIso: string = new Date().toISOString(),
+  countCall?: () => unknown
 ): Promise<Map<string, GrantSnapshot>> {
   const out = new Map<string, GrantSnapshot>();
   const users = [...new Set(userIds.filter(Boolean))];
@@ -505,6 +509,7 @@ export async function grantSnapshotForUsers(
     const res = await readPagedWithOptionalColumn<GrantPairRow>(
       "reissued_from",
       (columns, from, to) => {
+        countCall?.();
         const q = svc.from("attempt_requests").select(columns).eq("organization_id", orgId).eq("status", "approved").in("user_id", chunk);
         return (inQuery ? q.in("course_id", inQuery) : q).order("id").range(from, to);
       },

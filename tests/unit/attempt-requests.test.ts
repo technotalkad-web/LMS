@@ -245,12 +245,12 @@ console.log("\nPOST /api/attempt-requests/bulk: fail closed, skip a live retake 
   eq("the attempts columns name status, and the read adds is_revision through readPagedWithOptionalColumn (the first page decides)",
     /const ATTEMPT_COLUMNS = "[^"]*\bstatus\b[^"]*";/.test(src) &&
       // ADR 0024 P2-5: the query sits in the preview filter, one decision for every page.
-      /const previews: ContextFilterState = \{ applies: null \};\s*const attemptsRead = await readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(s\.from\("course_attempts"\)\.select\(cols\)[\s\S]*?, apply\)\s*\.order\("id"\)\s*\.range\(from, to\)\s*\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);\s*if \(attemptsRead\.error\) return unreadable\("attempts"\);/.test(src), true);
+      /const previews: ContextFilterState = \{ applies: null \};\s*const attemptsRead = await readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) => \{\s*spendCalls\(budget, 1\);\s*return withoutPreviews\(s\.from\("course_attempts"\)\.select\(cols\)[\s\S]*?, apply\)\s*\.order\("id"\)\s*\.range\(from, to\);\s*\}\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);\s*if \(attemptsRead\.error\) return unreadable\("attempts"\);/.test(src), true);
   eq("…a failed page or an empty answer still answers 503 (nullIsError), and no local copy of the first-page closure remains",
     [/\{ nullIsError: true \}/.test(src), /= used;|readWithOptionalColumn\b/.test(src)], [true, false]);
   eq("eligibility is bulkEligibility(…) === \"grant\"; a live retake is counted in skipped_live_retake",
     /const verdict = bulkEligibility\(\{ scoring: sc, attempts: list, passRequired \}\);\s*if \(verdict === "retake_live"\) skippedLiveRetake\+\+;\s*if \(verdict !== "grant"\) continue;/.test(src), true);
-  eq("the strict bulk snapshot replaces the fail-soft read", [/grantSnapshotForUsers\(s, org\.id, \[course\.id\], userIds\)/.test(src), /fetchGrantRetakeIdsForUsers/.test(src)], [true, false]);
+  eq("the strict bulk snapshot replaces the fail-soft read", [/grantSnapshotForUsers\(s, org\.id, \[course\.id\], userIds, undefined, countCalls\(budget\)\)/.test(src), /fetchGrantRetakeIdsForUsers/.test(src)], [true, false]);
   eq("the versions, attempts, grants and open-requests reads each answer 503 (unreadable) before the insert",
     inOrder(src, ['return unreadable("versions")', 'return unreadable("attempts")', 'return unreadable("grants")', 'return unreadable("open requests")', ".insert(rows)"]), true);
   eq("unreadable answers 503 records_unreadable", /const unreadable = \(read: string\) => \{[\s\S]*?\{ error: "records_unreadable" \}, \{ status: 503 \}/.test(src), true);
