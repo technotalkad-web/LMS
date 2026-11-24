@@ -693,13 +693,17 @@ export async function unusedGrantFor(svc: AnyClient, userId: string, courseId: s
   }
 }
 
-/** Course ids configured "pass required" among the given ids; empty set on a pre-0081 database. */
-export async function fetchPassRequired(client: AnyClient, courseIds: string[]): Promise<Set<string>> {
+/**
+ * Course ids configured "pass required" among the given ids; empty set on a pre-0081 database.
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call.
+ */
+export async function fetchPassRequired(client: AnyClient, courseIds: string[], countCall?: () => unknown): Promise<Set<string>> {
   const out = new Set<string>();
   const ids = [...new Set(courseIds.filter(Boolean))];
   if (ids.length === 0) return out;
   try {
     for (let i = 0; i < ids.length; i += 300) {
+      countCall?.();
       const { data, error } = await client
         .from("courses")
         .select("id, pass_required")

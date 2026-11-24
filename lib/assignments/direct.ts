@@ -1,11 +1,21 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, openRun, recordRecipientsUnreadable, requestBudget, spendCalls, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
+import {
+  ADMIN_REQUEST_OWN_CALLS,
+  MAIL_CALL_COSTS,
+  hasRoom,
+  openRun,
+  recordRecipientsUnreadable,
+  requestBudget,
+  spendCalls,
+  type MailBudget,
+  type MailRun,
+} from "@/lib/notifications/smtp-state";
 import { DEFAULT_JOURNEY_TZ } from "@/lib/journey/journey";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
 import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
-import { chunk } from "@/lib/db/chunked";
+import { chunk, isLostReply, isRowError } from "@/lib/db/chunked";
 import { isMissingColumn, type PgError } from "@/lib/scoring/attempt-kind";
 
 /**
@@ -79,7 +89,11 @@ export type RowWrite =
   | { kind: "duplicate" }
   /** No row came back and no error: the insert's answer had nothing to read. */
   | { kind: "silent" }
-  | { kind: "failed"; error: { code?: string | null; message?: string | null } };
+  | { kind: "failed"; error: { code?: string | null; message?: string | null } }
+  /** Not tried: the request had no room left for its insert (`room`). Not saved. */
+  | { kind: "left" }
+  /** Its insert's answer was lost and its read-back could not tell (it failed, or had no room): it may be saved. */
+  | { kind: "unconfirmed" };
 
 const ASSIGNEE_ID = { user: "user_id", team: "team_id", group: "group_id" } as const;
 const KEY_COLUMNS = ["assignee_type", "user_id", "team_id"] as const;
@@ -100,11 +114,26 @@ const codeOf = (e: PgError) => (e as { code?: string | null } | null | undefined
  *      the same keys (`group_id` on all of them when one is a group row), and
  *      what comes back is matched to its row by the assignee.
  *   3. An insert that answers 23505 (a row written since the read) is done
- *      again one row at a time, today's way. So is any other error when
- *      `stopAtError` is false (a caller answering each learner, who fails one
- *      learner and goes on); when it is true (the routes, which answer 400 at
- *      the first error) the error is returned at once with the rows written
- *      so far, and nothing after it is tried.
+ *      again one row at a time, today's way. So is any other error one row
+ *      causes (isRowError: a check, a foreign key) when `stopAtError` is
+ *      false (a caller answering each learner, who fails one learner and
+ *      goes on); when it is true (the routes, which answer 400 at the first
+ *      error) the error is returned at once with the rows written so far,
+ *      and nothing after it is tried. An error of the whole insert (any
+ *      other code) fails each of its rows, with no row tried again.
+ *   4. An insert whose answer was lost (isLostReply: no database code, the
+ *      fetch failed after it was sent) may have been saved, so it is never
+ *      done again: its rows are read back, one read per assignee type and
+ *      150 ids (the organisation row's one). A row found was written by this
+ *      request and is inserted, with the columns `select` names; a row not
+ *      found was not saved and is failed; with the read failed it is
+ *      unconfirmed. With `stopAtError` a row that is not found answers the
+ *      error.
+ *
+ * `room` (ADR 0029 rule FP2), when given, is asked before each call of the
+ * row-by-row inserts and of a read-back, with the calls made so far: a row
+ * it refuses is not tried (left), and a read-back it refuses is
+ * unconfirmed. So one race can never take a request past its limit.
  *
  * Nothing changes the database's own rules: no row is updated or ignored by
  * an upsert, and a row's defaults are its own. `calls` counts every call
@@ -116,10 +145,22 @@ export async function writeAssignmentRows<R extends AssigneeRow>(
   scope: { column: "course_id" | "path_id"; id: string },
   rows: R[],
   select: string,
-  opts: { stopAtError: boolean }
+  opts: { stopAtError: boolean; room?: (callsSoFar: number) => boolean }
 ): Promise<{ outcomes: RowWrite[]; error: { code?: string | null; message?: string | null } | null; calls: number }> {
   const outcomes: RowWrite[] = new Array(rows.length);
   let calls = 0;
+  const hasRoomFor = () => !opts.room || opts.room(calls);
+  // The assignee's columns come back with the caller's, to match each row
+  // to its own; a column the caller did not ask for is taken out again.
+  const asked = select.split(",").map((c) => c.trim()).filter(Boolean);
+  const keyColumns = (withGroup: boolean) =>
+    asked.includes("*") ? [] : [...KEY_COLUMNS, ...(withGroup ? ["group_id"] : [])].filter((c) => !asked.includes(c));
+  const strip = (r: Record<string, unknown>, added: string[]) => {
+    if (!added.length) return r;
+    const out = { ...r };
+    for (const c of added) delete out[c];
+    return out;
+  };
 
   // 1. The rows already there.
   const there = new Set<string>();
@@ -147,18 +188,83 @@ export async function writeAssignmentRows<R extends AssigneeRow>(
     else todo.push(i);
   });
 
-  // 3. Today's one insert per row, for one part.
-  const oneByOne = async (part: number[]) => {
+  // 4. The rows of an insert whose answer was lost, read back: each found
+  // is inserted, each not found failed with `lost`, and all unconfirmed
+  // when a read fails or has no room.
+  const readBack = async (part: number[], lost: { code?: string | null; message?: string | null }) => {
+    const found = new Map<string, Record<string, unknown>[]>();
+    const add = (r: Record<string, unknown>, added: string[]) => {
+      const k = keyOf(r);
+      found.set(k, [...(found.get(k) ?? []), strip(r, added)]);
+    };
+    const unconfirmed = () => {
+      for (const i of part) outcomes[i] = { kind: "unconfirmed" };
+    };
+    for (const type of ["user", "team", "group"] as const) {
+      const col = ASSIGNEE_ID[type];
+      const ids = [...new Set(part.filter((i) => rows[i].assignee_type === type).map((i) => rows[i][col]).filter((v): v is string => !!v))];
+      const added = keyColumns(type === "group");
+      for (const ofIds of chunk(ids, 150)) {
+        if (!hasRoomFor()) return unconfirmed();
+        calls++;
+        const { data, error } = await client
+          .from(table)
+          .select(added.length ? [select, ...added].join(", ") : select)
+          .eq(scope.column, scope.id)
+          .eq("assignee_type", type)
+          .in(col, ofIds);
+        if (error || !Array.isArray(data)) return unconfirmed();
+        for (const r of data as unknown as Record<string, unknown>[]) add(r, added);
+      }
+    }
+    const orgIdx = part.find((i) => rows[i].assignee_type === "org");
+    if (orgIdx !== undefined) {
+      if (!hasRoomFor()) return unconfirmed();
+      calls++;
+      const added = keyColumns(false);
+      const { data, error } = await client
+        .from(table)
+        .select(added.length ? [select, ...added].join(", ") : select)
+        .eq(scope.column, scope.id)
+        .eq("assignee_type", "org")
+        .eq("organization_id", rows[orgIdx].organization_id);
+      if (error || !Array.isArray(data)) return unconfirmed();
+      for (const r of data as unknown as Record<string, unknown>[]) add(r, added);
+    }
     for (const i of part) {
+      const r = found.get(keyOf(rows[i]))?.shift();
+      outcomes[i] = r ? { kind: "inserted", data: r } : { kind: "failed", error: lost };
+    }
+  };
+  /** With `stopAtError`, the first row of `part` that was not saved, or not confirmed, answers the error. */
+  const firstUnsaved = (part: number[], lost: { code?: string | null; message?: string | null }) =>
+    part.some((i) => outcomes[i].kind === "failed" || outcomes[i].kind === "unconfirmed") ? lost : null;
+
+  // 3. Today's one insert per row, for one part, each asking for room first.
+  const oneByOne = async (part: number[]) => {
+    const lostRows: number[] = [];
+    let lostError: { code?: string | null; message?: string | null } | null = null;
+    for (const i of part) {
+      if (!hasRoomFor()) {
+        outcomes[i] = { kind: "left" };
+        continue;
+      }
       calls++;
       const { data, error } = await client.from(table).insert(rows[i]).select(select).maybeSingle();
       if (data) outcomes[i] = { kind: "inserted", data: data as unknown as Record<string, unknown> };
       else if (!error) outcomes[i] = { kind: "silent" };
       else if (codeOf(error) === "23505") outcomes[i] = { kind: "duplicate" };
-      else {
+      else if (isLostReply(error)) {
+        lostRows.push(i);
+        lostError = error;
+      } else {
         outcomes[i] = { kind: "failed", error };
         if (opts.stopAtError) return error;
       }
+    }
+    if (lostError) {
+      await readBack(lostRows, lostError);
+      if (opts.stopAtError) return firstUnsaved(lostRows, lostError);
     }
     return null;
   };
@@ -167,36 +273,40 @@ export async function writeAssignmentRows<R extends AssigneeRow>(
   for (const part of chunk(todo, 150)) {
     const anyGroup = part.some((i) => rows[i].group_id !== undefined);
     const body = part.map((i) => (anyGroup ? { ...rows[i], group_id: rows[i].group_id ?? null } : rows[i]));
-    // The assignee's columns come back too, to match each row to its own;
-    // a column the caller did not ask for is taken out again.
-    const asked = select.split(",").map((c) => c.trim()).filter(Boolean);
-    const added = asked.includes("*") ? [] : [...KEY_COLUMNS, ...(anyGroup ? ["group_id"] : [])].filter((c) => !asked.includes(c));
+    const added = keyColumns(anyGroup);
     calls++;
     const { data, error } = await client.from(table).insert(body).select(added.length ? [select, ...added].join(", ") : select);
     if (error) {
-      if (codeOf(error) !== "23505" && opts.stopAtError) return { outcomes, error, calls };
+      if (isLostReply(error)) {
+        // Saved or not, the database knows: read the part back, never insert it again.
+        await readBack(part, error);
+        const stop = opts.stopAtError ? firstUnsaved(part, error) : null;
+        if (stop) return { outcomes, error: stop, calls };
+        continue;
+      }
+      const rowByRow = codeOf(error) === "23505" || (!opts.stopAtError && isRowError(error));
+      if (!rowByRow) {
+        if (opts.stopAtError) return { outcomes, error, calls };
+        // The whole insert's error: none of its rows was saved.
+        for (const i of part) outcomes[i] = { kind: "failed", error };
+        continue;
+      }
       const stop = await oneByOne(part);
       if (stop) return { outcomes, error: stop, calls };
       continue;
     }
     const slots = new Map<string, number[]>();
     for (const i of part) slots.set(keyOf(rows[i]), [...(slots.get(keyOf(rows[i])) ?? []), i]);
-    const strip = (r: Record<string, unknown>) => {
-      if (!added.length) return r;
-      const out = { ...r };
-      for (const c of added) delete out[c];
-      return out;
-    };
     const unmatched: Record<string, unknown>[] = [];
     for (const r of (data ?? []) as unknown as Record<string, unknown>[]) {
       const i = slots.get(keyOf(r))?.shift();
       if (i === undefined) unmatched.push(r);
-      else outcomes[i] = { kind: "inserted", data: strip(r) };
+      else outcomes[i] = { kind: "inserted", data: strip(r, added) };
     }
     for (const i of part) {
       if (outcomes[i]) continue;
       const r = unmatched.shift();
-      outcomes[i] = r ? { kind: "inserted", data: strip(r) } : { kind: "silent" };
+      outcomes[i] = r ? { kind: "inserted", data: strip(r, added) } : { kind: "silent" };
     }
   }
   return { outcomes, error: null, calls };
@@ -314,12 +424,21 @@ export async function assignCourseDirect(
   // The rows in one insert per 150 (ADR 0029 gate G3), each learner's
   // outcome what their own insert answered: a learner whose row fails is
   // failed and the others go on (writeAssignmentRows then inserts that part
-  // one row at a time, as before).
+  // one row at a time, as before, or reads it back when the insert's answer
+  // was lost). The row-by-row inserts and a read-back ask the budget for
+  // room first (rule FP2), and keep free the calls the writes below may
+  // still need for the rows already there: their new due date and the
+  // conversion of a self-enrolment, one each per 150 learners. A row they
+  // have no room for is not tried, and answered as not saved.
   const rows = ids.map((uid) => ({
     course_id: course.id, organization_id: args.orgId, assignee_type: "user" as const, user_id: uid, team_id: null,
     due_at: dueAt, release_at: null, assigned_by: args.assignedBy,
   }));
-  const written = await writeAssignmentRows(svc, "course_assignments", { column: "course_id", id: course.id }, rows, "id", { stopAtError: false });
+  const followUps = (dueAt ? chunk(ids, 150).length : 0) + chunk(ids, 150).length;
+  const written = await writeAssignmentRows(svc, "course_assignments", { column: "course_id", id: course.id }, rows, "id", {
+    stopAtError: false,
+    room: (made) => hasRoom(budget, made + 1 + followUps),
+  });
   spendCalls(budget, written.calls);
   written.outcomes.forEach((o, i) => {
     const uid = ids[i];
@@ -329,6 +448,8 @@ export async function assignCourseDirect(
       results.push({ userId: uid, status: "already", reason: dueAt ? "already assigned — due date updated" : "already assigned" });
       return;
     }
+    if (o.kind === "left") { results.push({ userId: uid, status: "failed", reason: "not saved: the request had no room left; try again" }); return; }
+    if (o.kind === "unconfirmed") { results.push({ userId: uid, status: "failed", reason: "not confirmed: the assignment may have been saved; try again" }); return; }
     results.push({ userId: uid, status: "failed", reason: (o.kind === "failed" ? o.error.message : null) ?? "insert failed" });
   });
   // The new due date on the rows already there: one update per 150 learners
@@ -369,6 +490,9 @@ export async function assignCourseDirect(
   let run: MailRun | undefined;
   if (inserted.length && args.notify !== false) {
     email = await (async (): Promise<MailOutcome | null> => {
+      // The addresses' read and the run's opening only while they fit (rule
+      // FP2): with no room left, nobody is emailed and the answer says so.
+      if (!hasRoom(budget, Math.ceil(inserted.length / 150) + MAIL_CALL_COSTS.open)) return mailCounts([], inserted.length);
       let people: Awaited<ReturnType<typeof namesAndEmails>>;
       try {
         // One call for each 150 learners.

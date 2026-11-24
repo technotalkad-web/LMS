@@ -4,7 +4,18 @@ import { resolveOrgMembership } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
 import { originFromRequest } from "@/lib/http/origin";
 import { sendMany, type SendResult } from "@/lib/notifications/send";
-import { ADMIN_REQUEST_OWN_CALLS, SENDS_AT_ONCE, openRun, requestBudget } from "@/lib/notifications/smtp-state";
+import {
+  GROUP_TAIL_CALLS,
+  MAIL_CALL_COSTS,
+  MIDDLEWARE_CALLS,
+  SENDS_AT_ONCE,
+  countCalls,
+  hasRoom,
+  openRun,
+  requestBudget,
+  spendCalls,
+  type MailBudget,
+} from "@/lib/notifications/smtp-state";
 import { type ActionError, type PerLearnerResult } from "@/lib/actions/types";
 import { namesAndEmails } from "@/lib/users/people";
 import {
@@ -32,6 +43,13 @@ import { computeLearnerInsights } from "./insights";
  * people on the server from the three hierarchy fields, refuse the whole
  * request if any target is outside them (never a partial leak), then write
  * on the service role.
+ *
+ * ADR 0029 rule FP2: the request is one budget, counted from its first
+ * call (the middleware's, then the session, the membership and the
+ * reporting line here), each call where it is made, every page and
+ * fallback of the reminder's reads included, so the reminders' mail is
+ * sized on the calls really made and stops at the limit: the rest is
+ * answered as not sent for room ("try again").
  */
 
 export type ManagerActionContext = {
@@ -40,6 +58,8 @@ export type ManagerActionContext = {
   user: { id: string; email: string | null };
   ctx: ManagerContext;
   origin: string;
+  /** The request's budget, its count holding the request's calls so far. */
+  budget: MailBudget;
 };
 
 export type { ActionError, PerLearnerResult } from "@/lib/actions/types";
@@ -49,16 +69,26 @@ const svcClient = () =>
     auth: { persistSession: false },
   });
 
-/** Session → org → manager scope. Impersonation never carries a hierarchy. */
-export async function authorizeManager(orgSlug: string | undefined): Promise<ManagerActionContext | ActionError> {
+/**
+ * Session → org → manager scope. Impersonation never carries a hierarchy.
+ * `budget`: the request's, made in the route's first line (ADR 0029 rule
+ * FP2); else one made here, counting the middleware's call.
+ */
+export async function authorizeManager(
+  orgSlug: string | undefined,
+  budget: MailBudget = requestBudget({ spent: MIDDLEWARE_CALLS })
+): Promise<ManagerActionContext | ActionError> {
   if (!orgSlug) return { error: "orgSlug required", status: 400 };
   const supabase = await createClient();
+  spendCalls(budget, 1);
   const {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return { error: "Unauthorized", status: 401 };
   // ADR 0030: a membership that counts (active, in an org that is not
   // deleted); anything else is answered as a signed-in non-member is.
+  // Two calls: the organisation by its slug, then the caller's member row.
+  spendCalls(budget, 2);
   const m = await resolveOrgMembership<{ id: string; name: string | null; slug: string }>(
     supabase,
     { slug: orgSlug },
@@ -69,7 +99,7 @@ export async function authorizeManager(orgSlug: string | undefined): Promise<Man
   if (m === "none") return { error: "Organization not found", status: 404 };
   const org = m.org;
   const svc = svcClient();
-  const ctx = await loadManagerContext(svc, org.id, user.id);
+  const ctx = await loadManagerContext(svc, org.id, user.id, countCalls(budget));
   if (!ctx.isManager) return { error: "You are not mapped as anyone's manager.", status: 403 };
   return {
     svc,
@@ -77,6 +107,7 @@ export async function authorizeManager(orgSlug: string | undefined): Promise<Man
     user: { id: user.id, email: user.email ?? null },
     ctx,
     origin: await originFromRequest(),
+    budget,
   };
 }
 
@@ -99,13 +130,15 @@ function requireAllInScope(a: ManagerActionContext, userIds: unknown): ActionErr
   return ids;
 }
 
-async function orgTimezone(svc: SupabaseClient, orgId: string): Promise<string> {
+async function orgTimezone(svc: SupabaseClient, orgId: string, budget: MailBudget): Promise<string> {
+  spendCalls(budget, 1);
   const { data } = await svc.from("gamification_settings").select("timezone").eq("organization_id", orgId).maybeSingle();
   return (data as { timezone?: string } | null)?.timezone || DEFAULT_JOURNEY_TZ;
 }
 
-async function orgCourse(svc: SupabaseClient, orgId: string, courseId: string | undefined) {
+async function orgCourse(svc: SupabaseClient, orgId: string, courseId: string | undefined, budget: MailBudget) {
   if (!courseId) return null;
+  spendCalls(budget, 1);
   const { data } = await svc
     .from("courses")
     .select("id, title, is_active")
@@ -115,18 +148,33 @@ async function orgCourse(svc: SupabaseClient, orgId: string, courseId: string | 
   return (data as { id: string; title: string; is_active: boolean } | null) ?? null;
 }
 
+/** A reminder the request had no room for: not attempted, and said so. */
+const NO_ROOM_REASON = "not sent: the request had no room left; try again";
+
+/**
+ * Whether the request has room for its run's first send (ADR 0029 rule
+ * FP2): the run's opening, its template, one send, and its group's tail
+ * with the caller's own calls around the group (`hookCalls`), as the run
+ * sizes a group. The reads before it are what decide who is due, and they
+ * are made whatever they cost; with no room left after them the run is not
+ * opened and every learner due is answered as left for room.
+ */
+const roomForFirstSend = (budget: MailBudget, hookCalls: number) =>
+  hasRoom(budget, MAIL_CALL_COSTS.open + MAIL_CALL_COSTS.template + MAIL_CALL_COSTS.send + GROUP_TAIL_CALLS + hookCalls);
+/** The course reminder's own call around a group: the reminder state's write after it. */
+const COURSE_HOOK_CALLS = 1;
+/** The journey reminder's own calls around a group: the day's claim before it, and up to one give-back a mail after it. */
+const JOURNEY_HOOK_CALLS = 1 + SENDS_AT_ONCE;
+
 /** A send that did not go out, in words the manager can act on. */
 function sendReason(r: SendResult): string {
   if (r.status === "paused") return "email reminders are paused for your organisation";
   if (r.errorClass === "timeout") return "not confirmed: the mail may still arrive";
   if (r.errorClass === "daily_limit") return "your organisation reached its daily email limit";
-  if (r.errorClass === "left") return "not sent: the request had no room left; try again";
+  if (r.errorClass === "left") return NO_ROOM_REASON;
   if (r.errorClass === "not_configured" || r.errorClass === "not_ready") return "your organisation's email is not working";
   return "email could not be sent";
 }
-
-/** A manager's request: its own reads before the mail (scope, coverage, insights, state), an estimate until gate G3. */
-const MANAGER_REQUEST_OWN_CALLS = ADMIN_REQUEST_OWN_CALLS + 6;
 
 // ---------------------------------------------------------------------------
 // 1. Send reminder now
@@ -142,11 +190,15 @@ export async function sendReminders(
   const ids = requireAllInScope(a, body.userIds ?? []);
   if (isActionError(ids)) return ids;
   const target = body.target === "journey" ? "journey" : "course";
+  // The request's one budget (ADR 0029 rule FP2): every call below is
+  // counted where it is made, and the run opens on it.
+  const budget = a.budget;
+  const count = countCalls(budget);
   // The learners' addresses decide who is mailed: a failed read answers 503
   // and sends nothing (ADR 0029, part 3), never "no email" for everyone.
   let people: Awaited<ReturnType<typeof namesAndEmails>>;
   try {
-    people = await namesAndEmails(a.svc, ids);
+    people = await namesAndEmails(a.svc, ids, count);
   } catch {
     return { error: "The learners' details could not be read. Nothing was sent; try again.", status: 503 };
   }
@@ -154,12 +206,12 @@ export async function sendReminders(
   const nowIso = new Date().toISOString();
 
   // Rule 1 (Phase 4c): a manager may only act on content they can see.
-  const coverage = await loadCoverage(a.svc, a.org.id, a.user.id);
+  const coverage = await loadCoverage(a.svc, a.org.id, a.user.id, count);
 
   if (target === "course") {
-    const course = await orgCourse(a.svc, a.org.id, body.contentId ?? undefined);
+    const course = await orgCourse(a.svc, a.org.id, body.contentId ?? undefined, budget);
     if (!course) return { error: "Course not found", status: 404 };
-    const scopes = await loadScopes(a.svc, a.org.id, [{ type: "course", id: course.id }]);
+    const scopes = await loadScopes(a.svc, a.org.id, [{ type: "course", id: course.id }], count);
     if (!isVisible(coverage, scopes.get(`course:${course.id}`))) return { error: "Course not found", status: 404 };
     // Re-derive entitlement and status NOW (dynamic groups change; the page
     // the manager clicked may be stale): the same rules as the Report Card,
@@ -176,11 +228,13 @@ export async function sendReminders(
         periodDays: null,
         content: `course:${course.id}`,
         strictGroups: true,
+        countCall: count,
       }));
     } catch {
       return { error: "The learners' assignments could not be read. Nothing was sent; try again.", status: 503 };
     }
     const lineOf = new Map(learners.map((l) => [l.userId, l.courses.find((c) => c.courseId === course.id) ?? null]));
+    spendCalls(budget, 1);
     const { data: stateRows, error: stateErr } = await a.svc
       .from("reminder_state")
       .select("user_id, first_assigned_at, last_nudge_at, nudge_count")
@@ -219,9 +273,12 @@ export async function sendReminders(
     // One run (ADR 0029 rules T4 and FP7): the sends go through the run's
     // shape and budgets, and each group's state is written with the group,
     // so a later failure in the request cannot lose the fact that a person
-    // WAS emailed.
-    if (due.length > 0) {
-      const run = await openRun({ organizationId: a.org.id, budget: requestBudget({ spent: MANAGER_REQUEST_OWN_CALLS }), db: a.svc });
+    // WAS emailed. The run is on the request's budget, so the mail stops
+    // where the request's calls do, and the rest is answered as left.
+    if (due.length > 0 && !roomForFirstSend(budget, COURSE_HOOK_CALLS)) {
+      for (const d of due) byUser.set(d.uid, { userId: d.uid, status: "failed", reason: NO_ROOM_REASON });
+    } else if (due.length > 0) {
+      const run = await openRun({ organizationId: a.org.id, budget, db: a.svc });
       const unrecorded = new Set<string>();
       const sent = await sendMany(
         run,
@@ -240,7 +297,7 @@ export async function sendReminders(
         }),
         {
           hooks: {
-            afterCalls: 1,
+            afterCalls: COURSE_HOOK_CALLS,
             after: async (entries) => {
               const rows = entries.filter((e) => e.result.status === "sent").map(({ item: d }) => {
                 const st = state.get(d.uid);
@@ -276,7 +333,7 @@ export async function sendReminders(
   }
 
   // Journey: the learner's ACTIVE enrollment on the given program (or their only active one).
-  const tz = await orgTimezone(a.svc, a.org.id);
+  const tz = await orgTimezone(a.svc, a.org.id, budget);
   const today = todayStr(tz);
   let q = a.svc
     .from("journey_enrollments")
@@ -285,6 +342,7 @@ export async function sendReminders(
     .eq("status", "active")
     .in("user_id", ids);
   if (body.contentId) q = q.eq("program_id", body.contentId);
+  spendCalls(budget, 1);
   const { data: enrRows, error: enrErr } = await q;
   // A failed read is never "no active journey" (ADR 0029, part 3): nothing is sent.
   if (enrErr) return { error: "The learners' journeys could not be read. Nothing was sent; try again.", status: 503 };
@@ -297,7 +355,7 @@ export async function sendReminders(
   for (const e of (enrRows ?? []) as Enr[]) if (!enrolments.has(e.user_id)) enrolments.set(e.user_id, e);
   // Enrollments on journeys outside the manager's coverage are not theirs to remind.
   const programIds = [...new Set([...enrolments.values()].map((e) => e.program_id))];
-  const journeyScopes = await loadScopes(a.svc, a.org.id, programIds.map((id) => ({ type: "journey" as const, id })));
+  const journeyScopes = await loadScopes(a.svc, a.org.id, programIds.map((id) => ({ type: "journey" as const, id })), count);
   for (const [uid, e] of [...enrolments]) if (!isVisible(coverage, journeyScopes.get(`journey:${e.program_id}`))) enrolments.delete(uid);
   // One batched round-trip for the credited days + "done today" (the same
   // RPC the hourly cron uses), instead of a query per learner. `credited`
@@ -307,6 +365,7 @@ export async function sendReminders(
   // (reminderCountsFrom).
   let counts: ReminderCounts = reminderCountsFrom([], null);
   if (enrolments.size) {
+    spendCalls(budget, 1);
     const { data: cntRows, error: cntErr } = await a.svc.rpc("journey_reminder_counts", { p_ids: [...enrolments.values()].map((e) => e.id) });
     counts = reminderCountsFrom(cntRows, cntErr);
   }
@@ -360,6 +419,7 @@ export async function sendReminders(
   const titleIds = [...new Set(due.filter((d) => !d.missionTitle && d.courseId).map((d) => d.courseId!))];
   const courseTitle = new Map<string, string>();
   if (titleIds.length > 0) {
+    spendCalls(budget, 1);
     const { data: titleRows } = await a.svc.from("courses").select("id, title").in("id", titleIds);
     for (const c of (titleRows ?? []) as Array<{ id: string; title?: string | null }>) if (c.title) courseTitle.set(c.id, c.title);
   }
@@ -382,13 +442,16 @@ export async function sendReminders(
       deadline: deadline ?? "",
     };
   });
-  if (mails.length > 0) {
+  if (mails.length > 0 && !roomForFirstSend(budget, JOURNEY_HOOK_CALLS)) {
+    for (const d of mails) byUser.set(d.uid, { userId: d.uid, status: "failed", reason: NO_ROOM_REASON });
+  } else if (mails.length > 0) {
     // One run (ADR 0029 rules T2, T4 and FP7). Today's reminder is claimed for
     // each group in one conditional update just before its sends, so the
     // hourly cron cannot send a second one and a nudge that is not started
     // holds no claim. A claim is given back after a failure of any class but
     // a timeout (the mail may still arrive), so the cron can try later today.
-    const run = await openRun({ organizationId: a.org.id, budget: requestBudget({ spent: MANAGER_REQUEST_OWN_CALLS }), db: a.svc });
+    // The run is on the request's budget, as the course's.
+    const run = await openRun({ organizationId: a.org.id, budget, db: a.svc });
     const claimed = new Set<string>();
     const sent = await sendMany(
       run,

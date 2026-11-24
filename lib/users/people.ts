@@ -11,13 +11,16 @@ export async function memberIdsInOrg(svc: SupabaseClient, orgId: string, ids: It
   return new Set(rows.map((r) => r.user_id));
 }
 
-/** Display names and emails for a set of user ids (profiles; chunked). */
-export async function namesAndEmails(svc: SupabaseClient, ids: Iterable<string>): Promise<Map<string, Person>> {
+/**
+ * Display names and emails for a set of user ids (profiles; chunked).
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call.
+ */
+export async function namesAndEmails(svc: SupabaseClient, ids: Iterable<string>, countCall?: () => unknown): Promise<Map<string, Person>> {
   const list = [...new Set([...ids].filter(Boolean))];
   const out = new Map<string, Person>();
   if (list.length === 0) return out;
   const rows = await fetchByIds<{ id: string; first_name: string | null; last_name: string | null; email: string | null }>(
-    svc, "profiles", "id, first_name, last_name, email", "id", list
+    svc, "profiles", "id, first_name, last_name, email", "id", list, undefined, "id", countCall
   );
   for (const p of rows) {
     out.set(p.id, {

@@ -18,7 +18,9 @@
  *     "grant a retry");
  *   - the vertical / department groups of an assignment's scopes
  *     (ensureScopeGroups, lib/org/scope-groups.ts): 20 pairs, the most a
- *     request takes, were one read (and one re-activation) each.
+ *     request takes, were one read (and one re-activation) each. The
+ *     groups not there yet are created first, and the deactivated ones
+ *     re-activated only after every create succeeded.
  *
  * For each: every row is written, in one insert; the calls before the first
  * send are a fixed number, whatever the number of learners (counted here
@@ -39,6 +41,23 @@
  * no room left after all (by the count or by the clock), the requester's
  * mail is left, never read or attempted, and the answer says so (`left`);
  * two cases call actOnTicket with such a budget.
+ *
+ * A ticket's insert can fail in two ways the one insert must answer
+ * honestly (the server's unique keys are held here for both tables):
+ *   - saved, with its answer lost (the fetch failed after the request was
+ *     sent; supabase-js answers code ""). It is read back, never inserted
+ *     again row by row: every learner is granted or assigned, emailed as
+ *     the budget allows, and the ticket closes. A read-back that fails
+ *     answers each learner "not confirmed", and the ticket stays open. The
+ *     course assignment route shares the writer and reads back the same way.
+ *   - refused with 23505 (another request wrote one of its rows since the
+ *     read). Its rows go one at a time while the request has room; the
+ *     rest are not tried and answered as not saved ("try again"), and the
+ *     request stays within 40. At 50 the inserts use the room up: no
+ *     learner is emailed, the requester's mail is left, and the ticket
+ *     still closes with its outcome.
+ * And a vertical target whose group cannot be created leaves the
+ * deactivated groups the request named deactivated.
  *
  * A learner's request for another attempt (POST /api/attempt-requests) and
  * a manager's new ticket (POST /api/tickets) mail up to 25 administrators;
@@ -82,6 +101,26 @@ type Call = { method: string; path: string; table: string; query: string; body: 
 let calls: Call[] = [];
 /** The tables whose one-row insert reads its new row back as one object (.single() or .maybeSingle()), with the id the server gives it. */
 const SINGLE_INSERTS: Record<string, string> = { org_groups: "0e100000", help_tickets: "0e200000", attempt_requests: "0e300000" };
+/**
+ * The unique keys the server holds for the two tables a ticket's action
+ * writes (attempt_requests_one_open_idx, course_assignments_unique_user_idx):
+ * a row's key, or null when no index covers it. An insert with a row whose
+ * key is taken, or taken twice in the insert, is refused whole with 23505.
+ */
+const UNIQUE: Record<string, (r: Row) => string | null> = {
+  attempt_requests: (r) => (r.status === "pending" || (r.status === "approved" && (r.used_at ?? null) === null) ? `${r.user_id}|${r.course_id}` : null),
+  course_assignments: (r) => (r.assignee_type === "user" ? `${r.course_id}|${r.user_id}` : null),
+};
+/**
+ * A case's switches: `beforeWrite` runs as an insert arrives (another
+ * request's write just before it); `loseReply` saves an insert and then
+ * fails its fetch, as a connection dropped after the request was sent
+ * (supabase-js answers code ""); `failRead` fails a read with an error.
+ */
+let beforeWrite: ((c: Call) => void) | null = null;
+let loseReply: ((c: Call) => boolean) | null = null;
+let failRead: ((c: Call) => boolean) | null = null;
+const json = (body: unknown, status: number) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = new URL(input instanceof Request ? input.url : String(input));
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
@@ -92,8 +131,21 @@ const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<R
   const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
   const key = headers.get("apikey");
   const table = url.pathname.replace("/rest/v1/", "");
-  calls.push({ method, path: url.pathname, table, query: decodeURIComponent(url.search), body, service: key === process.env.SUPABASE_SERVICE_ROLE_KEY });
+  const call: Call = { method, path: url.pathname, table, query: decodeURIComponent(url.search), body, service: key === process.env.SUPABASE_SERVICE_ROLE_KEY };
+  calls.push(call);
   if (url.pathname === "/auth/v1/user") return new Response(JSON.stringify(USER), { status: 200, headers: { "content-type": "application/json" } });
+  if (method === "GET" && failRead?.(call)) return json({ code: "XX000", message: "stub read failure" }, 500);
+  if (method === "POST" && UNIQUE[table]) {
+    beforeWrite?.(call);
+    const keyOf = UNIQUE[table];
+    const taken = new Set((world.tables[table] ?? []).map(keyOf).filter((k): k is string => k !== null));
+    for (const r of (Array.isArray(body) ? body : [body]) as Row[]) {
+      const k = keyOf(r);
+      if (k === null) continue;
+      if (taken.has(k)) return json({ code: "23505", message: "duplicate key value violates unique constraint" }, 409);
+      taken.add(k);
+    }
+  }
   // A new group, ticket or attempt request read back gets its id from the
   // server (the world's generic table gives none), and .single() or
   // .maybeSingle() reads it as one object, as the server answers it.
@@ -102,7 +154,9 @@ const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<R
     const rows = (await res.json()) as Row[];
     return new Response(JSON.stringify(rows[0] ?? null), { status: res.status, headers: { "content-type": "application/json" } });
   }
-  return worldStub(input, init);
+  const res = await worldStub(input, init);
+  if (loseReply?.(call)) throw new TypeError("fetch failed");
+  return res;
 };
 
 /** The calls before the first send, and the rows of the inserts into a table. */
@@ -173,10 +227,15 @@ function seed(over: { attempts?: boolean; ticket?: Row } = {}) {
         id: groupId(i), organization_id: ORG, name: `${v} (everyone)`, group_type: "dynamic", rules: { verticals: [v] },
         is_active: i % 2 === 0, system_key: `scope:${v}|`,
       })),
+      // No time zone of its own: a date-only due date ends in the default one.
+      gamification_settings: [],
     },
     rpc: { effective_attempt_policies: () => [] },
   });
   calls = [];
+  beforeWrite = null;
+  loseReply = null;
+  failRead = null;
 }
 
 /** The 25 administrators of the requests that mail them (`admin-1@` to `admin-25@`). */
@@ -217,6 +276,9 @@ function seedAdmins(others = 0) {
     rpc: { effective_attempt_policies: () => [] },
   });
   calls = [];
+  beforeWrite = null;
+  loseReply = null;
+  failRead = null;
 }
 
 async function main() {
@@ -253,6 +315,24 @@ async function main() {
       eq("the calls before the first send: 16, whatever the number of learners", beforeFirstSend(), 16);
       const own = ownCalls();
       eq(`…the route's own calls before its mail part: 8, within ADMIN_REQUEST_OWN_CALLS (${ADMIN_REQUEST_OWN_CALLS})`, [own, own !== null && own <= ADMIN_REQUEST_OWN_CALLS], [8, true]);
+    }
+    {
+      // The insert saved and its answer lost (the fetch failed after it was
+      // sent): the route shares writeAssignmentRows, which reads the rows
+      // back in one call instead of answering 400 with every row saved.
+      console.log(`\nPOST /api/assignments: ${N} named learners, the insert saved and its answer lost`);
+      seed();
+      let lost = false;
+      loseReply = (c) => !lost && c.method === "POST" && c.table === "course_assignments" && (lost = true);
+      const r = await post(courseRoute, "http://lms.test/api/assignments", { courseId: COURSE, userIds: LEARNERS });
+      const postAt = calls.findIndex((c) => c.method === "POST" && c.table === "course_assignments");
+      eq(`200, ${N} assigned, mail sent; every row written once, in the one insert, and read back in one call`,
+        [r.status, r.body.assigned, ((r.body.email as Row | null)?.emailed as number) > 0, named(world.tables.course_assignments), insertsInto("course_assignments").length,
+          calls.slice(postAt + 1).filter((c) => c.method === "GET" && c.table === "course_assignments").length],
+        [200, N, true, [...LEARNERS].sort(), 1, 1]);
+      const own = ownCalls();
+      eq(`…the route's own calls before its mail part: 9 with the read-back, within ADMIN_REQUEST_OWN_CALLS (${ADMIN_REQUEST_OWN_CALLS}); the whole request within 40`,
+        [own, own !== null && own <= ADMIN_REQUEST_OWN_CALLS, calls.length + MIDDLEWARE_CALLS <= 40], [9, true, true]);
     }
 
     console.log("\nPOST /api/assignments: 20 vertical targets, each group already there, every other one deactivated");
@@ -291,6 +371,31 @@ async function main() {
           calls.filter((c) => c.table === "org_groups" && c.method === "POST").length,
           created.map((g) => [g.is_active, g.group_type, JSON.stringify(g.rules), g.name]), groupRows.sort()],
         [200, 2, 1, 1, [[true, "dynamic", JSON.stringify({ verticals: ["V21"] }), "V21 (everyone)"]], [groupId(0), String(created[0]?.id)].sort()]);
+    }
+    {
+      // A create that fails: the route answers 400, and the deactivated
+      // groups the request named stay deactivated (the creates come first,
+      // the re-activation only after every create succeeded). Before, the
+      // deactivated groups were re-activated before the create was tried.
+      seed();
+      world.failWrite = (r) => r.table === "org_groups" && r.method === "POST";
+      const named = ["V02", "V21", "V04"];
+      const r = await post(courseRoute, "http://lms.test/api/assignments", { courseId: COURSE, scopes: named.map((vertical) => ({ vertical })) });
+      const state = (v: string) => world.tables.org_groups.find((g) => g.system_key === `scope:${v}|`)?.is_active ?? null;
+      eq("a create that fails: 400, V02 and V04 still deactivated, no group re-activated, none created, nothing assigned",
+        [r.status, state("V02"), state("V04"), calls.filter((c) => c.table === "org_groups" && c.method === "PATCH").length, state("V21"), world.tables.course_assignments.length],
+        [400, false, false, 0, null, 0]);
+    }
+    {
+      // A master value with a double quote: each pair's group is read on its
+      // own, and the order holds there too.
+      seed();
+      world.tables.org_field_options.push({ id: "0f000000-0000-4000-8000-000000000099", organization_id: ORG, field: "business_vertical", value: 'V"Q', parent_id: null });
+      world.failWrite = (r) => r.table === "org_groups" && r.method === "POST";
+      const r = await post(courseRoute, "http://lms.test/api/assignments", { courseId: COURSE, scopes: [{ vertical: "V02" }, { vertical: 'V"Q' }] });
+      eq("…a key a filter list cannot carry: 400, V02 still deactivated, no group re-activated",
+        [r.status, world.tables.org_groups.find((g) => g.system_key === "scope:V02|")?.is_active, calls.filter((c) => c.table === "org_groups" && c.method === "PATCH").length],
+        [400, false, 0]);
     }
 
     console.log(`\nPOST /api/learning-path-assignments: ${N} named learners`);
@@ -495,6 +600,126 @@ async function main() {
         [r.status, closed(), learnerSends(), requesterSends(), counts(r.body.requester_email), runsOpened()],
         [200, [["closed", "declined"]], 0, 1, [1, 0, 0, null], 1]);
       eq(`…${calls.length + MIDDLEWARE_CALLS} calls with the middleware's, within 40`, calls.length + MIDDLEWARE_CALLS <= 40, true);
+    }
+
+    /** A date-only due date 30 days on. */
+    const dueIn30 = new Date(Date.now() + 30 * 86_400_000).toISOString().slice(0, 10);
+    const tableOf = (action: "grant_retry" | "assign") => (action === "grant_retry" ? "attempt_requests" : "course_assignments");
+    /**
+     * A ticket naming `people`, acted on end to end, with `arrange` setting a
+     * case's switches after the seed: the answer, the learners whose row is
+     * there after it, the two mail outcomes, the sends, and the whole
+     * request's calls with the middleware's.
+     */
+    const actWith = async (action: "grant_retry" | "assign", people: string[], arrange: () => void, dueAt?: string) => {
+      seed({ attempts: action === "grant_retry", ticket: ticketRow(action === "grant_retry" ? "grant_retry" : "assign_content", people) });
+      arrange();
+      const r = await actOn(action === "grant_retry" ? { action, expires_in_days: 30 } : { action, ...(dueAt ? { dueAt } : {}) });
+      const rows = action === "grant_retry"
+        ? world.tables.attempt_requests.filter((x) => x.status === "approved" && x.decided_by === ADMIN).map((x) => String(x.user_id))
+        : world.tables.course_assignments.filter((x) => x.assignee_type === "user" && x.assigned_by === ADMIN).map((x) => String(x.user_id));
+      return {
+        status: r.status, results: (r.body.results as Row[] | undefined) ?? [], rows,
+        email: counts(r.body.email), requester: counts(r.body.requester_email),
+        learners: learnerSends(), requesterSent: requesterSends(), total: calls.length + MIDDLEWARE_CALLS,
+      };
+    };
+    /** The first insert into `table` is saved, and its answer lost. */
+    const loseFirstInsertInto = (table: string) => {
+      let done = false;
+      loseReply = (c) => {
+        if (done || c.method !== "POST" || c.table !== table) return false;
+        done = true;
+        return true;
+      };
+    };
+    const NOT_SAVED = "not saved: the request had no room left; try again";
+
+    // A batch insert saved whose answer is lost: the connection dropped after
+    // the request was sent, and supabase-js answers code "". Before, its rows
+    // were inserted again one at a time; each met its own row (23505), so
+    // every learner read as failed or already assigned and nobody was
+    // emailed: a grant answered 409 with every grant saved, and an
+    // assignment with a due date closed the ticket as assigned while nobody
+    // was told. The rows are now read back (one call per 150 learners), and
+    // each found is the request's own: granted or assigned, and emailed as
+    // the budget allows.
+    for (const action of ["grant_retry", "assign"] as const) {
+      const table = tableOf(action);
+      const done = action === "grant_retry" ? "granted" : "assigned";
+      const measured: string[] = [];
+      for (const n of [1, 3, MAX_TICKET_PEOPLE]) {
+        console.log(`\nPOST /api/tickets/[id]/act, "${action}"${action === "assign" ? " with a due date" : ""}: a ticket naming ${n}, its insert saved and its answer lost`);
+        const people = LEARNERS.slice(0, n);
+        const a = await actWith(action, people, () => loseFirstInsertInto(table), dueIn30);
+        const postAt = calls.findIndex((c) => c.method === "POST" && c.table === table);
+        eq(`200, the ticket closed as ${done} with its thread message; all ${n} ${done}, each row written once, no insert tried again`,
+          [a.status, closed(), world.tables.help_ticket_messages.length, a.results.filter((x) => x.status === done).length, [...a.rows].sort(), insertsInto(table).length],
+          [200, [["closed", done]], 1, n, [...people].sort(), 1]);
+        eq("…its rows read back in one call", calls.slice(postAt + 1).filter((c) => c.method === "GET" && c.table === table).length, 1);
+        const [emailed, notEmailed, notConfirmed] = a.email as number[];
+        eq("…the learners emailed as the budget allows, the rest not emailed; the requester emailed; within 40",
+          [emailed >= 1, emailed + notEmailed + notConfirmed, a.learners, a.requesterSent, a.requester, a.total <= 40],
+          [true, n, emailed, 1, [1, 0, 0, null], true]);
+        if (n <= 3) eq(`…a ticket of ${n}: every learner emailed`, emailed, n);
+        measured.push(`${n}:${emailed}/${a.total}`);
+      }
+      console.log(`  (size:learners emailed/calls) ${measured.join(" ")}`);
+    }
+
+    // The read-back itself fails: each learner is "not confirmed", neither
+    // granted or assigned nor "not saved", nobody is emailed, and nothing is
+    // inserted again. The ticket stays open (nobody was confirmed).
+    for (const action of ["grant_retry", "assign"] as const) {
+      const table = tableOf(action);
+      console.log(`\nPOST /api/tickets/[id]/act, "${action}": a ticket naming 3, its insert's answer lost and its read-back failed`);
+      const a = await actWith(action, LEARNERS.slice(0, 3), () => {
+        loseFirstInsertInto(table);
+        failRead = (c) => c.table === table && calls.some((x) => x.method === "POST" && x.table === table);
+      }, dueIn30);
+      eq("409, the ticket still open; each of the 3 not confirmed; nobody emailed; no insert tried again",
+        [a.status, closed(), a.results.length === 0 || a.results.every((x) => String(x.reason ?? "").startsWith("not confirmed")), a.learners, insertsInto(table).length],
+        [409, [["open", null]], true, 0, 1]);
+    }
+
+    // A batch refused with 23505: another request wrote one of its rows
+    // after this one read them. Its rows are inserted one at a time, each
+    // asking the budget for room first, and the rows the request has no room
+    // left for are not tried and answered as not saved ("try again"). The
+    // mail's reads and the run's opening are made only while they fit.
+    // Before, all 50 were tried one at a time, past 40 and past the
+    // platform's 50.
+    for (const [action, dueAt] of [["grant_retry", undefined], ["assign", undefined], ["assign", dueIn30]] as const) {
+      const table = tableOf(action);
+      const people = LEARNERS.slice(0, MAX_TICKET_PEOPLE);
+      const raced = people[6];
+      console.log(`\nPOST /api/tickets/[id]/act, "${action}"${dueAt ? " with a due date" : ""}: a ticket naming ${people.length}, its insert refused with 23505`);
+      const a = await actWith(action, people, () => {
+        let done = false;
+        beforeWrite = (c) => {
+          if (done || c.table !== table || !Array.isArray(c.body)) return;
+          done = true;
+          world.tables[table].push(action === "grant_retry"
+            ? { organization_id: ORG, course_id: COURSE, user_id: raced, status: "pending", used_at: null, decided_by: null, decided_at: null, expires_at: null }
+            : { organization_id: ORG, course_id: COURSE, assignee_type: "user", user_id: raced, team_id: null, due_at: null, release_at: null, assigned_by: MANAGER });
+        };
+      }, dueAt);
+      const untried = a.results.filter((x) => x.reason === NOT_SAVED).map((x) => String(x.userId));
+      const done = a.results.filter((x) => x.status === (action === "grant_retry" ? "granted" : "assigned")).map((x) => String(x.userId));
+      const racedOutcome = a.results.find((x) => x.userId === raced);
+      console.log(`  (tried one at a time, raced one included: ${people.length - untried.length}; calls ${a.total})`);
+      eq("200, the whole request within 40", [a.status, a.total <= 40], [200, true]);
+      // What the room left: the row-by-row inserts use it up, so the
+      // learners' mail is not read or opened and the requester's is left;
+      // the ticket still closes with its outcome (its two calls were held).
+      eq("…measured: no learner emailed (each saved one reported as not emailed), the requester's mail left, the ticket closed with its outcome",
+        [a.email, a.learners, a.requester, a.requesterSent, closed()],
+        [[0, a.rows.length, 0, null], 0, [0, 1, 0, 1], 0, [["closed", action === "grant_retry" ? "granted" : "assigned"]]]);
+      eq("…the rows not tried answered as not saved, \"try again\", and none of them written",
+        [untried.length > 0, untried.some((u) => a.rows.includes(u))], [true, false]);
+      eq("…each row tried and saved is written, and each written row was tried; the raced one is answered as already there",
+        [[...done].sort(), [...a.rows].sort(), racedOutcome?.status], [[...a.rows].sort(), [...done].sort(), action === "grant_retry" ? "failed" : "already"]);
+      eq("…every learner has one outcome", done.length + untried.length + 1, people.length);
     }
 
     // The bulk grant (POST /api/attempt-requests/bulk) was one run, but its

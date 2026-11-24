@@ -16,6 +16,11 @@ export function chunk<T>(arr: T[], n: number): T[][] {
   return out;
 }
 
+/**
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call
+ * (every chunk and every page), so a request that counts its calls counts
+ * these.
+ */
 export async function fetchByIds<T>(
   svc: SupabaseClient,
   table: string,
@@ -23,12 +28,14 @@ export async function fetchByIds<T>(
   col: string,
   ids: string[],
   apply?: (q: any) => any,
-  orderBy = "id"
+  orderBy = "id",
+  countCall?: () => unknown
 ): Promise<T[]> {
   const out: T[] = [];
   const uniq = [...new Set(ids.filter(Boolean))];
   for (const part of chunk(uniq, 150)) {
     for (let from = 0; ; from += 1000) {
+      countCall?.();
       let q: any = svc.from(table).select(select).in(col, part).order(orderBy).range(from, from + 999);
       if (apply) q = apply(q);
       const { data, error } = await q;
@@ -41,15 +48,18 @@ export async function fetchByIds<T>(
   return out;
 }
 
+/** `countCall`, when given, is called before each page, as fetchByIds has it. */
 export async function fetchAll<T>(
   svc: SupabaseClient,
   table: string,
   select: string,
   apply: (q: any) => any,
-  orderBy = "id"
+  orderBy = "id",
+  countCall?: () => unknown
 ): Promise<T[]> {
   const out: T[] = [];
   for (let from = 0; ; from += 1000) {
+    countCall?.();
     const { data, error } = await apply(
       svc.from(table).select(select).order(orderBy).range(from, from + 999)
     );
@@ -119,4 +129,29 @@ export async function readByIdsStrict<T>(
     out.push(...rows);
   }
   return out;
+}
+
+/**
+ * A write's error that carries no database code: its answer was lost on
+ * the way. supabase-js answers code "" when the fetch itself failed (the
+ * connection dropped after the request was sent), and a gateway's error
+ * page that is not JSON comes back with no code at all. Such a write may
+ * have been saved; only a read can tell (ADR 0029: a batch is read back,
+ * never inserted again row by row).
+ */
+export function isLostReply(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return code === undefined || code === null || code === "";
+}
+
+/**
+ * A database error that one row of a write causes: class 23, an integrity
+ * constraint (a duplicate, 23505; a check, 23514; a foreign key; a missing
+ * value). The database refused the whole insert for that row, so writing
+ * the rows one at a time tells which. Any other error is the whole write's.
+ */
+export function isRowError(error: unknown): boolean {
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : null;
+  return typeof code === "string" && code.startsWith("23");
 }

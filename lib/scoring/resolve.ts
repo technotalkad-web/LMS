@@ -22,18 +22,20 @@ type AnyClient = any;
  * answer (a missing function before 0073 among them) before the platform
  * default is used, and may throw: a caller that mails from the answer reads
  * a failed read as a failure, never as the default (ADR 0029, stage 2's one
- * rule). Without it the call stays fail-soft.
+ * rule). Without it the call stays fail-soft. `countCall` (ADR 0029 rule
+ * FP2), when given, is called before its one call.
  */
 export async function resolvePolicies(
   client: AnyClient,
   courseIds: string[],
-  opts: { readFailed?: (error: unknown) => void } = {}
+  opts: { readFailed?: (error: unknown) => void; countCall?: () => unknown } = {}
 ): Promise<Map<string, EffectivePolicy>> {
   const out = new Map<string, EffectivePolicy>();
   const ids = [...new Set(courseIds.filter(Boolean))];
   if (ids.length === 0) return out;
   let failure: unknown = null;
   try {
+    opts.countCall?.();
     const { data, error } = await client.rpc("effective_attempt_policies", {
       p_course_ids: ids,
     });

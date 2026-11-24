@@ -78,6 +78,13 @@ export type InsightOptions = {
    * Report Card pages leave it off.
    */
   strictGroups?: boolean;
+  /**
+   * For a request that counts its calls (ADR 0029 rule FP2): called before
+   * each call made here, every chunk, page and fallback included, so the
+   * request's budget holds the calls really made. The manager's reminder
+   * passes it; the Report Card pages leave it off.
+   */
+  countCall?: () => unknown;
 };
 
 export type CatalogEntry = { id: string; title: string };
@@ -182,7 +189,7 @@ const ATTEMPT_COLUMNS =
  * (`previews`); on a database without 0107 the filter's missing-column error
  * reads today's select once (readWithContextFilter).
  */
-async function fetchAttemptRows(svc: SupabaseClient, orgId: string, userIds: string[]): Promise<AttemptRow[]> {
+async function fetchAttemptRows(svc: SupabaseClient, orgId: string, userIds: string[], countCall?: () => unknown): Promise<AttemptRow[]> {
   const out: AttemptRow[] = [];
   const decided: OptionalColumnState = { columns: null };
   const previews: ContextFilterState = { applies: null };
@@ -190,11 +197,12 @@ async function fetchAttemptRows(svc: SupabaseClient, orgId: string, userIds: str
     const res = await readPagedWithOptionalColumn<unknown>(
       "is_revision",
       (cols, from, to): PromiseLike<{ data: unknown[] | null; error: PgError }> =>
-        readWithContextFilter(previews, (apply) =>
-          withoutPreviews(svc.from("course_attempts").select(cols).in("user_id", part).eq("organization_id", orgId), apply)
+        readWithContextFilter(previews, (apply) => {
+          countCall?.();
+          return withoutPreviews(svc.from("course_attempts").select(cols).in("user_id", part).eq("organization_id", orgId), apply)
             .order("id")
-            .range(from, to)
-        ),
+            .range(from, to);
+        }),
       ATTEMPT_COLUMNS,
       { state: decided }
     );
@@ -216,8 +224,10 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const lensCourse = content.startsWith("course:") ? content.slice(7) : null;
   const lensPath = content.startsWith("path:") ? content.slice(5) : null;
   const lensJourney = content.startsWith("journey:") ? content.slice(8) : null;
+  const count = opts.countCall;
 
   /* ---- org timezone / today (journey maths, "active today") ---- */
+  count?.();
   const { data: gsRow } = await svc
     .from("gamification_settings")
     .select("timezone")
@@ -232,6 +242,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   // The active courses and paths decide which assignments reach a learner:
   // for a caller that mails from the answer, a failed read throws (the
   // caller answers 503), never "not assigned".
+  count?.();
   const { data: courseRows, error: courseErr } = await svc
     .from("courses")
     .select("id, title, is_active")
@@ -240,6 +251,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   if (opts.strictGroups && (courseErr || !Array.isArray(courseRows))) throw new Error(`courses: ${courseErr?.message ?? "no answer"}`);
   const allCourses = (courseRows ?? []) as Array<{ id: string; title: string; is_active: boolean }>;
   const courseTitle = new Map(allCourses.map((c) => [c.id, c.title]));
+  count?.();
   const { data: pathRows, error: pathErr } = await svc
     .from("learning_paths")
     .select("id, name, is_active")
@@ -250,7 +262,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const pathName = new Map(allPaths.map((p) => [p.id, p.name]));
   const pathCourseRows = allPaths.length
     ? await fetchByIds<{ path_id: string; course_id: string; step_number: number; release_at: string | null }>(
-        svc, "learning_path_courses", "path_id, course_id, step_number, release_at", "path_id", allPaths.map((p) => p.id), undefined, "path_id"
+        svc, "learning_path_courses", "path_id, course_id, step_number, release_at", "path_id", allPaths.map((p) => p.id), undefined, "path_id", count
       )
     : [];
   pathCourseRows.sort((a, b) => (a.step_number ?? 0) - (b.step_number ?? 0));
@@ -265,6 +277,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
     if (!activePath.has(r.path_id) || !activeCourse.has(r.course_id) || !isReleased(r.release_at, nowMs)) continue;
     coursesOfPath.set(r.path_id, [...(coursesOfPath.get(r.path_id) ?? []), r.course_id]);
   }
+  count?.();
   const { data: progRows } = await svc.from("journey_programs").select("*").eq("organization_id", orgId);
   const programs = (progRows ?? []) as Array<{ id: string; name: string; is_active: boolean; deadline_days?: number | null }>;
   const programById = new Map(programs.map((p) => [p.id, p]));
@@ -276,22 +289,22 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
 
   if (userIds.length === 0) {
     // Catalog-only call (the L3 cached path still needs the org benchmark for §7 gaps).
-    return { learners: [], catalog, benchmark: await loadBenchmark(svc, catalog.courses.map((c) => c.id)), today, tz };
+    return { learners: [], catalog, benchmark: await loadBenchmark(svc, catalog.courses.map((c) => c.id), count), today, tz };
   }
 
   /* ---- people ---- */
   type MemberRow = { user_id: string; designation: string | null; city: string | null; branch: string | null; business_vertical: string | null; department?: string | null; date_of_joining: string | null };
   let memberRows: MemberRow[];
   try {
-    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, department, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
+    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, department, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id", count);
   } catch (e) {
     // 0096 deploy safety: no department column yet.
     if (!/department/.test(String((e as Error)?.message ?? e))) throw e;
-    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
+    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id", count);
   }
   const memberById = new Map(memberRows.map((m) => [m.user_id, m]));
   const profRows = await fetchByIds<{ id: string; first_name: string | null; last_name: string | null; email: string | null; avatar_url: string | null }>(
-    svc, "profiles", "id, first_name, last_name, email, avatar_url", "id", userIds
+    svc, "profiles", "id, first_name, last_name, email, avatar_url", "id", userIds, undefined, "id", count
   );
   const profById = new Map(profRows.map((p) => [p.id, p]));
   const nameOf = (id: string) => {
@@ -300,11 +313,11 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   };
 
   /* ---- attempts + versions ---- */
-  const attempts = await fetchAttemptRows(svc, orgId, userIds);
+  const attempts = await fetchAttemptRows(svc, orgId, userIds, count);
   const versionIds = [...new Set(attempts.map((a) => a.course_version_id))];
   const versionRows = versionIds.length
     ? await fetchByIds<{ id: string; course_id: string; unit_count: number | null }>(
-        svc, "course_versions", "id, course_id, unit_count:manifest_data->unitCount", "id", versionIds
+        svc, "course_versions", "id, course_id, unit_count:manifest_data->unitCount", "id", versionIds, undefined, "id", count
       )
     : [];
   const courseOfVersion = new Map(versionRows.map((v) => [v.id, v.course_id]));
@@ -313,12 +326,12 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   for (const a of attempts) attemptsByUser.set(a.user_id, [...(attemptsByUser.get(a.user_id) ?? []), a]);
 
   /* ---- assignment expansion (released only; paths entitle their courses) ---- */
-  const courseAssigns = await fetchAll<CourseAssign>(svc, "course_assignments", "*", (q) => q.eq("organization_id", orgId));
-  const pathAssigns = await fetchAll<PathAssign>(svc, "learning_path_assignments", "*", (q) => q.eq("organization_id", orgId));
+  const courseAssigns = await fetchAll<CourseAssign>(svc, "course_assignments", "*", (q) => q.eq("organization_id", orgId), "id", count);
+  const pathAssigns = await fetchAll<PathAssign>(svc, "learning_path_assignments", "*", (q) => q.eq("organization_id", orgId), "id", count);
   const teamIds = [...new Set([...courseAssigns, ...pathAssigns].filter((a) => a.assignee_type === "team" && a.team_id).map((a) => a.team_id as string))];
   const teamUserIds = new Map<string, Set<string>>();
   if (teamIds.length) {
-    const rows = await fetchByIds<{ team_id: string; user_id: string }>(svc, "team_members", "team_id, user_id", "team_id", teamIds, undefined, "user_id");
+    const rows = await fetchByIds<{ team_id: string; user_id: string }>(svc, "team_members", "team_id, user_id", "team_id", teamIds, undefined, "user_id", count);
     for (const r of rows) {
       if (!userSet.has(r.user_id)) continue;
       (teamUserIds.get(r.team_id) ?? teamUserIds.set(r.team_id, new Set()).get(r.team_id)!).add(r.user_id);
@@ -332,6 +345,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
     const groups: GroupRow[] = [];
     let noGroupsTable = false;
     for (const ids of chunk(groupIds, 150)) {
+      count?.();
       const { data: groupRows, error: groupErr } = await svc
         .from("org_groups")
         .select("id, organization_id, name, group_type, rules, is_active")
@@ -346,21 +360,22 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       groups.push(...(groupRows as GroupRow[]));
     }
     if (!noGroupsTable) {
-      const byGroup = await groupMembersStrict(svc, orgId, groups.filter((g) => g.is_active !== false));
+      const byGroup = await groupMembersStrict(svc, orgId, groups.filter((g) => g.is_active !== false), count ? () => (count(), true as const) : undefined);
       if (byGroup === "unreadable") throw new Error("org_groups: a group's members could not be read");
       for (const [gid, ids] of byGroup) groupUserIds.set(gid, new Set([...ids].filter((u) => userSet.has(u))));
     }
   } else if (groupIds.length) {
     try {
+      count?.();
       const { data: groupRows } = await svc
         .from("org_groups")
         .select("id, organization_id, name, group_type, rules, is_active")
         .in("id", groupIds);
       const groups = ((groupRows ?? []) as GroupRow[]).filter((g) => g.is_active !== false);
       const needsMembers = groups.some((g) => g.group_type === "dynamic");
-      const allMembers = needsMembers ? await fetchActiveMembers(svc, orgId) : undefined;
+      const allMembers = needsMembers ? await fetchActiveMembers(svc, orgId, count) : undefined;
       for (const g of groups) {
-        const ids = await resolveGroupMembers(svc, g, allMembers);
+        const ids = await resolveGroupMembers(svc, g, allMembers, count);
         groupUserIds.set(g.id, new Set(ids.filter((u) => userSet.has(u))));
       }
     } catch (e) {
@@ -423,12 +438,12 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const enrollments = await fetchByIds<EnrRow>(
     svc, "journey_enrollments",
     "id, user_id, program_id, version_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode)",
-    "user_id", userIds, (q) => q.eq("organization_id", orgId).in("status", ["active", "completed"])
+    "user_id", userIds, (q) => q.eq("organization_id", orgId).in("status", ["active", "completed"]), "id", count
   ).catch(tolerateMissing<EnrRow>);
   // The credits by day id, through the one reader (ADR 0024 step 45). A
   // failed read throws, as every other read of the Report Card does: it is
   // never "no days done".
-  const credits = await readJourneyCredits(svc, enrollments.map((e) => ({ id: e.id, version_id: e.version_id })));
+  const credits = await readJourneyCredits(svc, enrollments.map((e) => ({ id: e.id, version_id: e.version_id })), { countCall: count });
   if (!credits.ok) throw new Error(`journey credits read failed: ${credits.error?.message ?? "no answer"}`);
   const journeysByUser = new Map<string, Array<JourneyInsight & { dayCompletions: string[]; courseIds: Set<string> }>>();
   for (const e of enrollments) {
@@ -480,13 +495,13 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
 
   /* ---- reminders, open grants, policies ---- */
   const nudgeRows = await fetchByIds<{ user_id: string; course_id: string; nudge_count: number }>(
-    svc, "reminder_state", "user_id, course_id, nudge_count", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id"
+    svc, "reminder_state", "user_id, course_id, nudge_count", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id", count
   ).catch(() => []);
   const nudges = new Map<string, number>();
   for (const n of nudgeRows) nudges.set(`${n.user_id}:${n.course_id}`, n.nudge_count ?? 0);
   const grantRows = await fetchByIds<{ user_id: string; course_id: string; expires_at: string | null }>(
     svc, "attempt_requests", "user_id, course_id, expires_at", "user_id", userIds,
-    (q) => q.eq("organization_id", orgId).eq("status", "approved").is("used_at", null), "user_id"
+    (q) => q.eq("organization_id", orgId).eq("status", "approved").is("used_at", null), "user_id", count
   ).catch(() => []);
   const openGrants = new Set<string>();
   for (const g of grantRows) if (!g.expires_at || g.expires_at > nowIso) openGrants.add(`${g.user_id}:${g.course_id}`);
@@ -504,7 +519,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   // client-level failure cannot fail the page or the refresh either.
   const readGrants = async (): Promise<Map<string, GrantSnapshot> | null> => {
     try {
-      return await grantSnapshotForUsers(svc, orgId, null, userIds);
+      return await grantSnapshotForUsers(svc, orgId, null, userIds, undefined, count);
     } catch (e) {
       console.warn(JSON.stringify({ event: "report_card_grants_unreadable", org_id: orgId, code: e instanceof GrantReadError ? e.code : null }));
       return null;
@@ -516,11 +531,11 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
     if (!isSchemaMissing(e as PgError)) throw new Error("effective_attempt_policies: the read failed");
   };
   const [policies, snapshots, passRequired, visits] = await Promise.all([
-    resolvePolicies(svc, courseIdList, opts.strictGroups ? { readFailed: policiesUnreadable } : {}),
+    resolvePolicies(svc, courseIdList, opts.strictGroups ? { readFailed: policiesUnreadable, countCall: count } : { countCall: count }),
     readGrants(),
-    fetchPassRequired(svc, courseIdList),
+    fetchPassRequired(svc, courseIdList, count),
     // "Last revisit" beside the inactive flag (ADR 0014:199), fail-soft.
-    fetchRevisionVisitStats(svc, { orgId, userIds }),
+    fetchRevisionVisitStats(svc, { orgId, userIds, countCall: count }),
   ]);
   const historyUnavailable = snapshots === null;
   // The reader pages oldest first, so a capped read lacks the newest visits:
@@ -535,7 +550,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   }
 
   /* ---- org benchmark (nightly matview; fail-soft) ---- */
-  const benchmark = await loadBenchmark(svc, courseIdList);
+  const benchmark = await loadBenchmark(svc, courseIdList, count);
 
   /* ---- per-learner rollup (one data load, any number of period windows) ---- */
   const rollup = (periodDays: number | null): LearnerInsight[] => {
@@ -749,12 +764,12 @@ export function periodKey(days: number | null): string {
 }
 
 /** Org-wide fail rate per course from the nightly matview (fail-soft: absent/unrefreshed → empty). */
-async function loadBenchmark(svc: SupabaseClient, courseIds: string[]): Promise<InsightsResult["benchmark"]> {
+async function loadBenchmark(svc: SupabaseClient, courseIds: string[], countCall?: () => unknown): Promise<InsightsResult["benchmark"]> {
   const benchmark = new Map<string, { failRate: number | null; enrolled: number }>();
   if (courseIds.length === 0) return benchmark;
   try {
     const rows = await fetchByIds<{ course_id: string; total_enrolled: number | null; total_failed: number | null }>(
-      svc, "mv_course_performance", "course_id, total_enrolled, total_failed", "course_id", courseIds, undefined, "course_id"
+      svc, "mv_course_performance", "course_id, total_enrolled, total_failed", "course_id", courseIds, undefined, "course_id", countCall
     );
     for (const r of rows) {
       const enrolled = r.total_enrolled ?? 0;

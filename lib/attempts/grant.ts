@@ -13,7 +13,19 @@ import { GRANT_EXPIRY_CHOICES, expiryFromDays, notifyLearnerOfDecision } from ".
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { orgCourse } from "@/lib/courses/lookup";
 import { namesAndEmails } from "@/lib/users/people";
-import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls, type MailBudget, type MailRun } from "@/lib/notifications/smtp-state";
+import {
+  ADMIN_REQUEST_OWN_CALLS,
+  MAIL_CALL_COSTS,
+  countCalls,
+  hasRoom,
+  openRun,
+  recordRecipientsUnreadable,
+  requestBudget,
+  spendCalls,
+  type MailBudget,
+  type MailRun,
+} from "@/lib/notifications/smtp-state";
+import { chunk, isLostReply, isRowError } from "@/lib/db/chunked";
 import { RECIPIENTS_UNREADABLE, addMailOutcome, mailCounts, type MailCounts, type MailOutcome } from "@/lib/notifications/send";
 import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
 
@@ -60,6 +72,18 @@ import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
  * share one run, opened on that budget at the first learner to mail, and
  * the answer hands it back (`run`) so the rest of the request's mail goes
  * in the same run.
+ *
+ * ADR 0029 rule FP2, the writes: the grants are one insert. An insert whose
+ * answer was lost (no database code: the fetch failed after it was sent)
+ * may have been saved, so it is never tried again row by row: the rows are
+ * read back (one call per 150 learners), and each row found was written by
+ * this request, granted and mailed as usual; a row not found is failed.
+ * Only an error one row causes (isRowError: a duplicate, a check) is tried
+ * again one row at a time, and each of those inserts first asks the budget
+ * for room: a row the request has no room left for is not tried, and
+ * answered as not saved ("try again"). The mail's reads and the run's
+ * opening are made only while they fit, so the request never passes the
+ * limit on the writes' account.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
@@ -175,7 +199,7 @@ export async function grantExtraAttempts(
   // for each 150 learners.
   spendCalls(budget, Math.ceil(ids.length / 150));
   const people = await namesAndEmails(svc, ids).catch(() => "unreadable" as const);
-  let counting: ReadonlySet<string> | "unreadable" | undefined;
+  let counting: ReadonlySet<string> | "unreadable" | "no_room" | undefined;
   let run: MailRun | undefined;
   /** The granted learners' mails, for the answer (rule T4). */
   let mailed: MailCounts = mailCounts([]);
@@ -214,49 +238,94 @@ export async function grantExtraAttempts(
   // only as far as the database requires: an older source CHECK rejects
   // 'ticket' / 'manager' (23514 → record as a bulk-style grant; decided_by
   // still names the admin), pre-0085 has no attempts_used (42703). The one
-  // insert holds every row, so it degrades as each row's own insert would.
-  // Any error it still answers is each learner's own again: then each row
-  // is inserted on its own, as before, and a learner whose row fails (23505:
-  // a grant made since the read) is failed while the others are granted.
-  const insertGrant = async (first: Record<string, unknown> | Record<string, unknown>[]) => {
-    let rows = Array.isArray(first) ? first : [first];
-    const send = () => {
+  // insert holds every row, so it degrades as each row's own insert would,
+  // and the shape it degraded to is kept for every insert after it.
+  let asBulk = false;
+  let withoutUsed = false;
+  const shaped = (r: Record<string, unknown>) => {
+    const out: Record<string, unknown> = asBulk ? { ...r, source: "bulk" } : { ...r };
+    if (withoutUsed) delete out.attempts_used;
+    return out;
+  };
+  /** The request has room for one more call: asked before each call after the first insert. */
+  const room = () => hasRoom(budget, 1);
+  /** One insert of these grants: null when saved, its error, or "no_room" when `gate` refused a call. */
+  const insertGrants = async (list: typeof grants, gate?: () => boolean) => {
+    for (let i = 0; ; i++) {
+      if (gate && !gate()) return "no_room" as const;
+      const rows = list.map((g) => shaped(g.row));
       spendCalls(budget, 1);
-      return svc.from("attempt_requests").insert(Array.isArray(first) ? rows : rows[0]);
-    };
-    let { error } = await send();
-    for (let i = 0; error && i < 2; i++) {
+      const { error } = await svc.from("attempt_requests").insert(rows.length === 1 ? rows[0] : rows);
+      if (!error) return null;
       const code = (error as { code?: string }).code;
-      if (code === "23514" && rows.some((r) => r.source !== "bulk")) rows = rows.map((r) => ({ ...r, source: "bulk" }));
-      else if (code === "42703" && rows.some((r) => "attempts_used" in r)) {
-        rows = rows.map((r) => {
-          const { attempts_used: _dropped, ...rest } = r;
-          void _dropped;
-          return rest;
-        });
-      } else break;
-      ({ error } = await send());
+      if (i < 2 && code === "23514" && !asBulk && rows.some((r) => r.source !== "bulk")) asBulk = true;
+      else if (i < 2 && code === "42703" && !withoutUsed && rows.some((r) => "attempts_used" in r)) withoutUsed = true;
+      else return error;
     }
-    return error;
+  };
+  /**
+   * The grants among `list` that are there now, written by this request (its
+   * administrator and its time): one call per 150 learners, each asking for
+   * room. "unconfirmed" when a read failed or had no room.
+   */
+  const readBack = async (list: typeof grants): Promise<Set<string> | "unconfirmed"> => {
+    const found = new Set<string>();
+    for (const part of chunk(list.map((g) => g.uid), 150)) {
+      if (!room()) return "unconfirmed";
+      spendCalls(budget, 1);
+      const { data, error } = await svc
+        .from("attempt_requests")
+        .select("user_id")
+        .eq("organization_id", args.orgId)
+        .eq("course_id", course.id)
+        .eq("status", "approved")
+        .eq("decided_by", args.decidedBy)
+        .eq("decided_at", nowIso)
+        .in("user_id", part);
+      if (error || !Array.isArray(data)) return "unconfirmed";
+      for (const r of data as Array<{ user_id: string }>) found.add(r.user_id);
+    }
+    return found;
   };
   const failedGrant = (g: (typeof grants)[number], error: unknown): PerLearnerResult => ({
     userId: g.uid,
     status: "failed",
     reason: (error as { code?: string }).code === "23505" ? "already has an open request or grant" : "the grant could not be saved",
   });
-  if (grants.length === 1) {
-    const error = await insertGrant(grants[0].row);
-    if (error) results[grants[0].at] = failedGrant(grants[0], error);
-  } else if (grants.length > 1) {
-    const batchError = await insertGrant(grants.map((g) => g.row));
-    if (batchError) {
-      for (const g of grants) {
-        const error = await insertGrant(g.row);
-        if (error) results[g.at] = failedGrant(g, error);
-      }
+  /** Grants whose insert answered nothing (isLostReply): read back once, together. */
+  const lost: Array<{ g: (typeof grants)[number]; error: unknown }> = [];
+  const batchError = grants.length > 0 ? await insertGrants(grants) : null;
+  if (batchError && isLostReply(batchError)) {
+    for (const g of grants) lost.push({ g, error: batchError });
+  } else if (batchError && grants.length > 1 && isRowError(batchError)) {
+    // An error one row causes (23505: a grant made since the read): each row
+    // on its own, so the others are granted, while the request has room.
+    for (const g of grants) {
+      const error = await insertGrants([g], room);
+      if (error === "no_room") results[g.at] = { userId: g.uid, status: "failed", reason: "not saved: the request had no room left; try again" };
+      else if (error && isLostReply(error)) lost.push({ g, error });
+      else if (error) results[g.at] = failedGrant(g, error);
+    }
+  } else if (batchError) {
+    // The whole insert's error: nothing was saved, and no row is tried again.
+    for (const g of grants) results[g.at] = failedGrant(g, batchError);
+  }
+  if (lost.length > 0) {
+    const found = await readBack(lost.map((x) => x.g));
+    for (const { g, error } of lost) {
+      if (found === "unconfirmed") results[g.at] = { userId: g.uid, status: "failed", reason: "not confirmed: the grant may have been saved; try again" };
+      else if (!found.has(g.uid)) results[g.at] = failedGrant(g, error);
     }
   }
 
+  // The mail's reads and the run's opening only while they fit (rule FP2):
+  // the members that count are read while the opening still fits after
+  // them. With no room left, the granted learners are not emailed.
+  const mailGate = () => {
+    if (!hasRoom(budget, 1 + MAIL_CALL_COSTS.open)) return false;
+    spendCalls(budget, 1);
+    return true;
+  };
   for (const g of grants) {
     if (results[g.at].status !== "granted") continue;
     const uid = g.uid;
@@ -264,13 +333,18 @@ export async function grantExtraAttempts(
     // this call at its first grant. A failed read of them or of the
     // addresses mails nobody and records the skip once; the grants stand.
     if (counting === undefined) {
-      counting = await countingMemberIds(svc, args.orgId, undefined, countCalls(budget));
+      counting = await countingMemberIds(svc, args.orgId, undefined, mailGate);
       if (counting === "unreadable" || people === "unreadable") {
         counting = "unreadable";
         await recordRecipientsUnreadable("attempt-grant", args.orgId);
       }
     }
     if (counting === "unreadable" || people === "unreadable") continue;
+    // No room for the mail: this learner is not emailed.
+    if (counting === "no_room") {
+      mailed = addMailOutcome(mailed, null);
+      continue;
+    }
     // Rule 10: a learner whose membership does not count gets no mail, and
     // no run is opened for nobody.
     if (!counting.has(uid)) continue;

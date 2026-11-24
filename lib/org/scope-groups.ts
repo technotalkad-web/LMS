@@ -74,12 +74,15 @@ export async function ensureScopeGroup(
 /**
  * ensureScopeGroup for each of an assignment's pairs (at most 20 a request),
  * in their order, stopping at the first error as the routes did: the groups
- * already there are read in one call and the deactivated ones among them
- * re-activated in one, not one read (and update) per pair (ADR 0029 gate
+ * already there are read in one call, not one read per pair (ADR 0029 gate
  * G3: an administrator's request that also mails stays within its calls). A
  * pair whose group is not there yet is created as before, one pair at a
- * time. One pair, or a key a filter list cannot carry (a double quote or a
- * backslash in a master value), takes ensureScopeGroup itself.
+ * time. Only when every create has succeeded are the deactivated groups
+ * re-activated, in one call: a create that fails, which the route answers
+ * with an error, leaves every group as it was. A key a filter list cannot
+ * carry (a double quote or a backslash in a master value) reads each pair's
+ * group on its own, in the same order. One pair takes ensureScopeGroup
+ * itself: it has nothing to create after a re-activation.
  */
 export async function ensureScopeGroups(
   svc: SupabaseClient,
@@ -89,7 +92,7 @@ export async function ensureScopeGroups(
 ): Promise<Array<{ id: string } | { error: string }>> {
   const out: Array<{ id: string } | { error: string }> = [];
   const keys = [...new Set(pairs.map(scopeGroupKey))];
-  if (keys.length < 2 || keys.some((k) => /["\\]/.test(k))) {
+  if (keys.length < 2) {
     for (const pair of pairs) {
       const g = await ensureScopeGroup(svc, orgId, pair, createdBy);
       out.push(g);
@@ -97,20 +100,33 @@ export async function ensureScopeGroups(
     }
     return out;
   }
-  const { data, error } = await svc.from("org_groups").select("id, is_active, system_key").eq("organization_id", orgId).in("system_key", keys);
-  if (error) return [{ error: error.message }];
-  const rows = (data ?? []) as Array<{ id: string; is_active: boolean; system_key: string }>;
+  type GroupKeyRow = { id: string; is_active: boolean; system_key: string };
+  let rows: GroupKeyRow[] = [];
+  if (keys.some((k) => /["\\]/.test(k))) {
+    for (const key of keys) {
+      const { data, error } = await svc.from("org_groups").select("id, is_active, system_key").eq("organization_id", orgId).eq("system_key", key).maybeSingle();
+      if (error) return [{ error: error.message }];
+      if (data) rows.push(data as GroupKeyRow);
+    }
+  } else {
+    const { data, error } = await svc.from("org_groups").select("id, is_active, system_key").eq("organization_id", orgId).in("system_key", keys);
+    if (error) return [{ error: error.message }];
+    rows = (data ?? []) as GroupKeyRow[];
+  }
   const there = new Map(rows.map((r) => [r.system_key, r.id]));
-  const inactive = rows.filter((r) => !r.is_active).map((r) => r.id);
-  if (inactive.length) await svc.from("org_groups").update({ is_active: true, updated_at: new Date().toISOString() }).in("id", inactive);
+  // The missing groups first: the first create that fails ends the call
+  // before anything is re-activated.
   for (const pair of pairs) {
     const key = scopeGroupKey(pair);
     const id = there.get(key);
     const g = id ? { id } : await createScopeGroup(svc, orgId, pair, createdBy);
     out.push(g);
-    if ("error" in g) break;
+    if ("error" in g) return out;
     there.set(key, g.id);
   }
+  // Every pair has its group: the deactivated ones are re-activated, by id.
+  const inactive = rows.filter((r) => !r.is_active).map((r) => r.id);
+  if (inactive.length) await svc.from("org_groups").update({ is_active: true, updated_at: new Date().toISOString() }).in("id", inactive);
   return out;
 }
 

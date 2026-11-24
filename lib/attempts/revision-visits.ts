@@ -80,10 +80,13 @@ function logFailure(courseIds: string[] | undefined, error: unknown): void {
   );
 }
 
-/** Pages every visit of the organisation matching the filters, up to `cap` pages. */
+/**
+ * Pages every visit of the organisation matching the filters, up to `cap` pages.
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each page.
+ */
 async function drainVisits(
   svc: AnyClient,
-  args: { orgId: string; courseIds?: string[]; userIds?: string[]; cap?: number }
+  args: { orgId: string; courseIds?: string[]; userIds?: string[]; cap?: number; countCall?: () => unknown }
 ): Promise<{ rows: VisitRow[]; capped: boolean; failed: boolean; missing: boolean }> {
   const courseIds = args.courseIds === undefined ? undefined : [...new Set(args.courseIds.filter(Boolean))];
   const userIds = args.userIds === undefined ? undefined : [...new Set(args.userIds.filter(Boolean))];
@@ -96,6 +99,7 @@ async function drainVisits(
       for (const userChunk of chunks(userIds)) {
         for (let from = 0; ; from += PAGE) {
           if (pages >= cap) return { rows, capped: true, failed: false, missing: false };
+          args.countCall?.();
           let q = svc.from("revision_visits").select("user_id, course_id, launched_at").eq("organization_id", args.orgId);
           if (courseChunk) q = q.in("course_id", courseChunk);
           if (userChunk) q = q.in("user_id", userChunk);
@@ -131,7 +135,7 @@ const later = (a: string | null, b: string): string => (a === null || Date.parse
  */
 export async function fetchRevisionVisitStats(
   svc: AnyClient,
-  args: { orgId: string; courseIds?: string[]; userIds?: string[]; cap?: number }
+  args: { orgId: string; courseIds?: string[]; userIds?: string[]; cap?: number; countCall?: () => unknown }
 ): Promise<RevisionVisitStats> {
   const { rows, capped, failed } = await drainVisits(svc, args);
   const byPair = new Map<string, VisitStat>();

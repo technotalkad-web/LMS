@@ -89,11 +89,13 @@ const isMap = (x: unknown): x is Record<string, unknown> =>
  * The credits of `enrollments` (each with the version it is pinned to), read
  * with `client` (the caller's own: a learner's session reads their own rows
  * under row-level security, a report reads with the service role).
+ * `opts.countCall` (ADR 0029 rule FP2), when given, is called before each
+ * call, every page and the re-read without `day_id` included.
  */
 export async function readJourneyCredits(
   client: AnyClient,
   enrollments: ReadonlyArray<{ id: string; version_id: string }>,
-  opts: { state?: OptionalColumnState } = {}
+  opts: { state?: OptionalColumnState; countCall?: () => unknown } = {}
 ): Promise<JourneyCredits> {
   const enrollmentIds = [...new Set(enrollments.map((e) => e.id).filter(Boolean))];
   const byEnrollment = new Map<string, JourneyCreditRow[]>();
@@ -103,14 +105,16 @@ export async function readJourneyCredits(
   for (const part of chunk(enrollmentIds, CHUNK)) {
     const res = await readPagedWithOptionalColumn<Record<string, unknown>>(
       DAY_ID,
-      (columns, from, to) =>
-        client
+      (columns, from, to) => {
+        opts.countCall?.();
+        return client
           .from("journey_day_progress")
           .select(columns)
           .in("enrollment_id", part)
           .order("id", { ascending: true })
           .range(from, to)
-          .abortSignal(fresh()),
+          .abortSignal(fresh());
+      },
       BASE,
       { state: decided, nullIsError: true }
     );
@@ -139,6 +143,7 @@ export async function readJourneyCredits(
   ];
   if (byDayId && versionIds.length > 0) {
     for (const part of chunk(versionIds, CHUNK)) {
+      opts.countCall?.();
       const { data, error } = await client
         .from("journey_versions")
         .select("id, day_ids")

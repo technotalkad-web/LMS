@@ -27,9 +27,15 @@ export type Coverage = {
   label: string;
 };
 
-/** Own pair + admin-granted coverage pairs + the org's enforce switch (every read fail-soft pre-0096/0097). */
-export async function loadCoverage(svc: SupabaseClient, orgId: string, userId: string): Promise<Coverage> {
-  const memQ = (cols: string) => svc.from("organization_members").select(cols).eq("organization_id", orgId).eq("user_id", userId).maybeSingle();
+/**
+ * Own pair + admin-granted coverage pairs + the org's enforce switch (every read fail-soft pre-0096/0097).
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call, the re-read without `department` included.
+ */
+export async function loadCoverage(svc: SupabaseClient, orgId: string, userId: string, countCall?: () => unknown): Promise<Coverage> {
+  const memQ = (cols: string) => {
+    countCall?.();
+    return svc.from("organization_members").select(cols).eq("organization_id", orgId).eq("user_id", userId).maybeSingle();
+  };
   let memRes = await memQ("business_vertical, department");
   if (memRes.error && /department/.test(memRes.error.message)) memRes = await memQ("business_vertical");
   const me = (memRes.data ?? null) as { business_vertical?: string | null; department?: string | null } | null;
@@ -42,12 +48,14 @@ export async function loadCoverage(svc: SupabaseClient, orgId: string, userId: s
   const ownVertical = me?.business_vertical?.trim() || null;
   if (ownVertical) add({ vertical: ownVertical, department: me?.department?.trim() || null });
   try {
+    countCall?.();
     const { data } = await svc.from("manager_coverage").select("vertical, department").eq("organization_id", orgId).eq("user_id", userId);
     for (const r of (data ?? []) as Array<{ vertical: string; department: string | null }>) add({ vertical: r.vertical, department: r.department });
   } catch {
     /* pre-0097 */
   }
   let enforce = false;
+  countCall?.();
   const { data: org } = await svc.from("organizations").select("enforce_content_mapping").eq("id", orgId).maybeSingle();
   if ((org as { enforce_content_mapping?: boolean } | null)?.enforce_content_mapping === true) enforce = true;
   return { pairs, hasVertical: pairs.length > 0, enforce, label: pairs.map(scopeLabel).join(", ") };

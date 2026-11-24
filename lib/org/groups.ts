@@ -133,20 +133,27 @@ type MemberFields = {
 const MEMBER_FIELD_COLS = "user_id, designation, job_role, city, state, business_vertical, branch, department, line_manager_id, date_of_joining";
 const MEMBER_FIELD_COLS_LEGACY = "user_id, designation, job_role, city, state, business_vertical, branch, line_manager_id, date_of_joining";
 
-/** All ACTIVE members with the fields rules can touch (paginated). */
+/**
+ * All ACTIVE members with the fields rules can touch (paginated).
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call,
+ * the re-read without `department` included.
+ */
 export async function fetchActiveMembers(
   svc: SupabaseClient,
-  orgId: string
+  orgId: string,
+  countCall?: () => unknown
 ): Promise<MemberFields[]> {
   const members: MemberFields[] = [];
   for (let fromIdx = 0; ; fromIdx += 1000) {
-    const q = (cols: string) =>
-      svc
+    const q = (cols: string) => {
+      countCall?.();
+      return svc
         .from("organization_members")
         .select(cols)
         .eq("organization_id", orgId)
         .eq("status", "active")
         .range(fromIdx, fromIdx + 999);
+    };
     // 0096 deploy safety: retry without `department` when the column is not there yet.
     let res = await q(MEMBER_FIELD_COLS);
     if (res.error && /department/.test(res.error.message)) res = await q(MEMBER_FIELD_COLS_LEGACY);
@@ -160,16 +167,19 @@ export async function fetchActiveMembers(
 /**
  * Resolve one group's member user-ids, LIVE.
  * `membersCache` lets callers resolving several groups share the member
- * fetch (pass the result of fetchActiveMembers).
+ * fetch (pass the result of fetchActiveMembers). `countCall` (ADR 0029 rule
+ * FP2), when given, is called before each call made here.
  */
 export async function resolveGroupMembers(
   svc: SupabaseClient,
   group: Pick<GroupRow, "id" | "organization_id" | "group_type" | "rules">,
-  membersCache?: MemberFields[]
+  membersCache?: MemberFields[],
+  countCall?: () => unknown
 ): Promise<string[]> {
   if (group.group_type === "static") {
     const ids: string[] = [];
     for (let fromIdx = 0; ; fromIdx += 1000) {
+      countCall?.();
       const { data } = await svc
         .from("org_group_members")
         .select("user_id")
@@ -184,10 +194,11 @@ export async function resolveGroupMembers(
 
   const rules = parseGroupRules(group.rules);
   const members =
-    membersCache ?? (await fetchActiveMembers(svc, group.organization_id));
+    membersCache ?? (await fetchActiveMembers(svc, group.organization_id, countCall));
 
   let teamSet: Set<string> | null = null;
   if (rules.team_ids && rules.team_ids.length > 0) {
+    countCall?.();
     const { data } = await svc
       .from("team_members")
       .select("user_id")
