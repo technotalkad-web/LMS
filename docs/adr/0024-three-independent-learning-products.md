@@ -2463,3 +2463,13 @@ The round 3 days per phase, before any addition (the Days column of step 72's ta
   - The journey page's "Change language" is on today's mission only; a started day other than the open day has no link until phase 6 lists started days (P2-6's open item).
   - The confirm that the picker opens at once for rule (1)'s `?switch=<lang>` is worded on the client before any request. On a day that F1 refuses, it still promises the restart, and OK then shows the refusal. The first-time picker and "Change language" ask the route first and show the refusal without the confirm.
   - ADR 0004 step 9 and ADR 0014 step 18 (step 77): their dated notes of 2026-11-13 and 2026-11-12 already say that the switch counts, holds and abandons in one context, that rule (1)'s confirm keeps the context on the launch page's own picker, and that an audit row names what was closed. Nothing is added to either.
+
+- **Note 2026-11-25 (pointer to ADR 0033: the pilot release).** The owner accepted ADR 0033 (`docs/adr/0033-paths-pilot-first-release.md`) on 2026-11-25. It changes this record at five points, for production's first release only. The body of this record and the earlier notes are not edited, and this record stays Accepted. For that release, ADR 0033 section 2 is the current text at these places:
+
+  1. C1, what the first release carries: rows R8 and R5; step 72 ("What blocks production's first release", the totals, release dependency 2); step 74, sitting item 4.
+  2. C2, the CRM conditions before the tag and before the first learner: D11; step 57, both gates; step 72 (release dependencies 5 and 9, "The first learner is bound by D11"); step 74 (the safe deployment checks before and after the tag, sitting item 4); step 74a, condition (3); row R4.
+  3. C3, "The core has no feature flag" and the list of what is flagged: step 72, first paragraph.
+  4. C4, Preview Reports, the test runs and phase P: row R12; A21 and section T (steps 87 to 89); step 72 (the phase P row, the totals); step 84, the flag `PREVIEW_REPORTS`.
+  5. C5, the staging validation: row R19; step 73, "Staging validation"; step 72 (release dependency 4; the gates of phases 6, 9a, P and 9b).
+
+  ADR 0033 changes nothing else in this record (its section 7). It adds pilot conditions on top of step 74a's gate (its section 6). This record applies again as written when release 2 is on production.

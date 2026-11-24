@@ -1,6 +1,6 @@
 # 0033. The pilot release carries the Library and Learning Paths; Journeys, the CRM integration and path and journey test runs follow in release 2
 
-Status: Proposed. The owner said yes in principle on 2026-11-20: "Yes. Launch Library + Learning Paths first. Move Journeys and CRM v2 to Release 2." The six parts in section 3 are not answered yet. Nothing in this record is built before the owner answers them. Each part can be answered alone (ADR 0001 decision 2).
+Status: Accepted (owner, 2026-11-25: "all as recommended"), on the owner's answers to the six parts of section 3, all as recommended. The owner said yes in principle on 2026-11-20: "Yes. Launch Library + Learning Paths first. Move Journeys and CRM v2 to Release 2." No part is excluded (ADR 0001 decision 2). The six answers are recorded under "Decisions requested from the owner", in the note of 2026-11-25 under "Owner answers", not by rewriting this record. The acceptance approves no production action.
 Date: 2026-11-20
 Deciders: owner; architect (Fable 5.2)
 
@@ -346,6 +346,17 @@ One line per part. Nothing is built for a part before its line is filled.
 - Part 4, the narrower staging validation (yes or no):
 - Part 5, a pilot course in both the Library and a path (yes or no):
 - Part 6, pilot paths "Assigned only" ((a) or (b)):
+
+**Note 2026-11-25 (the owner's answers to the six parts; acceptance).** The owner answered all six parts on 2026-11-25, in chat. The reply was passed on to the architect as "all as recommended". This note stands as the six filled lines above. Those lines and the rest of the record are not edited. Where the record says the parts are open or not answered yet, this note is the current text.
+
+- Part 1: yes. The CRM is off for the pilot, and the owner supplies the roster list.
+- Part 2: yes. Two off-switches.
+- Part 3: (b). Preview is on for single courses, with its delete screen. Path and journey test runs follow in release 2.
+- Part 4: yes. The narrower staging validation.
+- Part 5: yes. A pilot course may sit in both the Library and a path.
+- Part 6: (a). A count of "Everyone" paths, which must read 0.
+
+What may start. Steps 1 to 10 of section 5 are no longer held by an open part: steps 1 to 5 (part 2), step 6 (part 3 (b)), steps 7 and 9 (the pilot's share and the runbook) and step 10 (part 4's list, on the release candidate). Step 8, and phase 3 inside step 7, were never held. Each keeps ADR 0024's phase order and its own gate. Step 11, the sitting, is not opened by this note: the answers approve no production action, and the sitting stays owner-run and explained beforehand. Steps 12 and 13 follow the sitting. The owner's roster list is due before the pilot learners are entered (part 1). These answers do not settle 0112's place in the sitting (section 4). The dated note under ADR 0024 that points here is written with this note.
 
 ## References
 
