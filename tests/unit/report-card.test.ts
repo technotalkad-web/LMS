@@ -379,8 +379,10 @@ type Row = Record<string, unknown>;
 
 /**
  * Answers every read from `tables` with the eq / neq / in / is filters
- * applied (a filter on a column the row does not carry is ignored); `override` may
- * answer a query first (an error, say). Records every query.
+ * applied (a filter on a column the row does not carry is ignored), then, as
+ * the server does, at most 1,000 rows: the `range` asked, or the first 1,000
+ * (in the tables' own order, a stable one). `override` may answer a query
+ * first (an error, say). Records every query.
  */
 function fakeDb(tables: Record<string, Row[]>, override?: (q: Query) => Answer | undefined) {
   const queries: Query[] = [];
@@ -405,7 +407,10 @@ function fakeDb(tables: Record<string, Row[]>, override?: (q: Query) => Answer |
           const keep = (r: Row) => !(col in r) || (op === "eq" ? r[col] === val : op === "neq" ? r[col] !== val : op === "in" ? (val as unknown[]).includes(r[col]) : op === "is" ? r[col] === val : true);
           if (op === "eq" || op === "neq" || op === "in" || op === "is") rows = rows.filter(keep);
         }
-        return { data: rows, error: null };
+        // The server's row cap: the page asked, never more than 1,000 rows.
+        const range = q.ops.find((x) => x.op === "range");
+        const [from, to] = range ? (range.args as [number, number]) : [0, 999];
+        return { data: rows.slice(from, Math.min(to + 1, from + 1000)), error: null };
       };
       const settle = () => Promise.resolve({ data: null, error: null, count: null, ...answer() });
       b.maybeSingle = () => settle().then((r) => ({ ...r, data: Array.isArray(r.data) ? r.data[0] ?? null : r.data }));
@@ -665,6 +670,21 @@ function readerDb(users: string[], patch: (t: Tables) => void, override?: (q: Qu
   return { db: fakeDb(t, override), tables: t };
 }
 const usersOf = (n: number) => Array.from({ length: n }, (_, i) => `u${i + 1}`);
+/**
+ * c1 assigned to the dynamic group g6, whose rule is the team t6: 1,500
+ * other active members (m1 to m1500) in it first, then u1 to u3. A named u4
+ * is in no team. Past the server's 1,000-row cap, a team read that is not
+ * paged loses u1 to u3.
+ */
+const bigTeam = (t: Tables) => {
+  t.org_groups.push(group("g6", "dynamic", { team_ids: ["t6"] }));
+  t.course_assignments.push(courseRow({ assignee_type: "group", group_id: "g6" }));
+  for (let i = 1; i <= 1_500; i++) {
+    t.organization_members.push(member(`m${i}`));
+    t.team_members.push({ team_id: "t6", user_id: `m${i}` });
+  }
+  t.team_members.push(...["u1", "u2", "u3"].map((u) => ({ team_id: "t6", user_id: u })));
+};
 
 /** The Report Card's line for c1 (its status, or null for no line), learner by learner, and the reminder's. */
 async function bothReaders(users: string[], db: ReturnType<typeof fakeDb>, courseActive: boolean) {
@@ -791,12 +811,73 @@ async function reminderReadCases() {
         t["rpc/effective_attempt_policies"] = [{ course_id: "c1", max_scored_attempts: 3, official_basis: "best", official_attempt_number: null, retain_first_attempt: true, after_limit: "practice", source: "course", source_id: "c1" }];
       }, card: ["failed"] },
   );
+  // Past the server's 1,000-row cap: the fake answers at most 1,000 rows a
+  // call, so a read that is not paged loses the rows after them.
+  worlds.push(
+    { label: "a dynamic group whose team has 1,500 other members before the named learners (past the server's 1,000-row cap), and a named learner in no team", users: usersOf(4),
+      patch: bigTeam, card: ["not_started", "not_started", "not_started", null] },
+    { label: "an organisation with 1,200 other courses and 1,200 other paths before the course and its path (past the cap): a row of their own, a path", users: usersOf(2),
+      patch: (t) => {
+        t.courses = [...Array.from({ length: 1_200 }, (_, i) => ({ id: `cx${i + 1}`, organization_id: "org1", title: `Course ${i + 1}`, is_active: true })), ...t.courses];
+        t.learning_paths.push(...Array.from({ length: 1_200 }, (_, i) => ({ id: `px${i + 1}`, organization_id: "org1", name: `Path ${i + 1}`, is_active: true })));
+        t.learning_paths.push({ id: "p1", organization_id: "org1", name: "P1", is_active: true });
+        t.learning_path_courses.push({ path_id: "p1", course_id: "c1", step_number: 1, release_at: null });
+        t.course_assignments.push(ownRow("u1"));
+        t.learning_path_assignments.push(pathRow("p1", { assignee_type: "user", user_id: "u2" }));
+      }, card: ["not_started", "not_started"] },
+  );
   for (const w of worlds) {
     await guarded(w.label, async () => {
       const { db } = readerDb(w.users, w.patch);
       const r = await bothReaders(w.users, db, w.courseActive ?? true);
       eq(`${w.label}: the Report Card's lines (the world tests what it names)`, r.card, w.card);
       eq("…the reminder's read: the same line, or none, and the same status, for every learner", r.reader, r.card);
+    });
+  }
+
+  console.log("\nthe Report Card reads a dynamic group's team in pages (lib/org/groups.ts resolveGroupMembers), and a failed read still reads as no team members");
+  {
+    const users = usersOf(5);
+    /** bigTeam, and u5's row first, so the first page holds a named learner. */
+    const patch = (t: Tables) => {
+      bigTeam(t);
+      t.team_members.unshift({ team_id: "t6", user_id: "u5" });
+    };
+    const card = async (override?: (q: Query) => Answer | undefined, extra?: (t: Tables) => void) => {
+      const { db } = readerDb(users, (t) => { patch(t); extra?.(t); }, override);
+      const { value } = await captureWarn(() => computeLearnerInsights(db.client, { orgId: "org1", orgSlug: "acme", userIds: users, periodDays: 30, content: "course:c1", now: NOW }));
+      return { db, lines: users.map((u) => value.learners.find((l) => l.userId === u)?.courses.find((c) => c.courseId === "c1")?.status ?? null) };
+    };
+    const shape = (q: Query) => [
+      q.ops.filter((o) => o.op === "order").map((o) => o.args[0]),
+      q.ops.filter((o) => o.op === "range").map((o) => o.args),
+      q.ops.filter((o) => o.op === "in").map((o) => [o.args[0], (o.args[1] as unknown[]).length]),
+    ];
+    await guarded("the team read's calls", async () => {
+      const { db, lines } = await card();
+      eq("control: every named member of the team has a line, the learner in no team none", lines, ["not_started", "not_started", "not_started", null, "not_started"]);
+      eq("1,504 rows: two calls, pages of 1,000 in the key's order (team_id, user_id), the rule's one team in the list",
+        db.queries.filter((q) => q.table === "team_members").map(shape), [
+          [["team_id", "user_id"], [[0, 999]], [["team_id", 1]]],
+          [["team_id", "user_id"], [[1000, 1999]], [["team_id", 1]]],
+        ]);
+      // A rule naming 160 teams (parseGroupRules keeps 200): two lists, of 150 and of 10 ids.
+      const many = await card(undefined, (t) => {
+        const g = t.org_groups.find((x) => x.id === "g6")!;
+        g.rules = { team_ids: ["t6", ...Array.from({ length: 159 }, (_, i) => `te${i + 1}`)] };
+      });
+      eq("a rule of 160 teams: lists of at most 150 ids (150, then 10), the same lines",
+        [many.db.queries.filter((q) => q.table === "team_members").map((q) => (q.ops.find((o) => o.op === "in")!.args[1] as unknown[]).length), many.lines],
+        [[150, 150, 10], ["not_started", "not_started", "not_started", null, "not_started"]]);
+    });
+    await guarded("the team read fails", async () => {
+      const BOOM = { data: null, error: { code: "XX000", message: "stub read failure" } };
+      const first = await card((q) => (q.table === "team_members" ? BOOM : undefined));
+      eq("the first call fails: no throw, and the team holds nobody (as today's failed read)", first.lines, [null, null, null, null, null]);
+      const later = await card((q) => (q.table === "team_members" && q.ops.some((o) => o.op === "range" && o.args[0] === 1000) ? BOOM : undefined));
+      eq("a later page fails: no throw, and the team holds nobody, u5 of the first page too (any failed call reads as today's failed read)", later.lines, [null, null, null, null, null]);
+      const noList = await card((q) => (q.table === "team_members" ? { data: null, error: null } : undefined));
+      eq("an answer that is not a list: the team holds nobody, as today", noList.lines, [null, null, null, null, null]);
     });
   }
 

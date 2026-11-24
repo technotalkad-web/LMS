@@ -132,6 +132,56 @@ export async function readByIdsStrict<T>(
 }
 
 /**
+ * The same house rules for a fail-soft read (a page or an audience that only
+ * shows people), which once was one call that read a failure as no rows:
+ * pages of 1000 rows in the order `page` sets, until a short one. A page that
+ * answers an error, or no list, makes the whole read answer no rows, as that
+ * one call did; a call that throws, throws, as it did. `beforePage`, when
+ * given, is called before every page (ADR 0029 rule FP2).
+ */
+export async function readAllSoft<T>(
+  page: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+  beforePage?: () => unknown
+): Promise<T[]> {
+  return (await pagesSoft<T>(page, beforePage)) ?? [];
+}
+
+/**
+ * readAllSoft over an `.in()` list: the ids in chunks of 150, each chunk
+ * read in pages of 1000. A failed page of any chunk: no rows at all. An empty
+ * list reads nothing.
+ */
+export async function readByIdsSoft<T>(
+  ids: Iterable<string>,
+  page: (part: string[], from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+  beforePage?: () => unknown
+): Promise<T[]> {
+  const out: T[] = [];
+  for (const part of chunk([...new Set([...ids].filter(Boolean))], 150)) {
+    const rows = await pagesSoft<T>((from, to) => page(part, from, to), beforePage);
+    if (rows === null) return [];
+    out.push(...rows);
+  }
+  return out;
+}
+
+/** Every page's rows, or null when a page answered an error or no list. */
+async function pagesSoft<T>(
+  page: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+  beforePage?: () => unknown
+): Promise<T[] | null> {
+  const out: T[] = [];
+  for (let from = 0; ; from += 1000) {
+    beforePage?.();
+    const answer = await page(from, from + 999);
+    if (answer.error || !Array.isArray(answer.data)) return null;
+    out.push(...(answer.data as T[]));
+    if (answer.data.length < 1000) break;
+  }
+  return out;
+}
+
+/**
  * A write's error that carries no database code: its answer was lost on
  * the way. supabase-js answers code "" when the fetch itself failed (the
  * connection dropped after the request was sent), and a gateway's error

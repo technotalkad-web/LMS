@@ -1,5 +1,5 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { chunk, fetchAll, fetchByIds, readAllStrict } from "@/lib/db/chunked";
+import { chunk, fetchAll, fetchByIds, readAllSoft, readAllStrict, readByIdsSoft } from "@/lib/db/chunked";
 import {
   DEFAULT_POLICY,
   attemptCounts,
@@ -247,19 +247,17 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const today = opts.now ? new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(now) : todayStr(tz);
 
   /* ---- catalog (titles for everything we may show; the picker lists active only) ---- */
-  const { data: courseRows } = await svc
-    .from("courses")
-    .select("id, title, is_active")
-    .eq("organization_id", orgId)
-    .order("title");
-  const allCourses = (courseRows ?? []) as Array<{ id: string; title: string; is_active: boolean }>;
+  // The catalog decides which courses and paths count (activeCourse,
+  // activePath), so it is read in pages of 1,000 rows, the id breaking a
+  // tie of titles, and no course or path is cut at the server's row cap.
+  // Fail-soft, as before paging: a failed call reads as no rows (readAllSoft).
+  const allCourses = await readAllSoft<{ id: string; title: string; is_active: boolean }>((from, to) =>
+    svc.from("courses").select("id, title, is_active").eq("organization_id", orgId).order("title").order("id").range(from, to)
+  );
   const courseTitle = new Map(allCourses.map((c) => [c.id, c.title]));
-  const { data: pathRows } = await svc
-    .from("learning_paths")
-    .select("id, name, is_active")
-    .eq("organization_id", orgId)
-    .order("name");
-  const allPaths = (pathRows ?? []) as Array<{ id: string; name: string; is_active: boolean }>;
+  const allPaths = await readAllSoft<{ id: string; name: string; is_active: boolean }>((from, to) =>
+    svc.from("learning_paths").select("id, name, is_active").eq("organization_id", orgId).order("name").order("id").range(from, to)
+  );
   const pathName = new Map(allPaths.map((p) => [p.id, p.name]));
   const pathCourseRows = allPaths.length
     ? await fetchByIds<{ path_id: string; course_id: string; step_number: number; release_at: string | null }>(
@@ -278,8 +276,10 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
     if (!activePath.has(r.path_id) || !activeCourse.has(r.course_id) || !isReleased(r.release_at, nowMs)) continue;
     coursesOfPath.set(r.path_id, [...(coursesOfPath.get(r.path_id) ?? []), r.course_id]);
   }
-  const { data: progRows } = await svc.from("journey_programs").select("*").eq("organization_id", orgId);
-  const programs = (progRows ?? []) as Array<{ id: string; name: string; is_active: boolean; deadline_days?: number | null }>;
+  // In the order they were made, in pages, as the catalog above.
+  const programs = await readAllSoft<{ id: string; name: string; is_active: boolean; deadline_days?: number | null }>((from, to) =>
+    svc.from("journey_programs").select("*").eq("organization_id", orgId).order("created_at").order("id").range(from, to)
+  );
   const programById = new Map(programs.map((p) => [p.id, p]));
   const catalog: Catalog = {
     courses: allCourses.filter((c) => c.is_active).map((c) => ({ id: c.id, title: c.title })),
@@ -341,11 +341,12 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const groupUserIds = new Map<string, Set<string>>();
   if (groupIds.length) {
     try {
-      const { data: groupRows } = await svc
-        .from("org_groups")
-        .select("id, organization_id, name, group_type, rules, is_active")
-        .in("id", groupIds);
-      const groups = ((groupRows ?? []) as GroupRow[]).filter((g) => g.is_active !== false);
+      // `.in()` lists of 150 ids, pages of 1,000 rows; a failed call reads
+      // as no groups, as the one unpaged call did (readByIdsSoft).
+      const groupRows = await readByIdsSoft<GroupRow>(groupIds, (ids, from, to) =>
+        svc.from("org_groups").select("id, organization_id, name, group_type, rules, is_active").in("id", ids).order("id").range(from, to)
+      );
+      const groups = groupRows.filter((g) => g.is_active !== false);
       const needsMembers = groups.some((g) => g.group_type === "dynamic");
       const allMembers = needsMembers ? await fetchActiveMembers(svc, orgId) : undefined;
       for (const g of groups) {

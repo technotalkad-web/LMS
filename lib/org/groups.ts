@@ -2,7 +2,7 @@ import {
   createClient as createServiceClient,
   type SupabaseClient,
 } from "@supabase/supabase-js";
-import { chunk, readAllStrict, readByIdsStrict, type CallCounter, type CallGate } from "@/lib/db/chunked";
+import { chunk, readAllStrict, readByIdsSoft, readByIdsStrict, type CallCounter, type CallGate } from "@/lib/db/chunked";
 import { isMissingRelation } from "@/lib/scoring/attempt-kind";
 
 /**
@@ -135,9 +135,10 @@ const MEMBER_FIELD_COLS = "user_id, designation, job_role, city, state, business
 const MEMBER_FIELD_COLS_LEGACY = "user_id, designation, job_role, city, state, business_vertical, branch, line_manager_id, date_of_joining";
 
 /**
- * All ACTIVE members with the fields rules can touch (paginated).
- * `countCall` (ADR 0029 rule FP2), when given, is called before each call,
- * the re-read without `department` included.
+ * All ACTIVE members with the fields rules can touch, in pages of 1,000 rows
+ * in user_id order (a stable order, so a page boundary can't skip or repeat
+ * a member). `countCall` (ADR 0029 rule FP2), when given, is called before
+ * each call, the re-read without `department` included.
  */
 export async function fetchActiveMembers(
   svc: SupabaseClient,
@@ -153,6 +154,7 @@ export async function fetchActiveMembers(
         .select(cols)
         .eq("organization_id", orgId)
         .eq("status", "active")
+        .order("user_id")
         .range(fromIdx, fromIdx + 999);
     };
     // 0096 deploy safety: retry without `department` when the column is not there yet.
@@ -170,6 +172,14 @@ export async function fetchActiveMembers(
  * `membersCache` lets callers resolving several groups share the member
  * fetch (pass the result of fetchActiveMembers). `countCall` (ADR 0029 rule
  * FP2), when given, is called before each call made here.
+ *
+ * Every read is paged (pages of 1,000 rows in a stable order) and a team
+ * rule's `.in()` lists hold at most 150 ids, so no set is cut at the
+ * server's 1,000-row cap: the Report Card reads a dynamic group's team here,
+ * the manager's reminder through namedMembershipStrict, and the two agree.
+ * Fail-soft, as before paging: a static group's failed page ends its rows
+ * there; a team rule's failed call reads as its one unpaged call did on an
+ * error, no team members (readByIdsSoft).
  */
 export async function resolveGroupMembers(
   svc: SupabaseClient,
@@ -185,6 +195,7 @@ export async function resolveGroupMembers(
         .from("org_group_members")
         .select("user_id")
         .eq("group_id", group.id)
+        .order("user_id")
         .range(fromIdx, fromIdx + 999);
       const page = (data ?? []) as Array<{ user_id: string }>;
       ids.push(...page.map((r) => r.user_id));
@@ -199,12 +210,12 @@ export async function resolveGroupMembers(
 
   let teamSet: Set<string> | null = null;
   if (rules.team_ids && rules.team_ids.length > 0) {
-    countCall?.();
-    const { data } = await svc
-      .from("team_members")
-      .select("user_id")
-      .in("team_id", rules.team_ids);
-    teamSet = new Set(((data ?? []) as Array<{ user_id: string }>).map((t) => t.user_id));
+    const rows = await readByIdsSoft<{ user_id: string }>(
+      rules.team_ids,
+      (ids, from, to) => svc.from("team_members").select("user_id").in("team_id", ids).order("team_id").order("user_id").range(from, to),
+      countCall
+    );
+    teamSet = new Set(rows.map((t) => t.user_id));
   }
 
   return membersByRules(members, rules, teamSet);
@@ -338,7 +349,11 @@ export async function myGroupIdsServer(
   }
 }
 
-/** Union of several groups' members (shared member fetch). */
+/**
+ * Union of several groups' members (shared member fetch). The groups are
+ * read in `.in()` lists of 150 ids and pages of 1,000 rows; a failed call
+ * reads as no groups, as the one unpaged call did (readByIdsSoft).
+ */
 export async function resolveManyGroups(
   svc: SupabaseClient,
   orgId: string,
@@ -346,12 +361,16 @@ export async function resolveManyGroups(
 ): Promise<Set<string>> {
   const out = new Set<string>();
   if (groupIds.length === 0) return out;
-  const { data } = await svc
-    .from("org_groups")
-    .select("id, organization_id, group_type, rules, is_active")
-    .eq("organization_id", orgId)
-    .in("id", groupIds);
-  const groups = ((data ?? []) as GroupRow[]).filter((g) => g.is_active !== false);
+  const data = await readByIdsSoft<GroupRow>(groupIds, (ids, from, to) =>
+    svc
+      .from("org_groups")
+      .select("id, organization_id, group_type, rules, is_active")
+      .eq("organization_id", orgId)
+      .in("id", ids)
+      .order("id")
+      .range(from, to)
+  );
+  const groups = data.filter((g) => g.is_active !== false);
   const needMembers = groups.some((g) => g.group_type === "dynamic");
   const cache = needMembers ? await fetchActiveMembers(svc, orgId) : undefined;
   for (const g of groups) {
