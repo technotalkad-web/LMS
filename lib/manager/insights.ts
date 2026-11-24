@@ -1,21 +1,22 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
-import { chunk, fetchAll, fetchByIds } from "@/lib/db/chunked";
+import { chunk, fetchAll, fetchByIds, readAllStrict } from "@/lib/db/chunked";
 import {
   DEFAULT_POLICY,
   attemptCounts,
   computeScoring,
   courseStatus,
   excludeAbandoned,
+  isCompletedAttempt,
   isRevisionAttempt,
   officialDone,
+  type CourseStatus,
+  type EffectivePolicy,
 } from "@/lib/scoring/policy";
 import { resolvePolicies } from "@/lib/scoring/resolve";
 import {
   GrantReadError,
   fetchPassRequired,
   grantSnapshotForUsers,
-  isMissingRelation as relationMissing,
-  isSchemaMissing,
   readPagedWithOptionalColumn,
   type GrantSnapshot,
   type OptionalColumnState,
@@ -35,7 +36,7 @@ import {
   todayStr,
 } from "@/lib/journey/journey";
 import { readJourneyCredits } from "@/lib/journey/credits-read";
-import { fetchActiveMembers, groupMembersStrict, resolveGroupMembers, type GroupRow } from "@/lib/org/groups";
+import { fetchActiveMembers, namedMembershipStrict, resolveGroupMembers, type AssigneeRow, type GroupRow } from "@/lib/org/groups";
 import { isReleased } from "@/lib/learner/release";
 import { THRESHOLDS } from "./report-card";
 import { DAY, daysAgo, deriveLearner, fmtDay, maxIso, minIso } from "./derive";
@@ -66,25 +67,6 @@ export type InsightOptions = {
   /** "" | course:<id> | path:<id> | journey:<id> — narrows every number to that content. */
   content?: string;
   now?: Date;
-  /**
-   * For a caller whose answer decides who is mailed (ADR 0029, note of
-   * 2026-11-20, part 3, and stage 2's one rule): every read that decides
-   * whether a course reaches a learner throws when it fails, instead of
-   * leaving the learner "not assigned": the organisation's courses and
-   * paths, the groups and their members, and the courses' attempt policies
-   * (a default policy can read a learner as finished). Only a database
-   * without org_groups (before 0067) or without the policies' function
-   * (before 0073), read from the error's code, is still tolerated. The
-   * Report Card pages leave it off.
-   */
-  strictGroups?: boolean;
-  /**
-   * For a request that counts its calls (ADR 0029 rule FP2): called before
-   * each call made here, every chunk, page and fallback included, so the
-   * request's budget holds the calls really made. The manager's reminder
-   * passes it; the Report Card pages leave it off.
-   */
-  countCall?: () => unknown;
 };
 
 export type CatalogEntry = { id: string; title: string };
@@ -170,6 +152,24 @@ const toScorable = (a: AttemptRow) => ({
 });
 void fmtDay; void daysAgo;
 
+/**
+ * A course line's scoring: the one place in this file that works out a
+ * course's status (ADR 0029, note of 2026-11-25, part 1, point 3), for the
+ * Report Card's roll-up and for the manager's reminder
+ * (readCourseReminderLines), so the two cannot drift. `status` is
+ * courseStatus over computeScoring of the learner's rows on the course,
+ * with the retake ids of their approved grants. ADR 0024's phase that moves
+ * the Report Card's lines onto contextResult moves this function, and both
+ * readers with it.
+ */
+function scoreLine(list: AttemptRow[], policy: EffectivePolicy, retakeIds: ReadonlySet<string>) {
+  const scorable = list.map(toScorable);
+  const scoring = computeScoring(scorable, policy, retakeIds);
+  // ADR 0014 step 10: "in_progress" while a granted retake runs.
+  const status = courseStatus(scoring, scorable);
+  return { scorable, scoring, status };
+}
+
 /** The attempts select; `is_revision` (0103) is added through the narrower-select fallback. */
 const ATTEMPT_COLUMNS =
   "id, user_id, course_version_id, status, completion_status, success_status, score, started_at, completed_at, last_activity_at, progress_pct, units:cmi_data->cmi5->units";
@@ -188,26 +188,36 @@ const ATTEMPT_COLUMNS =
  * `context_kind = 'preview'` rows, one decision for every chunk and page
  * (`previews`); on a database without 0107 the filter's missing-column error
  * reads today's select once (readWithContextFilter).
+ *
+ * ADR 0029, note of 2026-11-25, part 1: the manager's reminder reads the
+ * named learners' rows on one course through this same read, narrowed to
+ * the course's versions (`versionIds`, at most 100 a call beside at most 50
+ * learners). For that caller an answer that is not a list is an error too
+ * (`strict`): it decides who is mailed. The Report Card passes no versions
+ * and reads as before. `countCall` (ADR 0029 rule FP2), when given, is
+ * called before each call, every chunk, page and fallback included.
  */
-async function fetchAttemptRows(svc: SupabaseClient, orgId: string, userIds: string[], countCall?: () => unknown): Promise<AttemptRow[]> {
+async function fetchAttemptRows(svc: SupabaseClient, orgId: string, userIds: string[], countCall?: () => unknown, versionIds?: string[]): Promise<AttemptRow[]> {
+  const strict = versionIds !== undefined;
   const out: AttemptRow[] = [];
   const decided: OptionalColumnState = { columns: null };
   const previews: ContextFilterState = { applies: null };
-  for (const part of chunk([...new Set(userIds.filter(Boolean))], 150)) {
-    const res = await readPagedWithOptionalColumn<unknown>(
-      "is_revision",
-      (cols, from, to): PromiseLike<{ data: unknown[] | null; error: PgError }> =>
-        readWithContextFilter(previews, (apply) => {
-          countCall?.();
-          return withoutPreviews(svc.from("course_attempts").select(cols).in("user_id", part).eq("organization_id", orgId), apply)
-            .order("id")
-            .range(from, to);
-        }),
-      ATTEMPT_COLUMNS,
-      { state: decided }
-    );
-    if (res.error) throw new Error(`course_attempts: ${res.error.message ?? ""}`);
-    out.push(...(res.data as AttemptRow[]));
+  for (const part of chunk([...new Set(userIds.filter(Boolean))], strict ? 50 : 150)) {
+    for (const versions of strict ? chunk([...new Set(versionIds)], 100) : [null]) {
+      const res = await readPagedWithOptionalColumn<unknown>(
+        "is_revision",
+        (cols, from, to): PromiseLike<{ data: unknown[] | null; error: PgError }> =>
+          readWithContextFilter(previews, (apply) => {
+            countCall?.();
+            const q = withoutPreviews(svc.from("course_attempts").select(cols).in("user_id", part).eq("organization_id", orgId), apply);
+            return (versions ? q.in("course_version_id", versions) : q).order("id").range(from, to);
+          }),
+        ATTEMPT_COLUMNS,
+        { state: decided, nullIsError: strict }
+      );
+      if (res.error) throw new Error(`course_attempts: ${res.error.message ?? ""}`);
+      out.push(...(res.data as AttemptRow[]));
+    }
   }
   return out;
 }
@@ -224,10 +234,8 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const lensCourse = content.startsWith("course:") ? content.slice(7) : null;
   const lensPath = content.startsWith("path:") ? content.slice(5) : null;
   const lensJourney = content.startsWith("journey:") ? content.slice(8) : null;
-  const count = opts.countCall;
 
   /* ---- org timezone / today (journey maths, "active today") ---- */
-  count?.();
   const { data: gsRow } = await svc
     .from("gamification_settings")
     .select("timezone")
@@ -239,30 +247,23 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const today = opts.now ? new Intl.DateTimeFormat("en-CA", { timeZone: tz, year: "numeric", month: "2-digit", day: "2-digit" }).format(now) : todayStr(tz);
 
   /* ---- catalog (titles for everything we may show; the picker lists active only) ---- */
-  // The active courses and paths decide which assignments reach a learner:
-  // for a caller that mails from the answer, a failed read throws (the
-  // caller answers 503), never "not assigned".
-  count?.();
-  const { data: courseRows, error: courseErr } = await svc
+  const { data: courseRows } = await svc
     .from("courses")
     .select("id, title, is_active")
     .eq("organization_id", orgId)
     .order("title");
-  if (opts.strictGroups && (courseErr || !Array.isArray(courseRows))) throw new Error(`courses: ${courseErr?.message ?? "no answer"}`);
   const allCourses = (courseRows ?? []) as Array<{ id: string; title: string; is_active: boolean }>;
   const courseTitle = new Map(allCourses.map((c) => [c.id, c.title]));
-  count?.();
-  const { data: pathRows, error: pathErr } = await svc
+  const { data: pathRows } = await svc
     .from("learning_paths")
     .select("id, name, is_active")
     .eq("organization_id", orgId)
     .order("name");
-  if (opts.strictGroups && (pathErr || !Array.isArray(pathRows))) throw new Error(`learning_paths: ${pathErr?.message ?? "no answer"}`);
   const allPaths = (pathRows ?? []) as Array<{ id: string; name: string; is_active: boolean }>;
   const pathName = new Map(allPaths.map((p) => [p.id, p.name]));
   const pathCourseRows = allPaths.length
     ? await fetchByIds<{ path_id: string; course_id: string; step_number: number; release_at: string | null }>(
-        svc, "learning_path_courses", "path_id, course_id, step_number, release_at", "path_id", allPaths.map((p) => p.id), undefined, "path_id", count
+        svc, "learning_path_courses", "path_id, course_id, step_number, release_at", "path_id", allPaths.map((p) => p.id), undefined, "path_id"
       )
     : [];
   pathCourseRows.sort((a, b) => (a.step_number ?? 0) - (b.step_number ?? 0));
@@ -277,7 +278,6 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
     if (!activePath.has(r.path_id) || !activeCourse.has(r.course_id) || !isReleased(r.release_at, nowMs)) continue;
     coursesOfPath.set(r.path_id, [...(coursesOfPath.get(r.path_id) ?? []), r.course_id]);
   }
-  count?.();
   const { data: progRows } = await svc.from("journey_programs").select("*").eq("organization_id", orgId);
   const programs = (progRows ?? []) as Array<{ id: string; name: string; is_active: boolean; deadline_days?: number | null }>;
   const programById = new Map(programs.map((p) => [p.id, p]));
@@ -289,22 +289,22 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
 
   if (userIds.length === 0) {
     // Catalog-only call (the L3 cached path still needs the org benchmark for §7 gaps).
-    return { learners: [], catalog, benchmark: await loadBenchmark(svc, catalog.courses.map((c) => c.id), count), today, tz };
+    return { learners: [], catalog, benchmark: await loadBenchmark(svc, catalog.courses.map((c) => c.id)), today, tz };
   }
 
   /* ---- people ---- */
   type MemberRow = { user_id: string; designation: string | null; city: string | null; branch: string | null; business_vertical: string | null; department?: string | null; date_of_joining: string | null };
   let memberRows: MemberRow[];
   try {
-    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, department, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id", count);
+    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, department, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
   } catch (e) {
     // 0096 deploy safety: no department column yet.
     if (!/department/.test(String((e as Error)?.message ?? e))) throw e;
-    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id", count);
+    memberRows = await fetchByIds<MemberRow>(svc, "organization_members", "user_id, designation, city, branch, business_vertical, date_of_joining", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id");
   }
   const memberById = new Map(memberRows.map((m) => [m.user_id, m]));
   const profRows = await fetchByIds<{ id: string; first_name: string | null; last_name: string | null; email: string | null; avatar_url: string | null }>(
-    svc, "profiles", "id, first_name, last_name, email, avatar_url", "id", userIds, undefined, "id", count
+    svc, "profiles", "id, first_name, last_name, email, avatar_url", "id", userIds
   );
   const profById = new Map(profRows.map((p) => [p.id, p]));
   const nameOf = (id: string) => {
@@ -313,11 +313,11 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   };
 
   /* ---- attempts + versions ---- */
-  const attempts = await fetchAttemptRows(svc, orgId, userIds, count);
+  const attempts = await fetchAttemptRows(svc, orgId, userIds);
   const versionIds = [...new Set(attempts.map((a) => a.course_version_id))];
   const versionRows = versionIds.length
     ? await fetchByIds<{ id: string; course_id: string; unit_count: number | null }>(
-        svc, "course_versions", "id, course_id, unit_count:manifest_data->unitCount", "id", versionIds, undefined, "id", count
+        svc, "course_versions", "id, course_id, unit_count:manifest_data->unitCount", "id", versionIds
       )
     : [];
   const courseOfVersion = new Map(versionRows.map((v) => [v.id, v.course_id]));
@@ -326,12 +326,12 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   for (const a of attempts) attemptsByUser.set(a.user_id, [...(attemptsByUser.get(a.user_id) ?? []), a]);
 
   /* ---- assignment expansion (released only; paths entitle their courses) ---- */
-  const courseAssigns = await fetchAll<CourseAssign>(svc, "course_assignments", "*", (q) => q.eq("organization_id", orgId), "id", count);
-  const pathAssigns = await fetchAll<PathAssign>(svc, "learning_path_assignments", "*", (q) => q.eq("organization_id", orgId), "id", count);
+  const courseAssigns = await fetchAll<CourseAssign>(svc, "course_assignments", "*", (q) => q.eq("organization_id", orgId));
+  const pathAssigns = await fetchAll<PathAssign>(svc, "learning_path_assignments", "*", (q) => q.eq("organization_id", orgId));
   const teamIds = [...new Set([...courseAssigns, ...pathAssigns].filter((a) => a.assignee_type === "team" && a.team_id).map((a) => a.team_id as string))];
   const teamUserIds = new Map<string, Set<string>>();
   if (teamIds.length) {
-    const rows = await fetchByIds<{ team_id: string; user_id: string }>(svc, "team_members", "team_id, user_id", "team_id", teamIds, undefined, "user_id", count);
+    const rows = await fetchByIds<{ team_id: string; user_id: string }>(svc, "team_members", "team_id, user_id", "team_id", teamIds, undefined, "user_id");
     for (const r of rows) {
       if (!userSet.has(r.user_id)) continue;
       (teamUserIds.get(r.team_id) ?? teamUserIds.set(r.team_id, new Set()).get(r.team_id)!).add(r.user_id);
@@ -339,43 +339,17 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   }
   const groupIds = [...new Set([...courseAssigns, ...pathAssigns].filter((a) => a.assignee_type === "group" && a.group_id).map((a) => a.group_id as string))];
   const groupUserIds = new Map<string, Set<string>>();
-  if (groupIds.length && opts.strictGroups) {
-    // Every read's error is read: a group that could not be read is never
-    // "nobody in it". Lists of 150 ids (the house rule).
-    const groups: GroupRow[] = [];
-    let noGroupsTable = false;
-    for (const ids of chunk(groupIds, 150)) {
-      count?.();
-      const { data: groupRows, error: groupErr } = await svc
-        .from("org_groups")
-        .select("id, organization_id, name, group_type, rules, is_active")
-        .in("id", ids);
-      // "Missing" is read from the error's code, never from its words: a
-      // transient error that names a relation is a failed read.
-      if (groupErr && relationMissing(groupErr, "org_groups")) {
-        noGroupsTable = true;
-        break;
-      }
-      if (groupErr || !Array.isArray(groupRows)) throw new Error(`org_groups: ${groupErr?.message ?? "no answer"}`);
-      groups.push(...(groupRows as GroupRow[]));
-    }
-    if (!noGroupsTable) {
-      const byGroup = await groupMembersStrict(svc, orgId, groups.filter((g) => g.is_active !== false), count ? () => (count(), true as const) : undefined);
-      if (byGroup === "unreadable") throw new Error("org_groups: a group's members could not be read");
-      for (const [gid, ids] of byGroup) groupUserIds.set(gid, new Set([...ids].filter((u) => userSet.has(u))));
-    }
-  } else if (groupIds.length) {
+  if (groupIds.length) {
     try {
-      count?.();
       const { data: groupRows } = await svc
         .from("org_groups")
         .select("id, organization_id, name, group_type, rules, is_active")
         .in("id", groupIds);
       const groups = ((groupRows ?? []) as GroupRow[]).filter((g) => g.is_active !== false);
       const needsMembers = groups.some((g) => g.group_type === "dynamic");
-      const allMembers = needsMembers ? await fetchActiveMembers(svc, orgId, count) : undefined;
+      const allMembers = needsMembers ? await fetchActiveMembers(svc, orgId) : undefined;
       for (const g of groups) {
-        const ids = await resolveGroupMembers(svc, g, allMembers, count);
+        const ids = await resolveGroupMembers(svc, g, allMembers);
         groupUserIds.set(g.id, new Set(ids.filter((u) => userSet.has(u))));
       }
     } catch (e) {
@@ -438,12 +412,12 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   const enrollments = await fetchByIds<EnrRow>(
     svc, "journey_enrollments",
     "id, user_id, program_id, version_id, status, start_date, journey_versions!inner(days, days_total, count_sundays, unlock_mode)",
-    "user_id", userIds, (q) => q.eq("organization_id", orgId).in("status", ["active", "completed"]), "id", count
+    "user_id", userIds, (q) => q.eq("organization_id", orgId).in("status", ["active", "completed"])
   ).catch(tolerateMissing<EnrRow>);
   // The credits by day id, through the one reader (ADR 0024 step 45). A
   // failed read throws, as every other read of the Report Card does: it is
   // never "no days done".
-  const credits = await readJourneyCredits(svc, enrollments.map((e) => ({ id: e.id, version_id: e.version_id })), { countCall: count });
+  const credits = await readJourneyCredits(svc, enrollments.map((e) => ({ id: e.id, version_id: e.version_id })));
   if (!credits.ok) throw new Error(`journey credits read failed: ${credits.error?.message ?? "no answer"}`);
   const journeysByUser = new Map<string, Array<JourneyInsight & { dayCompletions: string[]; courseIds: Set<string> }>>();
   for (const e of enrollments) {
@@ -495,13 +469,13 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
 
   /* ---- reminders, open grants, policies ---- */
   const nudgeRows = await fetchByIds<{ user_id: string; course_id: string; nudge_count: number }>(
-    svc, "reminder_state", "user_id, course_id, nudge_count", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id", count
+    svc, "reminder_state", "user_id, course_id, nudge_count", "user_id", userIds, (q) => q.eq("organization_id", orgId), "user_id"
   ).catch(() => []);
   const nudges = new Map<string, number>();
   for (const n of nudgeRows) nudges.set(`${n.user_id}:${n.course_id}`, n.nudge_count ?? 0);
   const grantRows = await fetchByIds<{ user_id: string; course_id: string; expires_at: string | null }>(
     svc, "attempt_requests", "user_id, course_id, expires_at", "user_id", userIds,
-    (q) => q.eq("organization_id", orgId).eq("status", "approved").is("used_at", null), "user_id", count
+    (q) => q.eq("organization_id", orgId).eq("status", "approved").is("used_at", null), "user_id"
   ).catch(() => []);
   const openGrants = new Set<string>();
   for (const g of grantRows) if (!g.expires_at || g.expires_at > nowIso) openGrants.add(`${g.user_id}:${g.course_id}`);
@@ -519,23 +493,18 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   // client-level failure cannot fail the page or the refresh either.
   const readGrants = async (): Promise<Map<string, GrantSnapshot> | null> => {
     try {
-      return await grantSnapshotForUsers(svc, orgId, null, userIds, undefined, count);
+      return await grantSnapshotForUsers(svc, orgId, null, userIds);
     } catch (e) {
       console.warn(JSON.stringify({ event: "report_card_grants_unreadable", org_id: orgId, code: e instanceof GrantReadError ? e.code : null }));
       return null;
     }
   };
-  // For a caller that mails from the answer, a failed read of the policies
-  // throws: the platform default could read a learner as finished.
-  const policiesUnreadable = (e: unknown) => {
-    if (!isSchemaMissing(e as PgError)) throw new Error("effective_attempt_policies: the read failed");
-  };
   const [policies, snapshots, passRequired, visits] = await Promise.all([
-    resolvePolicies(svc, courseIdList, opts.strictGroups ? { readFailed: policiesUnreadable, countCall: count } : { countCall: count }),
+    resolvePolicies(svc, courseIdList),
     readGrants(),
-    fetchPassRequired(svc, courseIdList, count),
+    fetchPassRequired(svc, courseIdList),
     // "Last revisit" beside the inactive flag (ADR 0014:199), fail-soft.
-    fetchRevisionVisitStats(svc, { orgId, userIds, countCall: count }),
+    fetchRevisionVisitStats(svc, { orgId, userIds }),
   ]);
   const historyUnavailable = snapshots === null;
   // The reader pages oldest first, so a capped read lacks the newest visits:
@@ -550,7 +519,7 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
   }
 
   /* ---- org benchmark (nightly matview; fail-soft) ---- */
-  const benchmark = await loadBenchmark(svc, courseIdList, count);
+  const benchmark = await loadBenchmark(svc, courseIdList);
 
   /* ---- per-learner rollup (one data load, any number of period windows) ---- */
   const rollup = (periodDays: number | null): LearnerInsight[] => {
@@ -643,10 +612,9 @@ export async function computeLearnerInsights(svc: SupabaseClient, opts: InsightO
       }
       const snapshot = snapshots?.get(`${uid}:${cid}`);
       const retakeIds = snapshot?.retakeIds ?? new Set<string>();
-      const scorable = list.map(toScorable);
-      const scoring = computeScoring(scorable, policies.get(cid) ?? DEFAULT_POLICY, retakeIds);
-      // ADR 0014 step 10: "in_progress" while a granted retake runs.
-      const status = courseStatus(scoring, scorable);
+      // The one scoring of a course line (scoreLine), shared with the
+      // manager's reminder.
+      const { scorable, scoring, status } = scoreLine(list, policies.get(cid) ?? DEFAULT_POLICY, retakeIds);
       // A per-course display: the retake's progress while it runs. The path
       // steps below read officialDone, so a passed step stays done.
       const progress = courseProgress(list, unitCountByVersion, { retakeIds });
@@ -763,13 +731,191 @@ export function periodKey(days: number | null): string {
   return days === null ? "all" : String(days);
 }
 
+/** A named learner's line on the course, as the Report Card shows it: its status. */
+export type ReminderLine = { status: CourseStatus };
+
+/** The ids of a call's second `.in()` list, beside the learners' (at most 50): 150 ids a call in all. */
+const IDS_BESIDE_LEARNERS = 100;
+
+/**
+ * The manager's "send reminder now" for a course (ADR 0029, note of
+ * 2026-11-25, part 1): for each named learner, whether the course has a
+ * line on their Report Card and that line's status, read only for those
+ * learners and that one course. No entry: no line. It lives here, beside
+ * computeLearnerInsights, because ADR 0024's guard admits no new file that
+ * works out an official result (tests/unit/revision-listing.test.ts, part
+ * (vii)); the status is scoreLine's, the Report Card's own.
+ *
+ * The rules are the Report Card's (computeLearnerInsights above):
+ *   - a line exists when an assignment gives the learner the course, or the
+ *     learner has any row on a version of it (a preview is not a row; an
+ *     abandoned row and a revision visit's row are);
+ *   - a course row counts only when it is released and the course is
+ *     active; a person's row reaches that person, a team's its members, a
+ *     group's its members while the group is active (a static group its
+ *     rows, a dynamic group its rules over the active members' fields and a
+ *     rule's teams), the organisation's everybody named;
+ *   - a path gives the course when the path is active, the course is
+ *     active, the step is released, and the path is assigned to the learner
+ *     in any of the four ways (a path's row has no release of its own);
+ *   - the status is scoreLine over the learner's rows with the retake ids of
+ *     their approved grants, under DEFAULT_POLICY: since ADR 0014 step 9
+ *     normalizePolicy clamps every stored rule to it, so no policy is read
+ *     (officialFailedAttemptId leaves it out for the same reason), and no
+ *     pass mark (it moves "done", not the status).
+ *
+ * The reads, in order, each one call, each counted (`countCall`) where it
+ * is made; a learner who has a line needs no more, so the assignment steps
+ * stop once every learner has one:
+ *   a. the course's versions; b. the learners' rows on them (only when a
+ *   version exists), through the file's one attempts read; then, for an
+ *   active course only: c. the course's own rows for the learners without a
+ *   line; d. its rows for a team, a group or the organisation; e. the path
+ *   steps that hold it; f. those paths (released steps), the active ones of
+ *   this organisation; g. those paths' own rows for the learners without a
+ *   line; h. their rows for a team, a group or the organisation; i to l. one
+ *   call of namedMembershipStrict (lib/org/groups.ts) for the teams and
+ *   groups of d and h together, for the learners without a line; and m. the
+ *   approved grants on the course of the learners who have a completed row
+ *   (without one nobody has an official attempt, whatever the grants say).
+ *   An inactive course makes a, b and m only. Pages of 1,000 rows; a longer
+ *   list or a later page is a call more, and is counted.
+ *
+ * Every read is strict (stage 2's one rule): an error, a call that throws or
+ * an answer that is not a list throws, and the caller answers 503 and sends
+ * nothing. Tolerated, each read from its error's code: a database without
+ * org_groups has no groups, one without attempt_requests no grants, and a
+ * missing is_revision, context_kind, reissued_from or department column is
+ * read without it (one call more).
+ */
+export async function readCourseReminderLines(
+  svc: SupabaseClient,
+  opts: { orgId: string; courseId: string; courseActive: boolean; userIds: string[]; countCall?: () => unknown; now?: Date }
+): Promise<Map<string, ReminderLine>> {
+  const { orgId, courseId } = opts;
+  const count = opts.countCall;
+  const gate = () => {
+    count?.();
+    return true as const;
+  };
+  const nowMs = (opts.now ?? new Date()).getTime();
+  const users = [...new Set(opts.userIds.filter(Boolean))];
+  const named = new Set(users);
+  const hasLine = new Set<string>();
+  const open = () => users.filter((u) => !hasLine.has(u));
+  /** Every row of a strict paged read: a failed read throws, never "not assigned". */
+  const all = async <T,>(what: string, page: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>): Promise<T[]> => {
+    const rows = await readAllStrict<T>(page, gate);
+    if (rows === "unreadable" || rows === "no_room") throw new Error(`${what}: the read failed`);
+    return rows;
+  };
+  const teams = new Set<string>();
+  const groups = new Set<string>();
+  /** What one assignment row gives: a named person a line, a team or a group to read, the organisation everybody. */
+  const reach = (r: AssigneeRow) => {
+    if (r.assignee_type === "user") {
+      if (r.user_id && named.has(r.user_id)) hasLine.add(r.user_id);
+    } else if (r.assignee_type === "team") {
+      if (r.team_id) teams.add(r.team_id);
+    } else if (r.assignee_type === "group") {
+      if (r.group_id) groups.add(r.group_id);
+    } else if (r.assignee_type === "org") {
+      for (const u of users) hasLine.add(u);
+    }
+  };
+
+  // a. The course's versions.
+  const versions = await all<{ id: string }>("course_versions", (from, to) =>
+    svc.from("course_versions").select("id").eq("course_id", courseId).order("id").range(from, to)
+  );
+  // b. The learners' rows on them: any row gives a line (previews are not read).
+  const rowsOf = new Map<string, AttemptRow[]>();
+  if (versions.length > 0) {
+    for (const r of await fetchAttemptRows(svc, orgId, users, count, versions.map((v) => v.id))) {
+      if (!named.has(r.user_id)) continue;
+      (rowsOf.get(r.user_id) ?? rowsOf.set(r.user_id, []).get(r.user_id)!).push(r);
+      hasLine.add(r.user_id);
+    }
+  }
+
+  // An inactive course's assignment rows count for nothing, as on the Report Card.
+  if (opts.courseActive) {
+    // c. The course's own rows of the learners without a line: released only.
+    if (open().length > 0) {
+      const who = open();
+      const own = await all<{ user_id: string; release_at: string | null }>("course_assignments", (from, to) =>
+        svc.from("course_assignments").select("user_id, release_at").eq("organization_id", orgId).eq("course_id", courseId).eq("assignee_type", "user").in("user_id", who).order("id").range(from, to)
+      );
+      for (const r of own) if (isReleased(r.release_at, nowMs)) reach({ assignee_type: "user", user_id: r.user_id });
+    }
+    // d. Its rows for a team, a group or the organisation ("*" keeps a database without group_id working): released only.
+    if (open().length > 0) {
+      const other = await all<AssigneeRow & { release_at?: string | null }>("course_assignments", (from, to) =>
+        svc.from("course_assignments").select("*").eq("organization_id", orgId).eq("course_id", courseId).neq("assignee_type", "user").order("id").range(from, to)
+      );
+      for (const r of other) if (r.assignee_type !== "user" && isReleased(r.release_at ?? null, nowMs)) reach(r);
+    }
+    // e and f. The paths that give the course: a released step, an active path of this organisation.
+    const paths: string[] = [];
+    if (open().length > 0) {
+      const steps = await all<{ path_id: string; release_at: string | null }>("learning_path_courses", (from, to) =>
+        svc.from("learning_path_courses").select("path_id, release_at").eq("course_id", courseId).order("path_id").range(from, to)
+      );
+      const released = [...new Set(steps.filter((s) => isReleased(s.release_at, nowMs)).map((s) => s.path_id))];
+      for (const part of chunk(released, 150)) {
+        const rows = await all<{ id: string; is_active: boolean | null }>("learning_paths", (from, to) =>
+          svc.from("learning_paths").select("id, is_active").eq("organization_id", orgId).in("id", part).order("id").range(from, to)
+        );
+        paths.push(...rows.filter((p) => p.is_active !== false).map((p) => p.id));
+      }
+    }
+    // g. Those paths' own rows of the learners without a line (a path's row has no release of its own).
+    if (paths.length > 0 && open().length > 0) {
+      const who = open();
+      for (const part of chunk(paths, IDS_BESIDE_LEARNERS)) {
+        const own = await all<{ user_id: string }>("learning_path_assignments", (from, to) =>
+          svc.from("learning_path_assignments").select("user_id").eq("organization_id", orgId).in("path_id", part).eq("assignee_type", "user").in("user_id", who).order("id").range(from, to)
+        );
+        for (const r of own) reach({ assignee_type: "user", user_id: r.user_id });
+      }
+    }
+    // h. Their rows for a team, a group or the organisation.
+    if (paths.length > 0 && open().length > 0) {
+      for (const part of chunk(paths, 150)) {
+        const other = await all<AssigneeRow>("learning_path_assignments", (from, to) =>
+          svc.from("learning_path_assignments").select("*").eq("organization_id", orgId).in("path_id", part).neq("assignee_type", "user").order("id").range(from, to)
+        );
+        for (const r of other) if (r.assignee_type !== "user") reach(r);
+      }
+    }
+    // i to l. Which of the learners still without a line the teams and groups of d and h hold now.
+    if ((teams.size > 0 || groups.size > 0) && open().length > 0) {
+      const held = await namedMembershipStrict(svc, orgId, { teamIds: teams, groupIds: groups, userIds: open() }, gate);
+      if (held === "unreadable") throw new Error("team_members, org_groups: a team's or a group's members could not be read");
+      for (const set of [...held.teams.values(), ...held.groups.values()]) for (const u of set) if (named.has(u)) hasLine.add(u);
+    }
+  }
+
+  // m. The approved grants on the course, of the learners who have a completed row.
+  const completed = [...rowsOf].filter(([, list]) => excludeAbandoned(list).some(isCompletedAttempt)).map(([u]) => u);
+  const grants = completed.length > 0 ? await grantSnapshotForUsers(svc, orgId, [courseId], completed, undefined, count) : new Map<string, GrantSnapshot>();
+  const lines = new Map<string, ReminderLine>();
+  for (const u of users) {
+    if (!hasLine.has(u)) continue;
+    const mine = rowsOf.get(u) ?? [];
+    const retakeIds = grants.get(`${u}:${courseId}`)?.retakeIds ?? new Set<string>();
+    lines.set(u, { status: scoreLine(mine, DEFAULT_POLICY, retakeIds).status });
+  }
+  return lines;
+}
+
 /** Org-wide fail rate per course from the nightly matview (fail-soft: absent/unrefreshed → empty). */
-async function loadBenchmark(svc: SupabaseClient, courseIds: string[], countCall?: () => unknown): Promise<InsightsResult["benchmark"]> {
+async function loadBenchmark(svc: SupabaseClient, courseIds: string[]): Promise<InsightsResult["benchmark"]> {
   const benchmark = new Map<string, { failRate: number | null; enrolled: number }>();
   if (courseIds.length === 0) return benchmark;
   try {
     const rows = await fetchByIds<{ course_id: string; total_enrolled: number | null; total_failed: number | null }>(
-      svc, "mv_course_performance", "course_id, total_enrolled, total_failed", "course_id", courseIds, undefined, "course_id", countCall
+      svc, "mv_course_performance", "course_id, total_enrolled, total_failed", "course_id", courseIds, undefined, "course_id"
     );
     for (const r of rows) {
       const enrolled = r.total_enrolled ?? 0;

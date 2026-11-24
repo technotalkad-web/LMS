@@ -2,7 +2,8 @@ import {
   createClient as createServiceClient,
   type SupabaseClient,
 } from "@supabase/supabase-js";
-import { readAllStrict, readByIdsStrict, type CallCounter, type CallGate } from "@/lib/db/chunked";
+import { chunk, readAllStrict, readByIdsStrict, type CallCounter, type CallGate } from "@/lib/db/chunked";
+import { isMissingRelation } from "@/lib/scoring/attempt-kind";
 
 /**
  * Custom Groups (0067) — the LMS's reusable AUDIENCE object.
@@ -502,6 +503,164 @@ export async function resolveManyGroupsStrict(svc: SupabaseClient, orgId: string
   if (byGroup === "unreadable" || byGroup === "no_room") return byGroup;
   for (const ids of byGroup.values()) for (const id of ids) out.add(id);
   return out;
+}
+
+/** The ids of a call's second `.in()` list, beside its users': at most 150 ids a call in all. */
+const IDS_BESIDE_USERS = 100;
+/** The users of one call (a request names at most 50). */
+const USERS_A_CALL = 50;
+
+/** Which of the named users each team and each active group holds now. */
+export type NamedMembership = {
+  /** Every team given, with the named users in it. */
+  teams: Map<string, Set<string>>;
+  /** Every active group among those given, with the named users it holds. */
+  groups: Map<string, Set<string>>;
+};
+
+/**
+ * The strict reader for named people (ADR 0029, note of 2026-11-25, part 1,
+ * steps i to l): given team ids, group ids and the users a request names (at
+ * most 50), which of those users each team and each active group holds now.
+ * Every read is narrowed to the users, so none grows with the organisation:
+ *
+ *   i. the groups, by id: only an active group is answered. A database
+ *      without org_groups (before 0067), read from the error's code
+ *      (isMissingRelation, never its words), has no groups;
+ *   j. team_members of the teams given and of the teams the active dynamic
+ *      groups' rules name, for the users;
+ *   k. org_group_members of the active static groups, for the users (no
+ *      status filter, as groupMembersStrict);
+ *   l. the users' own member fields, the active rows of this organisation
+ *      (with fetchActiveMembers's `department` fallback), for the dynamic
+ *      groups' rules (membersByRules).
+ *
+ * Each read is made only when it is needed. Pages of 1,000 rows in a stable
+ * order; a call with two `.in()` lists holds at most 150 ids (the users, and
+ * up to 100 of the other list). `beforeCall` is asked before every call, the
+ * legacy column's second try included. "unreadable" when any read failed,
+ * threw or answered no list; "no_room" when the gate refused a call.
+ */
+export function namedMembershipStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  named: { teamIds: Iterable<string>; groupIds: Iterable<string>; userIds: Iterable<string> },
+  beforeCall?: CallCounter
+): Promise<NamedMembership | Unreadable>;
+export function namedMembershipStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  named: { teamIds: Iterable<string>; groupIds: Iterable<string>; userIds: Iterable<string> },
+  beforeCall?: CallGate
+): Promise<NamedMembership | Unreadable | NoRoom>;
+export async function namedMembershipStrict(
+  svc: SupabaseClient,
+  orgId: string,
+  named: { teamIds: Iterable<string>; groupIds: Iterable<string>; userIds: Iterable<string> },
+  beforeCall?: CallGate
+): Promise<NamedMembership | Unreadable | NoRoom> {
+  const uniq = (ids: Iterable<string>) => [...new Set([...ids].filter(Boolean))];
+  const users = uniq(named.userIds);
+  const teamIds = uniq(named.teamIds);
+  const groupIds = uniq(named.groupIds);
+  const out: NamedMembership = { teams: new Map(teamIds.map((t) => [t, new Set<string>()])), groups: new Map() };
+  if (users.length === 0) return out;
+  /** Rows of `ids` beside the users: each part of the ids with each part of the users, every page. */
+  const besideUsers = async <T>(ids: string[], page: (idPart: string[], userPart: string[], from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>) => {
+    const rows: T[] = [];
+    for (const idPart of chunk(ids, IDS_BESIDE_USERS)) {
+      for (const userPart of chunk(users, USERS_A_CALL)) {
+        const read = await readAllStrict<T>((from, to) => page(idPart, userPart, from, to), beforeCall);
+        if (read === "unreadable" || read === "no_room") return read;
+        rows.push(...read);
+      }
+    }
+    return rows;
+  };
+  try {
+    // i. The groups. "Missing" is read from the error's code: a transient
+    // error whose words name a relation is a failed read.
+    type Group = Pick<GroupRow, "id" | "group_type" | "rules" | "is_active">;
+    const groups: Group[] = [];
+    let noGroupsTable = false;
+    for (const part of chunk(groupIds, 150)) {
+      for (let from = 0; ; from += 1000) {
+        if (beforeCall && !beforeCall()) return "no_room";
+        const { data, error } = await svc
+          .from("org_groups")
+          .select("id, group_type, rules, is_active")
+          .eq("organization_id", orgId)
+          .in("id", part)
+          .order("id")
+          .range(from, from + 999);
+        if (error && isMissingRelation(error, "org_groups")) {
+          noGroupsTable = true;
+          break;
+        }
+        if (error || !Array.isArray(data)) return "unreadable";
+        groups.push(...(data as Group[]));
+        if (data.length < 1000) break;
+      }
+      if (noGroupsTable) break;
+    }
+    const active = noGroupsTable ? [] : groups.filter((g) => g.is_active !== false);
+    const statics = active.filter((g) => g.group_type === "static");
+    const dynamics = active.filter((g) => g.group_type === "dynamic").map((g) => ({ id: g.id, rules: parseGroupRules(g.rules) }));
+
+    // j. The teams given and the teams the dynamic groups' rules name.
+    const allTeams = uniq([...teamIds, ...dynamics.flatMap((g) => g.rules.team_ids ?? [])]);
+    const inTeam = new Map<string, Set<string>>();
+    if (allTeams.length > 0) {
+      const rows = await besideUsers<{ team_id: string; user_id: string }>(allTeams, (ids, us, from, to) =>
+        svc.from("team_members").select("team_id, user_id").in("team_id", ids).in("user_id", us).order("team_id").order("user_id").range(from, to)
+      );
+      if (rows === "unreadable" || rows === "no_room") return rows;
+      for (const r of rows) (inTeam.get(r.team_id) ?? inTeam.set(r.team_id, new Set()).get(r.team_id)!).add(r.user_id);
+    }
+    for (const t of teamIds) out.teams.set(t, new Set(inTeam.get(t) ?? []));
+
+    // k. The static groups' rows.
+    if (statics.length > 0) {
+      for (const g of statics) out.groups.set(g.id, new Set());
+      const rows = await besideUsers<{ group_id: string; user_id: string }>(statics.map((g) => g.id), (ids, us, from, to) =>
+        svc.from("org_group_members").select("group_id, user_id").in("group_id", ids).in("user_id", us).order("group_id").order("user_id").range(from, to)
+      );
+      if (rows === "unreadable" || rows === "no_room") return rows;
+      for (const r of rows) out.groups.get(r.group_id)?.add(r.user_id);
+    }
+
+    // l. The users' own member fields, for the dynamic groups' rules.
+    if (dynamics.length > 0) {
+      const members: MemberFields[] = [];
+      for (const part of chunk(users, USERS_A_CALL)) {
+        for (let from = 0; ; from += 1000) {
+          const q = (cols: string) =>
+            svc.from("organization_members").select(cols).eq("organization_id", orgId).eq("status", "active").in("user_id", part).order("user_id").range(from, from + 999);
+          if (beforeCall && !beforeCall()) return "no_room";
+          let res = await q(MEMBER_FIELD_COLS);
+          // 0096 deploy safety, as fetchActiveMembers: the column may not be there yet.
+          if (res.error && /department/.test(res.error.message)) {
+            if (beforeCall && !beforeCall()) return "no_room";
+            res = await q(MEMBER_FIELD_COLS_LEGACY);
+          }
+          if (res.error || !Array.isArray(res.data)) return "unreadable";
+          for (const r of res.data as unknown[]) {
+            const m = r as Partial<MemberFields>;
+            members.push({ ...m, department: m.department ?? null } as MemberFields);
+          }
+          if (res.data.length < 1000) break;
+        }
+      }
+      for (const g of dynamics) {
+        const ruleTeams = g.rules.team_ids ?? [];
+        const teamSet = ruleTeams.length > 0 ? new Set(ruleTeams.flatMap((t) => [...(inTeam.get(t) ?? [])])) : null;
+        out.groups.set(g.id, new Set(membersByRules(members, g.rules, teamSet)));
+      }
+    }
+    return out;
+  } catch {
+    return "unreadable";
+  }
 }
 
 /** An assignment row as the mail paths read it: one person, a team, a group, or the whole organisation. */

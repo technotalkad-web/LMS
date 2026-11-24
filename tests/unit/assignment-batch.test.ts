@@ -59,6 +59,18 @@
  * And a vertical target whose group cannot be created leaves the
  * deactivated groups the request named deactivated.
  *
+ * ADR 0029, note of 2026-11-25, part 3, the two writes called directly: a
+ * refusal every row shares (23503) makes the batch and three row inserts
+ * and no more, and nobody reads "try again"; a refusal one row causes saves
+ * the others; duplicates (23505) are each tried. A lost reply whose
+ * read-back finds nothing is "not confirmed", never "failed", and mails
+ * nobody. The assignment's read-back takes a row for the request's own
+ * only after a first read that answered and with the request's
+ * assigned_by; any other row found is a duplicate (its date, its
+ * conversion, no "assigned" mail). A row another press of the same action
+ * finishes (not saved for room, or not confirmed) carries `retry: true`
+ * (part 2, point 6), and no other row does.
+ *
  * A learner's request for another attempt (POST /api/attempt-requests) and
  * a manager's new ticket (POST /api/tickets) mail up to 25 administrators;
  * each counts from its first call too, and stays within the 40.
@@ -120,6 +132,15 @@ const UNIQUE: Record<string, (r: Row) => string | null> = {
 let beforeWrite: ((c: Call) => void) | null = null;
 let loseReply: ((c: Call) => boolean) | null = null;
 let failRead: ((c: Call) => boolean) | null = null;
+/**
+ * Two more (ADR 0029, note of 2026-11-25, part 3): `refuse` answers an
+ * insert into a keyed table with its error, saving nothing (a refusal every
+ * row shares, such as 23503, or one row's own, such as 23514); `dropWrite`
+ * saves nothing and fails the fetch, as a connection dropped before the
+ * write reached the database (supabase-js answers code "").
+ */
+let refuse: ((c: Call, rows: Row[]) => Row | null) | null = null;
+let dropWrite: ((c: Call) => boolean) | null = null;
 const json = (body: unknown, status: number) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = new URL(input instanceof Request ? input.url : String(input));
@@ -137,6 +158,9 @@ const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<R
   if (method === "GET" && failRead?.(call)) return json({ code: "XX000", message: "stub read failure" }, 500);
   if (method === "POST" && UNIQUE[table]) {
     beforeWrite?.(call);
+    const refused = refuse?.(call, (Array.isArray(body) ? body : [body]) as Row[]);
+    if (refused) return json(refused, 409);
+    if (dropWrite?.(call)) throw new TypeError("fetch failed");
     const keyOf = UNIQUE[table];
     const taken = new Set((world.tables[table] ?? []).map(keyOf).filter((k): k is string => k !== null));
     for (const r of (Array.isArray(body) ? body : [body]) as Row[]) {
@@ -236,6 +260,8 @@ function seed(over: { attempts?: boolean; ticket?: Row } = {}) {
   beforeWrite = null;
   loseReply = null;
   failRead = null;
+  refuse = null;
+  dropWrite = null;
 }
 
 /** The 25 administrators of the requests that mail them (`admin-1@` to `admin-25@`). */
@@ -279,6 +305,8 @@ function seedAdmins(others = 0) {
   beforeWrite = null;
   loseReply = null;
   failRead = null;
+  refuse = null;
+  dropWrite = null;
 }
 
 async function main() {
@@ -720,6 +748,129 @@ async function main() {
       eq("…each row tried and saved is written, and each written row was tried; the raced one is answered as already there",
         [[...done].sort(), [...a.rows].sort(), racedOutcome?.status], [[...a.rows].sort(), [...done].sort(), action === "grant_retry" ? "failed" : "already"]);
       eq("…every learner has one outcome", done.length + untried.length + 1, people.length);
+      // ADR 0029, note of 2026-11-25, part 2, point 6: a row that another
+      // press of the same action finishes carries the mark; no other row does.
+      eq("…each row not saved for room carries retry: true, and no other row does",
+        [a.results.filter((x) => x.retry === true).map((x) => String(x.userId)).sort(), [...untried].sort()].map((l) => l.join(",")),
+        [[...untried].sort().join(","), [...untried].sort().join(",")]);
+    }
+
+    // ADR 0029, note of 2026-11-25, part 3: the writes of a grant and of an
+    // assignment to named learners, called directly (as a ticket's action
+    // calls them), five learners each unless said.
+    //   Row 2: a row-by-row pass stops once three rows tried alone were each
+    //   refused with the batch's own code, none was saved, and that code is
+    //   not 23505; the rest are answered with that refusal, with no call and
+    //   no mark for another press. A refusal one row causes saves the others;
+    //   duplicates (23505) are each tried.
+    //   Row 6: a lost reply whose read-back finds nothing is "not confirmed",
+    //   marked `retry`, and nobody is mailed for it.
+    //   Row 7: the assignment's read-back takes a row for the request's own
+    //   only when the first read of the rows already there answered and the
+    //   row's assigned_by is the request's; any other row found is a
+    //   duplicate (its new date, the conversion of a self-enrolment, no
+    //   "assigned" mail).
+    {
+      const five = LEARNERS.slice(0, 5);
+      const callGrant = (people: string[]) => grant.grantExtraAttempts(svc, {
+        orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "http://lms.test", decidedBy: ADMIN,
+        source: "ticket", courseId: COURSE, userIds: people, expiresInDays: 30,
+      });
+      const callAssign = (people: string[], dueAt: string | null = null) => direct.assignCourseDirect(svc, {
+        orgId: ORG, orgName: "Tenant A", orgSlug: "tenant-a", origin: "http://lms.test", assignedBy: ADMIN,
+        courseId: COURSE, userIds: people, dueAt,
+      });
+      type Out = { results: Array<{ userId: string; status: string; reason?: string; retry?: true }> };
+      const resultsOf = (out: unknown) => {
+        if (out && typeof out === "object" && "error" in out) throw new Error(String((out as { error: unknown }).error));
+        return (out as Out).results;
+      };
+      const marked = (rs: Out["results"]) => rs.filter((r) => r.retry === true).map((r) => r.userId);
+      const tryAgain = (rs: Out["results"]) => rs.filter((r) => /try again/.test(r.reason ?? "")).map((r) => r.userId);
+      const FK = { code: "23503", message: "insert or update violates foreign key constraint" };
+
+      for (const action of ["grant_retry", "assign"] as const) {
+        const table = tableOf(action);
+        const run = (people: string[]) => (action === "grant_retry" ? callGrant(people) : callAssign(people));
+        const done = action === "grant_retry" ? "granted" : "assigned";
+
+        console.log(`\n${action === "grant_retry" ? "grantExtraAttempts" : "assignCourseDirect"}: a refusal every row shares (23503), five learners`);
+        seed({ attempts: action === "grant_retry" });
+        refuse = () => FK;
+        let rs = resultsOf(await run(five));
+        eq("the batch and exactly three rows tried alone; nobody saved, nobody reads \"try again\", nobody carries retry",
+          [insertsInto(table).length, rowsOf(insertsInto(table)).length, rs.filter((r) => r.status === done).length, tryAgain(rs), marked(rs), rs.every((r) => r.status === "failed")],
+          [4, 5 + 3, 0, [], [], true]);
+        eq("…the two not tried answered with the refusal", rs.slice(3).map((r) => r.reason), action === "grant_retry" ? ["the grant could not be saved", "the grant could not be saved"] : [FK.message, FK.message]);
+
+        console.log(`\n${action === "grant_retry" ? "grantExtraAttempts" : "assignCourseDirect"}: a refusal one row causes (23502, the first learner), five learners`);
+        seed({ attempts: action === "grant_retry" });
+        refuse = (_c, rows) => (rows.some((r) => r.user_id === five[0]) ? { code: "23502", message: "null value violates not-null constraint" } : null);
+        rs = resultsOf(await run(five));
+        eq("the batch and each of the five alone; the other four saved, the first failed, nobody marked",
+          [insertsInto(table).length, rs.map((r) => r.status), marked(rs)],
+          [6, ["failed", done, done, done, done], []]);
+
+        console.log(`\n${action === "grant_retry" ? "grantExtraAttempts" : "assignCourseDirect"}: four of five rows written by another request just before the insert (23505)`);
+        seed({ attempts: action === "grant_retry" });
+        let raced = false;
+        beforeWrite = (c) => {
+          if (raced || c.table !== table || !Array.isArray(c.body)) return;
+          raced = true;
+          for (const u of five.slice(0, 4)) {
+            world.tables[table].push(action === "grant_retry"
+              ? { organization_id: ORG, course_id: COURSE, user_id: u, status: "pending", used_at: null, decided_by: null, decided_at: null, expires_at: null }
+              : { organization_id: ORG, course_id: COURSE, assignee_type: "user", user_id: u, team_id: null, due_at: null, release_at: null, assigned_by: MANAGER });
+          }
+        };
+        rs = resultsOf(await run(five));
+        eq("the batch and each of the five alone (duplicates are never bounded); the fifth saved, the four already there",
+          [insertsInto(table).length, rs.map((r) => r.status), marked(rs)],
+          [6, action === "grant_retry" ? ["failed", "failed", "failed", "failed", done] : ["already", "already", "already", "already", done], []]);
+
+        console.log(`\n${action === "grant_retry" ? "grantExtraAttempts" : "assignCourseDirect"}: the insert's reply lost and nothing saved (the read-back finds nothing), three learners`);
+        seed({ attempts: action === "grant_retry" });
+        dropWrite = (c) => c.table === table;
+        const sendsBefore = learnerSends();
+        rs = resultsOf(await run(LEARNERS.slice(0, 3)));
+        const words = action === "grant_retry" ? "not confirmed: the grant may have been saved; try again" : "not confirmed: the assignment may have been saved; try again";
+        eq("each learner \"not confirmed\", marked retry; nobody mailed; one insert, no row written",
+          [rs.map((r) => [r.status, r.reason, r.retry ?? null]), learnerSends() - sendsBefore, insertsInto(table).length, world.tables[table].length],
+          [LEARNERS.slice(0, 3).map(() => ["failed", words, true]), 0, 1, 0]);
+      }
+
+      const dueIn30 = new Date(Date.now() + 30 * 86_400_000).toISOString().slice(0, 10);
+      const rowOf = (u: string) => world.tables.course_assignments.find((r) => r.assignee_type === "user" && r.user_id === u);
+      const three = LEARNERS.slice(0, 3);
+
+      console.log("\nassignCourseDirect with a due date: the reply lost, and the read-back finds the first learner's row written by another (their self-enrolment)");
+      seed();
+      dropWrite = (c) => c.table === "course_assignments";
+      beforeWrite = (c) => {
+        if (c.table !== "course_assignments" || rowOf(three[0])) return;
+        world.tables.course_assignments.push({ id: "0e900000-0000-4000-8000-000000000001", organization_id: ORG, course_id: COURSE, assignee_type: "user", user_id: three[0], team_id: null, due_at: null, release_at: null, assigned_by: three[0], source: "self" });
+      };
+      let rs = resultsOf(await callAssign(three, dueIn30));
+      eq("the first is a duplicate: its date written, the self row converted, no \"assigned\" mail; the other two not confirmed, marked retry",
+        [rs.map((r) => [r.status, r.reason ?? null, r.retry ?? null]), rowOf(three[0])?.due_at !== null, rowOf(three[0])?.source, rowOf(three[0])?.assigned_by, learnerSends()],
+        [[["assigned", "self-enrolment converted to an assignment", null],
+          ["failed", "not confirmed: the assignment may have been saved; try again", true],
+          ["failed", "not confirmed: the assignment may have been saved; try again", true]], true, "admin", ADMIN, 0]);
+
+      console.log("\nassignCourseDirect: the reply lost, the rows saved with the request's own id, after a first read that answered");
+      seed();
+      loseFirstInsertInto("course_assignments");
+      rs = resultsOf(await callAssign(three));
+      eq("each assigned and mailed", [rs.map((r) => [r.status, r.retry ?? null]), learnerSends()], [three.map(() => ["assigned", null]), 3]);
+
+      console.log("\nassignCourseDirect with a due date: the reply lost, the rows saved with the request's own id, after a first read that FAILED");
+      seed();
+      loseFirstInsertInto("course_assignments");
+      failRead = (c) => c.table === "course_assignments" && !calls.some((x) => x.method === "POST" && x.table === "course_assignments");
+      rs = resultsOf(await callAssign(three, dueIn30));
+      eq("each a duplicate: \"already assigned — due date updated\", the date written, no \"assigned\" mail",
+        [rs.map((r) => [r.status, r.reason ?? null, r.retry ?? null]), three.map((u) => rowOf(u)?.due_at !== null), calls.filter((c) => c.method === "PATCH" && c.table === "course_assignments").length > 0, learnerSends()],
+        [three.map(() => ["already", "already assigned — due date updated", null]), [true, true, true], true, 0]);
     }
 
     // The bulk grant (POST /api/attempt-requests/bulk) was one run, but its

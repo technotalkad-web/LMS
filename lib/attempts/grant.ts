@@ -76,14 +76,25 @@ import type { ActionError, PerLearnerResult } from "@/lib/actions/types";
  * ADR 0029 rule FP2, the writes: the grants are one insert. An insert whose
  * answer was lost (no database code: the fetch failed after it was sent)
  * may have been saved, so it is never tried again row by row: the rows are
- * read back (one call per 150 learners), and each row found was written by
- * this request, granted and mailed as usual; a row not found is failed.
+ * read back (one call per 150 learners) by the administrator and the exact
+ * `decided_at` the insert wrote, and each row found was written by this
+ * request, granted and mailed as usual. A lost reply says nothing about the
+ * write (the database may still be committing it), so a row the read-back
+ * does not find, or every row when the read-back fails, is "not confirmed"
+ * and nobody is mailed for it (ADR 0029, note of 2026-11-25, part 3, row 6).
  * Only an error one row causes (isRowError: a duplicate, a check) is tried
  * again one row at a time, and each of those inserts first asks the budget
  * for room: a row the request has no room left for is not tried, and
- * answered as not saved ("try again"). The mail's reads and the run's
- * opening are made only while they fit, so the request never passes the
- * limit on the writes' account.
+ * answered as not saved ("try again"). The pass stops once three rows tried
+ * alone were each refused with the batch's own code and none was saved,
+ * unless that code is 23505 (a duplicate is a row's own and never stops
+ * it): a refusal every row shares (a course deleted in the same minute) is
+ * not tried for each row until the room ends, and the rest are answered
+ * with that refusal (row 2). A row answered "not saved" for room or "not
+ * confirmed" carries `retry: true`: another press of the same action
+ * finishes it (part 2, point 6). The mail's reads and the run's opening are
+ * made only while they fit, so the request never passes the limit on the
+ * writes' account.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, user_id, status, score, started_at, completed_at, completion_status, success_status";
@@ -287,34 +298,55 @@ export async function grantExtraAttempts(
     }
     return found;
   };
+  const codeOf = (error: unknown) => (error as { code?: string } | null)?.code ?? null;
   const failedGrant = (g: (typeof grants)[number], error: unknown): PerLearnerResult => ({
     userId: g.uid,
     status: "failed",
-    reason: (error as { code?: string }).code === "23505" ? "already has an open request or grant" : "the grant could not be saved",
+    reason: codeOf(error) === "23505" ? "already has an open request or grant" : "the grant could not be saved",
   });
   /** Grants whose insert answered nothing (isLostReply): read back once, together. */
-  const lost: Array<{ g: (typeof grants)[number]; error: unknown }> = [];
+  const lost: Array<(typeof grants)[number]> = [];
   const batchError = grants.length > 0 ? await insertGrants(grants) : null;
   if (batchError && isLostReply(batchError)) {
-    for (const g of grants) lost.push({ g, error: batchError });
+    lost.push(...grants);
   } else if (batchError && grants.length > 1 && isRowError(batchError)) {
     // An error one row causes (23505: a grant made since the read): each row
     // on its own, so the others are granted, while the request has room.
+    // Bounded (part 3, row 2): once three rows alone were each refused with
+    // the batch's own code and none was saved, the refusal is every row's,
+    // and the rest are answered with it, untried. A lost reply may have
+    // saved its row, so after one the pass is not bounded. Never for 23505.
+    const shared = codeOf(batchError);
+    let refusedAlike = 0;
+    let maybeSaved = false;
     for (const g of grants) {
+      if (shared !== "23505" && !maybeSaved && refusedAlike >= 3) {
+        results[g.at] = failedGrant(g, batchError);
+        continue;
+      }
       const error = await insertGrants([g], room);
-      if (error === "no_room") results[g.at] = { userId: g.uid, status: "failed", reason: "not saved: the request had no room left; try again" };
-      else if (error && isLostReply(error)) lost.push({ g, error });
-      else if (error) results[g.at] = failedGrant(g, error);
+      if (error === "no_room") results[g.at] = { userId: g.uid, status: "failed", reason: "not saved: the request had no room left; try again", retry: true };
+      else if (error && isLostReply(error)) {
+        lost.push(g);
+        maybeSaved = true;
+      } else if (error) {
+        results[g.at] = failedGrant(g, error);
+        if (codeOf(error) === shared) refusedAlike++;
+      } else maybeSaved = true;
     }
   } else if (batchError) {
     // The whole insert's error: nothing was saved, and no row is tried again.
     for (const g of grants) results[g.at] = failedGrant(g, batchError);
   }
   if (lost.length > 0) {
-    const found = await readBack(lost.map((x) => x.g));
-    for (const { g, error } of lost) {
-      if (found === "unconfirmed") results[g.at] = { userId: g.uid, status: "failed", reason: "not confirmed: the grant may have been saved; try again" };
-      else if (!found.has(g.uid)) results[g.at] = failedGrant(g, error);
+    // Not found is not "not saved" (row 6): the database may still be
+    // committing the write. Not confirmed, marked for another press, and
+    // nobody is mailed for it.
+    const found = await readBack(lost);
+    for (const g of lost) {
+      if (found === "unconfirmed" || !found.has(g.uid)) {
+        results[g.at] = { userId: g.uid, status: "failed", reason: "not confirmed: the grant may have been saved; try again", retry: true };
+      }
     }
   }
 

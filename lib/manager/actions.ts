@@ -32,7 +32,7 @@ import {
 import { loadScopes } from "@/lib/content/scopes";
 import { loadManagerContext, partitionByScope, type ManagerContext } from "./access";
 import { isVisible, loadCoverage } from "./coverage";
-import { computeLearnerInsights } from "./insights";
+import { readCourseReminderLines } from "./insights";
 
 /**
  * Manager actions. Since Phase 4a (approved addendum, decision 12) managers
@@ -49,7 +49,11 @@ import { computeLearnerInsights } from "./insights";
  * reporting line here), each call where it is made, every page and
  * fallback of the reminder's reads included, so the reminders' mail is
  * sized on the calls really made and stops at the limit: the rest is
- * answered as not sent for room ("try again").
+ * answered as not sent for room ("try again"). A course reminder decides
+ * who is due with its own read, narrowed to the named learners and the
+ * course (readCourseReminderLines, ADR 0029 note of 2026-11-25, part 1),
+ * not with the Report Card's reader of the whole organisation; each press
+ * then mails the next learners due.
  */
 
 export type ManagerActionContext = {
@@ -214,26 +218,26 @@ export async function sendReminders(
     const scopes = await loadScopes(a.svc, a.org.id, [{ type: "course", id: course.id }], count);
     if (!isVisible(coverage, scopes.get(`course:${course.id}`))) return { error: "Course not found", status: 404 };
     // Re-derive entitlement and status NOW (dynamic groups change; the page
-    // the manager clicked may be stale): the same rules as the Report Card,
-    // narrowed to this course. Not assigned/attempted → skip; official result
-    // already in → skip. The assignments decide who is mailed, so their reads
-    // are strict (groups included): a failed read answers 503 and sends
-    // nothing (ADR 0029, part 3), never "not assigned this course".
-    let learners: Awaited<ReturnType<typeof computeLearnerInsights>>["learners"];
+    // the manager clicked may be stale), with the reminder's own read (ADR
+    // 0029, note of 2026-11-25, part 1): for the named learners and this
+    // course only, by the Report Card's rules, whether each has a line and
+    // its status (readCourseReminderLines, beside the Report Card's reader).
+    // No line → skip; official result already in → skip. Every read of it
+    // decides who is mailed, so each is strict: a failed read, the grants'
+    // included, answers 503 and sends nothing (stage 2's one rule), never
+    // "not assigned this course". Each call is counted where it is made.
+    let lines: Awaited<ReturnType<typeof readCourseReminderLines>>;
     try {
-      ({ learners } = await computeLearnerInsights(a.svc, {
+      lines = await readCourseReminderLines(a.svc, {
         orgId: a.org.id,
-        orgSlug: a.org.slug,
+        courseId: course.id,
+        courseActive: course.is_active !== false,
         userIds: ids,
-        periodDays: null,
-        content: `course:${course.id}`,
-        strictGroups: true,
         countCall: count,
-      }));
+      });
     } catch {
       return { error: "The learners' assignments could not be read. Nothing was sent; try again.", status: 503 };
     }
-    const lineOf = new Map(learners.map((l) => [l.userId, l.courses.find((c) => c.courseId === course.id) ?? null]));
     spendCalls(budget, 1);
     const { data: stateRows, error: stateErr } = await a.svc
       .from("reminder_state")
@@ -250,15 +254,8 @@ export async function sendReminders(
     for (const uid of ids) {
       const who = people.get(uid);
       if (!who?.email) { byUser.set(uid, { userId: uid, status: "skipped", reason: "no email" }); continue; }
-      const line = lineOf.get(uid);
+      const line = lines.get(uid);
       if (!line) { byUser.set(uid, { userId: uid, status: "skipped", reason: "not assigned this course" }); continue; }
-      // ADR 0014:188: with the learner's grant read
-      // failed the line carries no status, so nothing is sent or recorded:
-      // they may already have passed.
-      if (line.historyUnavailable || line.status === "unavailable") {
-        byUser.set(uid, { userId: uid, status: "skipped", reason: "records could not be read; try again" });
-        continue;
-      }
       if (line.status === "completed" || line.status === "passed" || line.status === "failed") {
         byUser.set(uid, { userId: uid, status: "skipped", reason: "already completed" });
         continue;

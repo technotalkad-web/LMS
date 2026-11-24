@@ -150,6 +150,7 @@ const READS: Record<string, Entry> = {
   "lib/notifications/smtp-state.ts#organisationsWithActiveMembers#1": { cls: "subject", reason: "health check and console (ADR 0029 step 17): which organisations that would warn have an active member, by organisation id only" },
   "lib/org/groups.ts#q#1": { cls: "subject", reason: "dynamic group members (active rows)" },
   "lib/org/groups.ts#q#2": { cls: "subject", reason: "dynamic group members (active rows), the strict reader for mail (ADR 0029): a failed read is never nobody" },
+  "lib/org/groups.ts#q#3": { cls: "subject", reason: "the named learners' own fields for dynamic group rules (active rows), the strict reader for named people (ADR 0029, note of 2026-11-25): a failed read is never nobody" },
   "lib/org/reporting-line.ts#q#1": { cls: "subject", reason: "the whole hierarchy, every status by design" },
   "lib/tickets/actions.ts#actOnTicket#1": { cls: "subject", reason: "the people a ticket names (active rows)" },
   "lib/users/people.ts#memberIdsInOrg#1": { cls: "subject", reason: "ids that are rows of the org (fetchByIds)" },

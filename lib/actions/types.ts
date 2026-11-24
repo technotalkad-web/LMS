@@ -3,6 +3,13 @@ export type PerLearnerResult = {
   userId: string;
   status: "sent" | "skipped" | "failed" | "granted" | "assigned" | "already";
   reason?: string;
+  /**
+   * Set only on a row that another press of the same action finishes (ADR
+   * 0029, note of 2026-11-25, part 2, point 6): not saved for want of the
+   * request's room, or its save not confirmed. A caller reads this mark,
+   * never the reason's words.
+   */
+  retry?: true;
 };
 
 /** 503: a check could not be read (ADR 0030: "try again", never a refusal or a grant). */

@@ -477,8 +477,12 @@ console.log("\nthe eight paged attempts reads use readPagedWithOptionalColumn, e
     ],
     "lib/manager/insights.ts": [
       // ADR 0024 P2-3: the preview filter inside, one decision for every chunk.
-      ["the call: by user chunk of 150, in id order, one decision for every chunk, previews dropped",
-        /const decided: OptionalColumnState = \{ columns: null \};\s*const previews: ContextFilterState = \{ applies: null \};\s*for \(const part of chunk\(\[\.\.\.new Set\(userIds\.filter\(Boolean\)\)\], 150\)\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(cols, from, to\)[^=]*=>\s*readWithContextFilter\(previews, \(apply\) => \{\s*countCall\?\.\(\);\s*return withoutPreviews\(svc\.from\("course_attempts"\)\.select\(cols\)\.in\("user_id", part\)\.eq\("organization_id", orgId\), apply\)\s*\.order\("id"\)\s*\.range\(from, to\);\s*\}\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\);/],
+      // ADR 0029, note of 2026-11-25: the manager's reminder reads through it
+      // narrowed to one course's versions (50 learners beside at most 100
+      // versions a call, an answer that is not a list an error); the Report
+      // Card passes no versions and reads by user chunk of 150, as before.
+      ["the call: by user chunk of 150 (50 beside the course's versions for the reminder), in id order, one decision for every chunk, previews dropped",
+        /const decided: OptionalColumnState = \{ columns: null \};\s*const previews: ContextFilterState = \{ applies: null \};\s*for \(const part of chunk\(\[\.\.\.new Set\(userIds\.filter\(Boolean\)\)\], strict \? 50 : 150\)\) \{\s*for \(const versions of strict \? chunk\(\[\.\.\.new Set\(versionIds\)\], 100\) : \[null\]\) \{\s*const res = await readPagedWithOptionalColumn<unknown>\(\s*"is_revision",\s*\(cols, from, to\)[^=]*=>\s*readWithContextFilter\(previews, \(apply\) => \{\s*countCall\?\.\(\);\s*const q = withoutPreviews\(svc\.from\("course_attempts"\)\.select\(cols\)\.in\("user_id", part\)\.eq\("organization_id", orgId\), apply\);\s*return \(versions \? q\.in\("course_version_id", versions\) : q\)\.order\("id"\)\.range\(from, to\);\s*\}\),\s*ATTEMPT_COLUMNS,\s*\{ state: decided, nullIsError: strict \}\s*\);/],
       ["the error rule: any error throws, as fetchByIds does", /if \(res\.error\) throw new Error\(`course_attempts: \$\{res\.error\.message \?\? ""\}`\);/],
     ],
     "app/api/attempt-requests/bulk/route.ts": [
