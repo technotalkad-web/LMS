@@ -323,8 +323,7 @@ async function main() {
     {
       // Pressing again now helps (part 1, point 7): those emailed read
       // "reminded in the last day" and the next are emailed; nobody twice.
-      // Measured: the second press, with 11 due, emails 10 of them (the run
-      // sizes its last group on the learners left as well as on the room).
+      // Measured: the second press, with 11 due, emails 10 of them.
       console.log("\nPOST /api/manager/remind, a course target, a team of 20: a second press");
       const team = seed(20);
       const first = outcome(((await remind(bodyFor("course", team))).body.results as Row[] | undefined) ?? []);
@@ -344,10 +343,27 @@ async function main() {
       const r = await remind(bodyFor("course", team));
       const o = outcome((r.body.results as Row[] | undefined) ?? []);
       const m = measure();
-      // Measured: the two calls more come out of the room the run's last
-      // group had spare, so as many are emailed as in an organisation of 21.
+      // Measured: 9 emailed, as many as in an organisation of 21.
       eq("200; the read 3 calls, two pages of members more before the run (17), 37 in all, within 40; 9 emailed, the other 11 left for room",
         [r.status, m.reader, m.beforeRun, o.total, o.total <= 40, o.sent, o.left, o.other], [200, 3, 17, 37, true, 9, 11, []]);
+    }
+
+    // The edge of the first send (roomForFirstSend): it needs 10 calls of
+    // room after the reads. Every step's 25 before the run, plus the
+    // reporting line's pages beyond the first: six pages of members make 30
+    // (the last count that still mails), seven make 31, where the run is not
+    // opened and every learner due is answered as left for room.
+    for (const [pages, others, before, mailed] of [[6, 5_500, 30, true], [7, 6_500, 31, false]] as const) {
+      console.log(`\nPOST /api/manager/remind, a course target, every step, a team of 20 in an organisation of ${pages} pages of members`);
+      const team = seed(20, { kind: "every", others });
+      const r = await remind(bodyFor("course", team));
+      const o = outcome((r.body.results as Row[] | undefined) ?? []);
+      const m = measure();
+      eq(`200; the read 13 calls, ${before} before the run, within 40; ${mailed ? "the run opened and somebody emailed" : "the run not opened: nobody emailed, all 11 due left for room"}`,
+        [r.status, m.reader, m.beforeRun, o.total <= 40, opened(), o.sent > 0, o.sent + o.left, o.other],
+        [200, 13, before, true, mailed, mailed, 11, ["1 skipped: already completed", "8 skipped: not assigned this course"]]);
+      if (!mailed) eq("…the whole request is its reads: no send, no log row, no state written", [o.total, ...nothingDone()], [before, 0, 0, 0, false]);
+      else eq("…measured: 1 emailed, 38 calls in all", [o.sent, o.total], [1, 38]);
     }
 
     console.log("\nPOST /api/manager/remind, a course target: a failed read of the reminder's, step by step (part 1, point 9)");
