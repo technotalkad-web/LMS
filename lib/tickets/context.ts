@@ -13,12 +13,17 @@ export type ContextError = { error: string; status: 400 | 403 };
  * content must belong to the org (its title is taken from the database), and
  * the viewer must be a manager at all. Refuses the whole ticket on any
  * out-of-scope id — never a partial ticket.
+ *
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call
+ * made here (the hierarchy's pages and the content), so a request that
+ * counts its calls counts these.
  */
 export async function validateManagerContext(
   svc: SupabaseClient,
   orgId: string,
   viewerId: string,
-  raw: unknown
+  raw: unknown,
+  countCall?: () => unknown
 ): Promise<{ context: TicketContext; level: number } | ContextError> {
   const r = (raw && typeof raw === "object" ? raw : {}) as Record<string, unknown>;
   const idsRaw = Array.isArray(r.userIds) ? r.userIds : [];
@@ -26,7 +31,7 @@ export async function validateManagerContext(
   if (!idsRaw.every((x) => typeof x === "string" && UUID_RE.test(x))) return { error: "userIds must be ids", status: 400 };
   const userIds = [...new Set(idsRaw as string[])];
 
-  const ctx = await loadManagerContext(svc, orgId, viewerId);
+  const ctx = await loadManagerContext(svc, orgId, viewerId, countCall);
   if (!ctx.isManager) return { error: "Only a manager may raise a ticket from the Report Card", status: 403 };
   if (userIds.some((id) => !ctx.scope.all.has(id))) return { error: "Someone named is outside your reporting line", status: 403 };
 
@@ -38,6 +43,7 @@ export async function validateManagerContext(
   if (contentKind && contentIdRaw) {
     const table = contentKind === "course" ? "courses" : contentKind === "path" ? "learning_paths" : "journey_programs";
     const col = contentKind === "course" ? "id, title" : "id, name";
+    countCall?.();
     const { data } = await svc.from(table).select(col).eq("id", contentIdRaw).eq("organization_id", orgId).maybeSingle();
     const row = data as { id: string; title?: string; name?: string } | null;
     if (!row) return { error: "Content not found", status: 400 };

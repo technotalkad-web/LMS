@@ -15,6 +15,17 @@
  * computeLearnerInsights and refreshOrgCache run over a recording fake of
  * the supabase-js query builder.
  *
+ * ADR 0029, note of 2026-11-25, part 1: the manager's course reminder reads
+ * its own lines (readCourseReminderLines, in lib/manager/insights.ts beside
+ * the Report Card's reader). Over the same fake, for every world of the
+ * note (a person's, a team's, a group's and the organisation's rows, the
+ * paths, an inactive course, every kind of attempt, a stored rule that is
+ * not the default), it answers what computeLearnerInsights answers with the
+ * course's lens, learner by learner: a line or none, and its status. Its
+ * calls are pinned for each world of the note's sums, for 5 and 50 learners
+ * in an organisation of 100 and of 2,500, and every read is strict (the
+ * strict cases of stage 2 moved here from computeLearnerInsights's option).
+ *
  * Run:  npx tsx tests/unit/report-card.test.ts
  * (No DB. Typechecked by `npm run typecheck`.)
  */
@@ -42,7 +53,7 @@ import { l2GroupsOf, type ManagerContext } from "../../lib/manager/access";
 import { resolveManagerScope, type HierarchyMember } from "../../lib/org/reporting-line";
 import { deriveLearner } from "../../lib/manager/derive";
 import { applyCoverage } from "../../lib/manager/coverage";
-import { computeLearnerInsights } from "../../lib/manager/insights";
+import { computeLearnerInsights, readCourseReminderLines } from "../../lib/manager/insights";
 import { refreshOrgCache } from "../../lib/manager/cache";
 
 let pass = 0, fail = 0;
@@ -367,9 +378,11 @@ type Answer = { data?: unknown; error?: unknown };
 type Row = Record<string, unknown>;
 
 /**
- * Answers every read from `tables` with the eq / in / is filters applied (a
- * filter on a column the row does not carry is ignored); `override` may
- * answer a query first (an error, say). Records every query.
+ * Answers every read from `tables` with the eq / neq / in / is filters
+ * applied (a filter on a column the row does not carry is ignored), then, as
+ * the server does, at most 1,000 rows: the `range` asked, or the first 1,000
+ * (in the tables' own order, a stable one). `override` may answer a query
+ * first (an error, say). Records every query.
  */
 function fakeDb(tables: Record<string, Row[]>, override?: (q: Query) => Answer | undefined) {
   const queries: Query[] = [];
@@ -391,16 +404,25 @@ function fakeDb(tables: Record<string, Row[]>, override?: (q: Query) => Answer |
         let rows = tables[table] ?? [];
         for (const { op, args } of q.ops) {
           const [col, val] = args as [string, unknown];
-          const keep = (r: Row) => !(col in r) || (op === "eq" ? r[col] === val : op === "in" ? (val as unknown[]).includes(r[col]) : op === "is" ? r[col] === val : true);
-          if (op === "eq" || op === "in" || op === "is") rows = rows.filter(keep);
+          const keep = (r: Row) => !(col in r) || (op === "eq" ? r[col] === val : op === "neq" ? r[col] !== val : op === "in" ? (val as unknown[]).includes(r[col]) : op === "is" ? r[col] === val : true);
+          if (op === "eq" || op === "neq" || op === "in" || op === "is") rows = rows.filter(keep);
         }
-        return { data: rows, error: null };
+        // The server's row cap: the page asked, never more than 1,000 rows.
+        const range = q.ops.find((x) => x.op === "range");
+        const [from, to] = range ? (range.args as [number, number]) : [0, 999];
+        return { data: rows.slice(from, Math.min(to + 1, from + 1000)), error: null };
       };
       const settle = () => Promise.resolve({ data: null, error: null, count: null, ...answer() });
       b.maybeSingle = () => settle().then((r) => ({ ...r, data: Array.isArray(r.data) ? r.data[0] ?? null : r.data }));
       b.single = b.maybeSingle;
       b.then = (res: (v: unknown) => unknown, rej?: (e: unknown) => unknown) => settle().then(res, rej);
       return b;
+    },
+    /** A database function, recorded as the table "rpc/<name>": no rows unless `tables` or `override` say otherwise. */
+    rpc(name: string, args: unknown) {
+      const q: Query = { table: `rpc/${name}`, ops: [{ op: "rpc", args: [args] }] };
+      queries.push(q);
+      return Promise.resolve({ data: tables[q.table] ?? [], error: null, ...(override?.(q) ?? {}) });
     },
   };
   return { client: client as never, queries };
@@ -588,6 +610,388 @@ async function insightsCases() {
     eq("a degraded batch: no upsert, counted as skipped_unreadable and pending", [bad, failing.db.queries.some((q) => q.table === "report_card_cache" && q.ops.some((o) => o.op === "upsert"))], [{ learners: 0, batches: 0, pending: 1, skipped_unreadable: 1 }, false]);
     eq("the refresh logs once that it skipped", lines.map((x) => JSON.parse(x).event), ["report_card_grants_unreadable", "report_card_cache_skipped_unreadable"]);
   }
+
+  await reminderReadCases();
+}
+
+/* ---------------- the reminder's own read (ADR 0029, note of 2026-11-25, part 1) ---------------- */
+
+/** A case that throws (the reader missing, say) is one failed case, and the file goes on. */
+async function guarded(n: string, fn: () => Promise<void>) {
+  try {
+    await fn();
+  } catch (e) {
+    fail++;
+    console.log(`  ✗ ${n} — threw: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+type Tables = Record<string, Row[]>;
+const FUTURE = iso("2026-12-01T00:00:00Z");
+const PAST = iso("2026-10-01T00:00:00Z");
+let seq = 0;
+const nextId = (p: string) => `${p}-${String(++seq).padStart(4, "0")}`;
+/** An active member of org1 with every field a group's rule reads. */
+const member = (u: string, over: Row = {}): Row => ({
+  organization_id: "org1", user_id: u, status: "active", designation: null, job_role: null, city: "Pune", state: null,
+  business_vertical: "V1", branch: null, department: null, line_manager_id: null, date_of_joining: null, ...over,
+});
+/** A course_assignments row of c1, released, for nobody until `over` says whom. */
+const courseRow = (over: Row): Row => ({
+  id: nextId("ca"), organization_id: "org1", course_id: "c1", assignee_type: "user", user_id: null, team_id: null, group_id: null,
+  due_at: null, release_at: null, assigned_at: PAST, ...over,
+});
+const ownRow = (u: string, over: Row = {}) => courseRow({ assignee_type: "user", user_id: u, ...over });
+/** A learning_path_assignments row. */
+const pathRow = (path: string, over: Row): Row => ({
+  id: nextId("pa"), organization_id: "org1", path_id: path, assignee_type: "user", user_id: null, team_id: null, group_id: null,
+  due_at: null, assigned_at: PAST, ...over,
+});
+/** A learner's row on c1's version v1, in org1, individual (not a preview). */
+const att = (u: string, over: Row = {}): Row =>
+  attempt({ id: nextId(`att-${u}`), user_id: u, organization_id: "org1", context_kind: "individual", course_version_id: "v1", ...over });
+const inProgress: Row = { status: "in_progress", completion_status: "in_progress", success_status: "unknown", score: null, completed_at: null };
+const failedRow: Row = { success_status: "failed", score: 0.4 };
+const grantOf = (u: string, usedAttempt: string): Row => ({ ...grant(nextId("g"), u, usedAttempt), organization_id: "org1" });
+const group = (id: string, type: "static" | "dynamic", rules: Row = {}, active = true): Row =>
+  ({ id, organization_id: "org1", name: id, group_type: type, rules, is_active: active });
+
+/** The reminder's world: org1, the course c1 (version v1) and c2 (version v2), `users` as active members, nothing assigned. */
+function readerDb(users: string[], patch: (t: Tables) => void, override?: (q: Query) => Answer | undefined, others = 0) {
+  const t: Tables = {
+    courses: [{ id: "c1", organization_id: "org1", title: "Alpha", is_active: true }, { id: "c2", organization_id: "org1", title: "Beta", is_active: true }],
+    course_versions: [{ id: "v1", course_id: "c1", unit_count: null }, { id: "v2", course_id: "c2", unit_count: null }],
+    learning_paths: [], learning_path_courses: [], learning_path_assignments: [],
+    course_assignments: [], team_members: [], org_groups: [], org_group_members: [],
+    organization_members: [...users.map((u) => member(u)), ...Array.from({ length: others }, (_, i) => member(`x${i + 1}`))],
+    profiles: users.map((u) => ({ id: u, first_name: u.toUpperCase(), last_name: null, email: `${u}@example.test`, avatar_url: null })),
+    course_attempts: [], attempt_requests: [], revision_visits: [],
+  };
+  patch(t);
+  return { db: fakeDb(t, override), tables: t };
+}
+const usersOf = (n: number) => Array.from({ length: n }, (_, i) => `u${i + 1}`);
+/**
+ * c1 assigned to the dynamic group g6, whose rule is the team t6: 1,500
+ * other active members (m1 to m1500) in it first, then u1 to u3. A named u4
+ * is in no team. Past the server's 1,000-row cap, a team read that is not
+ * paged loses u1 to u3.
+ */
+const bigTeam = (t: Tables) => {
+  t.org_groups.push(group("g6", "dynamic", { team_ids: ["t6"] }));
+  t.course_assignments.push(courseRow({ assignee_type: "group", group_id: "g6" }));
+  for (let i = 1; i <= 1_500; i++) {
+    t.organization_members.push(member(`m${i}`));
+    t.team_members.push({ team_id: "t6", user_id: `m${i}` });
+  }
+  t.team_members.push(...["u1", "u2", "u3"].map((u) => ({ team_id: "t6", user_id: u })));
+};
+
+/** The Report Card's line for c1 (its status, or null for no line), learner by learner, and the reminder's. */
+async function bothReaders(users: string[], db: ReturnType<typeof fakeDb>, courseActive: boolean) {
+  const card = await captureWarn(() => computeLearnerInsights(db.client, { orgId: "org1", orgSlug: "acme", userIds: users, periodDays: 30, content: "course:c1", now: NOW }));
+  const cardLines = users.map((u) => card.value.learners.find((l) => l.userId === u)?.courses.find((c) => c.courseId === "c1")?.status ?? null);
+  const lines = await readCourseReminderLines(db.client, { orgId: "org1", courseId: "c1", courseActive, userIds: users, now: NOW });
+  return { card: cardLines, reader: users.map((u) => lines.get(u)?.status ?? null) };
+}
+
+async function reminderReadCases() {
+  console.log("\nADR 0029 (note of 2026-11-25, part 1) — the reminder's read answers what the Report Card answers, learner by learner");
+  type World = { label: string; users: string[]; patch: (t: Tables) => void; card: Array<string | null>; courseActive?: boolean };
+  const worlds: World[] = [
+    { label: "a row of their own: released, not yet released, released in the past", users: usersOf(3),
+      patch: (t) => t.course_assignments.push(ownRow("u1"), ownRow("u2", { release_at: FUTURE }), ownRow("u3", { release_at: PAST })),
+      card: ["not_started", null, "not_started"] },
+    { label: "the organisation's row", users: usersOf(2),
+      patch: (t) => t.course_assignments.push(courseRow({ assignee_type: "org" })), card: ["not_started", "not_started"] },
+    { label: "the organisation's row, not yet released", users: usersOf(2),
+      patch: (t) => t.course_assignments.push(courseRow({ assignee_type: "org", release_at: FUTURE })), card: [null, null] },
+    { label: "a team's row: a member and a non-member", users: usersOf(2),
+      patch: (t) => {
+        t.course_assignments.push(courseRow({ assignee_type: "team", team_id: "t1" }));
+        t.team_members.push({ team_id: "t1", user_id: "u1" }, { team_id: "t1", user_id: "x-not-named" });
+      }, card: ["not_started", null] },
+    { label: "a static group: a member, a member who is not active, an inactive group's member, a non-member", users: usersOf(4),
+      patch: (t) => {
+        t.org_groups.push(group("g1", "static"), group("g2", "static", {}, false));
+        t.course_assignments.push(courseRow({ assignee_type: "group", group_id: "g1" }), courseRow({ assignee_type: "group", group_id: "g2" }));
+        t.org_group_members.push({ group_id: "g1", user_id: "u1" }, { group_id: "g1", user_id: "u2" }, { group_id: "g2", user_id: "u3" });
+        t.organization_members = t.organization_members.map((m) => (m.user_id === "u2" ? { ...m, status: "inactive" } : m));
+      }, card: ["not_started", "not_started", null, null] },
+    { label: "a dynamic group by a field rule: a member, a non-member, a member who is not active", users: usersOf(3),
+      patch: (t) => {
+        t.org_groups.push(group("g3", "dynamic", { verticals: ["V9"] }));
+        t.course_assignments.push(courseRow({ assignee_type: "group", group_id: "g3" }));
+        t.organization_members = t.organization_members.map((m) =>
+          m.user_id === "u1" ? { ...m, business_vertical: "V9" } : m.user_id === "u3" ? { ...m, business_vertical: "V9", status: "inactive" } : m);
+      }, card: ["not_started", null, null] },
+    { label: "a dynamic group by a team rule, and an inactive dynamic group that holds everybody", users: usersOf(3),
+      patch: (t) => {
+        t.org_groups.push(group("g4", "dynamic", { team_ids: ["t2"] }), group("g5", "dynamic", { verticals: ["V1"] }, false));
+        t.course_assignments.push(courseRow({ assignee_type: "group", group_id: "g4" }), courseRow({ assignee_type: "group", group_id: "g5" }));
+        t.team_members.push({ team_id: "t2", user_id: "u1" }, { team_id: "t2", user_id: "u3" });
+        t.organization_members = t.organization_members.map((m) => (m.user_id === "u3" ? { ...m, status: "inactive" } : m));
+      }, card: ["not_started", null, null] },
+    { label: "a path: active with a released step, assigned to a person, a team, a static and a dynamic group; an unreleased step; an inactive path", users: usersOf(6),
+      patch: (t) => {
+        t.learning_paths.push({ id: "p1", organization_id: "org1", name: "P1", is_active: true }, { id: "p2", organization_id: "org1", name: "P2", is_active: true }, { id: "p3", organization_id: "org1", name: "P3", is_active: false });
+        t.learning_path_courses.push(
+          { path_id: "p1", course_id: "c1", step_number: 1, release_at: null },
+          { path_id: "p2", course_id: "c1", step_number: 1, release_at: FUTURE },
+          { path_id: "p3", course_id: "c1", step_number: 1, release_at: null },
+        );
+        t.org_groups.push(group("g1", "static"), group("g3", "dynamic", { verticals: ["V9"] }));
+        t.org_group_members.push({ group_id: "g1", user_id: "u3" });
+        t.team_members.push({ team_id: "t1", user_id: "u2" });
+        t.organization_members = t.organization_members.map((m) => (m.user_id === "u4" ? { ...m, business_vertical: "V9" } : m));
+        t.learning_path_assignments.push(
+          pathRow("p1", { assignee_type: "user", user_id: "u1" }), pathRow("p1", { assignee_type: "team", team_id: "t1" }),
+          pathRow("p1", { assignee_type: "group", group_id: "g1" }), pathRow("p1", { assignee_type: "group", group_id: "g3" }),
+          pathRow("p2", { assignee_type: "user", user_id: "u5" }), pathRow("p3", { assignee_type: "user", user_id: "u6" }),
+        );
+      }, card: ["not_started", "not_started", "not_started", "not_started", null, null] },
+    { label: "a path assigned to the organisation", users: usersOf(2),
+      patch: (t) => {
+        t.learning_paths.push({ id: "p1", organization_id: "org1", name: "P1", is_active: true });
+        t.learning_path_courses.push({ path_id: "p1", course_id: "c1", step_number: 1, release_at: PAST });
+        t.learning_path_assignments.push(pathRow("p1", { assignee_type: "org" }));
+      }, card: ["not_started", "not_started"] },
+    { label: "an inactive course: its own row, a team's row and a path give nothing; rows still give a line", users: usersOf(5), courseActive: false,
+      patch: (t) => {
+        t.courses = t.courses.map((c) => (c.id === "c1" ? { ...c, is_active: false } : c));
+        t.course_assignments.push(ownRow("u1"), courseRow({ assignee_type: "team", team_id: "t1" }));
+        t.team_members.push({ team_id: "t1", user_id: "u4" });
+        t.course_attempts.push(att("u2", inProgress), att("u3"));
+        t.learning_paths.push({ id: "p1", organization_id: "org1", name: "P1", is_active: true });
+        t.learning_path_courses.push({ path_id: "p1", course_id: "c1", step_number: 1, release_at: null });
+        t.learning_path_assignments.push(pathRow("p1", { assignee_type: "user", user_id: "u5" }));
+      }, card: [null, "in_progress", "passed", null, null] },
+  ];
+  /**
+   * The attempts, with no assignment row (a line from the rows alone) and
+   * with a row of their own for everybody: none; in progress; passed;
+   * failed; completed with no verdict; abandoned only; a revision visit
+   * only; a preview only; passed with a granted retake running; passed with
+   * a granted retake completed and failed; passed with a granted retake that
+   * was reset; a row on another course's version.
+   */
+  const attempts = (t: Tables) => {
+    t.course_attempts.push(
+      att("u2", inProgress),
+      att("u3"),
+      att("u4", failedRow),
+      att("u5", { success_status: "unknown", score: null }),
+      att("u6", { ...inProgress, status: "abandoned" }),
+      att("u7", { ...inProgress, is_revision: true }),
+      att("u8", { context_kind: "preview" }),
+      att("u9"), att("u9", { ...inProgress, id: "t9", started_at: iso("2026-11-03T08:00:00Z") }),
+      att("u10"), att("u10", { ...failedRow, id: "t10", started_at: iso("2026-10-20T09:00:00Z"), completed_at: iso("2026-10-20T11:00:00Z") }),
+      att("u11"), att("u11", { ...inProgress, id: "t11", status: "abandoned", started_at: iso("2026-10-20T09:00:00Z") }),
+      att("u12", { course_version_id: "v2" }),
+    );
+    t.attempt_requests.push(grantOf("u9", "t9"), grantOf("u10", "t10"), grantOf("u11", "t11"));
+  };
+  worlds.push(
+    { label: "the attempts, with no assignment row", users: usersOf(12), patch: attempts,
+      card: [null, "in_progress", "passed", "failed", "completed", "not_started", "not_started", null, "in_progress", "failed", "passed", null] },
+    { label: "the same attempts, each learner with a row of their own", users: usersOf(12),
+      patch: (t) => { attempts(t); for (const u of usersOf(12)) t.course_assignments.push(ownRow(u)); },
+      card: ["not_started", "in_progress", "passed", "failed", "completed", "not_started", "not_started", "not_started", "in_progress", "failed", "passed", "not_started"] },
+    // A stored rule that is not the default: three scored attempts, the best
+    // official. normalizePolicy clamps it to the default (one attempt, the
+    // first), so the Report Card reads the first attempt's fail, as the
+    // reminder does without reading the rule. If the clamp is ever lifted,
+    // the Report Card reads the second attempt's pass and this case goes red.
+    { label: "a stored rule that is not the default (three attempts, the best official), clamped", users: usersOf(1),
+      patch: (t) => {
+        t.course_assignments.push(ownRow("u1"));
+        t.course_attempts.push(
+          att("u1", { ...failedRow, started_at: iso("2026-10-01T09:00:00Z"), completed_at: iso("2026-10-01T10:00:00Z") }),
+          att("u1", { score: 0.95, started_at: iso("2026-10-05T09:00:00Z"), completed_at: iso("2026-10-05T10:00:00Z") }),
+        );
+        t["rpc/effective_attempt_policies"] = [{ course_id: "c1", max_scored_attempts: 3, official_basis: "best", official_attempt_number: null, retain_first_attempt: true, after_limit: "practice", source: "course", source_id: "c1" }];
+      }, card: ["failed"] },
+  );
+  // Past the server's 1,000-row cap: the fake answers at most 1,000 rows a
+  // call, so a read that is not paged loses the rows after them.
+  worlds.push(
+    { label: "a dynamic group whose team has 1,500 other members before the named learners (past the server's 1,000-row cap), and a named learner in no team", users: usersOf(4),
+      patch: bigTeam, card: ["not_started", "not_started", "not_started", null] },
+    { label: "an organisation with 1,200 other courses and 1,200 other paths before the course and its path (past the cap): a row of their own, a path", users: usersOf(2),
+      patch: (t) => {
+        t.courses = [...Array.from({ length: 1_200 }, (_, i) => ({ id: `cx${i + 1}`, organization_id: "org1", title: `Course ${i + 1}`, is_active: true })), ...t.courses];
+        t.learning_paths.push(...Array.from({ length: 1_200 }, (_, i) => ({ id: `px${i + 1}`, organization_id: "org1", name: `Path ${i + 1}`, is_active: true })));
+        t.learning_paths.push({ id: "p1", organization_id: "org1", name: "P1", is_active: true });
+        t.learning_path_courses.push({ path_id: "p1", course_id: "c1", step_number: 1, release_at: null });
+        t.course_assignments.push(ownRow("u1"));
+        t.learning_path_assignments.push(pathRow("p1", { assignee_type: "user", user_id: "u2" }));
+      }, card: ["not_started", "not_started"] },
+  );
+  for (const w of worlds) {
+    await guarded(w.label, async () => {
+      const { db } = readerDb(w.users, w.patch);
+      const r = await bothReaders(w.users, db, w.courseActive ?? true);
+      eq(`${w.label}: the Report Card's lines (the world tests what it names)`, r.card, w.card);
+      eq("…the reminder's read: the same line, or none, and the same status, for every learner", r.reader, r.card);
+    });
+  }
+
+  console.log("\nthe Report Card reads a dynamic group's team in pages (lib/org/groups.ts resolveGroupMembers), and a failed read still reads as no team members");
+  {
+    const users = usersOf(5);
+    /** bigTeam, and u5's row first, so the first page holds a named learner. */
+    const patch = (t: Tables) => {
+      bigTeam(t);
+      t.team_members.unshift({ team_id: "t6", user_id: "u5" });
+    };
+    const card = async (override?: (q: Query) => Answer | undefined, extra?: (t: Tables) => void) => {
+      const { db } = readerDb(users, (t) => { patch(t); extra?.(t); }, override);
+      const { value } = await captureWarn(() => computeLearnerInsights(db.client, { orgId: "org1", orgSlug: "acme", userIds: users, periodDays: 30, content: "course:c1", now: NOW }));
+      return { db, lines: users.map((u) => value.learners.find((l) => l.userId === u)?.courses.find((c) => c.courseId === "c1")?.status ?? null) };
+    };
+    const shape = (q: Query) => [
+      q.ops.filter((o) => o.op === "order").map((o) => o.args[0]),
+      q.ops.filter((o) => o.op === "range").map((o) => o.args),
+      q.ops.filter((o) => o.op === "in").map((o) => [o.args[0], (o.args[1] as unknown[]).length]),
+    ];
+    await guarded("the team read's calls", async () => {
+      const { db, lines } = await card();
+      eq("control: every named member of the team has a line, the learner in no team none", lines, ["not_started", "not_started", "not_started", null, "not_started"]);
+      eq("1,504 rows: two calls, pages of 1,000 in the key's order (team_id, user_id), the rule's one team in the list",
+        db.queries.filter((q) => q.table === "team_members").map(shape), [
+          [["team_id", "user_id"], [[0, 999]], [["team_id", 1]]],
+          [["team_id", "user_id"], [[1000, 1999]], [["team_id", 1]]],
+        ]);
+      // A rule naming 160 teams (parseGroupRules keeps 200): two lists, of 150 and of 10 ids.
+      const many = await card(undefined, (t) => {
+        const g = t.org_groups.find((x) => x.id === "g6")!;
+        g.rules = { team_ids: ["t6", ...Array.from({ length: 159 }, (_, i) => `te${i + 1}`)] };
+      });
+      eq("a rule of 160 teams: lists of at most 150 ids (150, then 10), the same lines",
+        [many.db.queries.filter((q) => q.table === "team_members").map((q) => (q.ops.find((o) => o.op === "in")!.args[1] as unknown[]).length), many.lines],
+        [[150, 150, 10], ["not_started", "not_started", "not_started", null, "not_started"]]);
+    });
+    await guarded("the team read fails", async () => {
+      const BOOM = { data: null, error: { code: "XX000", message: "stub read failure" } };
+      const first = await card((q) => (q.table === "team_members" ? BOOM : undefined));
+      eq("the first call fails: no throw, and the team holds nobody (as today's failed read)", first.lines, [null, null, null, null, null]);
+      const later = await card((q) => (q.table === "team_members" && q.ops.some((o) => o.op === "range" && o.args[0] === 1000) ? BOOM : undefined));
+      eq("a later page fails: no throw, and the team holds nobody, u5 of the first page too (any failed call reads as today's failed read)", later.lines, [null, null, null, null, null]);
+      const noList = await card((q) => (q.table === "team_members" ? { data: null, error: null } : undefined));
+      eq("an answer that is not a list: the team holds nobody, as today", noList.lines, [null, null, null, null, null]);
+    });
+  }
+
+  console.log("\nADR 0029 (note of 2026-11-25, part 1, points 6 and 7) — the reminder's read: its calls, whatever the team's or the organisation's size");
+  /** Every learner a row of their own (c), unless the world says otherwise. */
+  type CallWorld = { label: string; calls: number; patch: (t: Tables, users: string[]) => void; courseActive?: boolean };
+  const pathOf = (t: Tables, released = true) => {
+    t.learning_paths.push({ id: "p1", organization_id: "org1", name: "P1", is_active: true });
+    t.learning_path_courses.push({ path_id: "p1", course_id: "c1", step_number: 1, release_at: released ? null : FUTURE });
+  };
+  const callWorlds: CallWorld[] = [
+    { label: "everybody has opened it, nobody has finished it: the versions and the rows", calls: 2,
+      patch: (t, us) => { for (const u of us) { t.course_attempts.push(att(u, inProgress)); t.course_assignments.push(ownRow(u)); } } },
+    { label: "each by a row of their own, nobody has opened it: the versions, the rows, their own rows", calls: 3,
+      patch: (t, us) => { for (const u of us) t.course_assignments.push(ownRow(u)); } },
+    { label: "the same, and somebody has finished it: and their grants", calls: 4,
+      patch: (t, us) => { for (const u of us) t.course_assignments.push(ownRow(u)); t.course_attempts.push(att(us[0])); } },
+    { label: "only through a dynamic group, the course on no path: a to e, the groups, the member fields", calls: 7,
+      patch: (t) => {
+        t.org_groups.push(group("g3", "dynamic", { verticals: ["V1"] }));
+        t.course_assignments.push(courseRow({ assignee_type: "group", group_id: "g3" }));
+      } },
+    { label: "only through a path a dynamic group is assigned: a to h, the groups, the member fields", calls: 10,
+      patch: (t) => {
+        pathOf(t);
+        t.org_groups.push(group("g3", "dynamic", { verticals: ["V1"] }));
+        t.learning_path_assignments.push(pathRow("p1", { assignee_type: "group", group_id: "g3" }));
+      } },
+    { label: "every step: a team, a static and a dynamic group with a team rule, a path, a finished learner", calls: 13,
+      patch: (t, us) => {
+        pathOf(t);
+        t.course_attempts.push(att(us[0]));
+        t.course_assignments.push(ownRow(us[1]), courseRow({ assignee_type: "team", team_id: "t1" }), courseRow({ assignee_type: "group", group_id: "g1" }), courseRow({ assignee_type: "group", group_id: "g3" }));
+        t.team_members.push({ team_id: "t1", user_id: us[2] }, { team_id: "t9", user_id: us[3] });
+        t.org_groups.push(group("g1", "static"), group("g3", "dynamic", { verticals: ["V9"], team_ids: ["t9"] }));
+        t.org_group_members.push({ group_id: "g1", user_id: us[4] });
+        t.organization_members = t.organization_members.map((m) => (m.user_id === us[3] ? { ...m, business_vertical: "V9" } : m));
+        t.learning_path_assignments.push(pathRow("p1", { assignee_type: "user", user_id: us[4] }), pathRow("p1", { assignee_type: "team", team_id: "t1" }));
+      } },
+    { label: "an inactive course: the versions and the rows only", calls: 2, courseActive: false,
+      patch: (t, us) => {
+        t.courses = t.courses.map((c) => (c.id === "c1" ? { ...c, is_active: false } : c));
+        for (const u of us) t.course_assignments.push(ownRow(u));
+        t.course_attempts.push(att(us[1], inProgress));
+      } },
+    { label: "an inactive course with a completed row: and its grants", calls: 3, courseActive: false,
+      patch: (t, us) => {
+        t.courses = t.courses.map((c) => (c.id === "c1" ? { ...c, is_active: false } : c));
+        t.course_attempts.push(att(us[0]));
+      } },
+  ];
+  for (const w of callWorlds) {
+    await guarded(w.label, async () => {
+      const measured: string[] = [];
+      for (const [n, others] of [[5, 95], [50, 50], [5, 2_495], [50, 2_450]] as const) {
+        const users = usersOf(n);
+        const { db } = readerDb(users, (t) => w.patch(t, users), undefined, others);
+        let counted = 0;
+        await readCourseReminderLines(db.client, { orgId: "org1", courseId: "c1", courseActive: w.courseActive ?? true, userIds: users, countCall: () => { counted++; }, now: NOW });
+        measured.push(`${n} of ${n + others}: ${counted} counted, ${db.queries.length} made`);
+      }
+      eq(`${w.label}: ${w.calls} calls, each counted, for 5 and 50 learners in an organisation of 100 and of 2,500`,
+        measured, [[5, 95], [50, 50], [5, 2_495], [50, 2_450]].map(([n, o]) => `${n} of ${n + o}: ${w.calls} counted, ${w.calls} made`));
+    });
+  }
+  await guarded("a course with no version", async () => {
+    const users = usersOf(5);
+    const { db } = readerDb(users, (t) => {
+      t.course_versions = t.course_versions.filter((v) => v.course_id !== "c1");
+      for (const u of users) t.course_assignments.push(ownRow(u));
+    });
+    const lines = await readCourseReminderLines(db.client, { orgId: "org1", courseId: "c1", courseActive: true, userIds: users, now: NOW });
+    eq("a course with no version: no attempts read, the versions and their own rows only; everybody not started",
+      [db.queries.some((q) => q.table === "course_attempts"), db.queries.map((q) => q.table), users.map((u) => lines.get(u)?.status ?? null)],
+      [false, ["course_versions", "course_assignments"], users.map(() => "not_started")]);
+  });
+
+  console.log("\nADR 0029 (note of 2026-11-25, part 1, point 9) — every read of the reminder's is strict: a failed read throws, never \"not assigned\"");
+  {
+    // c1 reaches u1 through the static group g1; u2 is reached by nothing,
+    // so every step up to the groups is made. The strict cases of stage 2
+    // (note of 2026-11-20, part 3), moved from computeLearnerInsights's
+    // option onto the reminder's own read.
+    const withGroup = (t: Tables) => {
+      t.course_assignments.push(courseRow({ assignee_type: "group", group_id: "g1" }));
+      t.org_groups.push(group("g1", "static"));
+      t.org_group_members.push({ group_id: "g1", user_id: "u1" });
+    };
+    const withPath = (t: Tables) => {
+      withGroup(t);
+      t.learning_paths.push({ id: "p1", organization_id: "org1", name: "P1", is_active: true });
+      t.learning_path_courses.push({ path_id: "p1", course_id: "c1", step_number: 1, release_at: null });
+    };
+    const users = usersOf(2);
+    const run = async (patch: (t: Tables) => void, override?: (q: Query) => Answer | undefined) => {
+      const { db } = readerDb(users, patch, override);
+      return readCourseReminderLines(db.client, { orgId: "org1", courseId: "c1", courseActive: true, userIds: users, now: NOW })
+        .then((m) => users.map((u) => m.get(u)?.status ?? null), () => "threw" as const);
+    };
+    const BOOM = { data: null, error: { code: "XX000", message: "stub read failure" } };
+    const fails = (table: string) => (q: Query) => (q.table === table ? BOOM : undefined);
+    await guarded("the strict cases", async () => {
+      eq("the control: every read answered, u1 through the group, u2 by nothing", await run(withGroup), ["not_started", null]);
+      eq("the groups cannot be read: throws", await run(withGroup, fails("org_groups")), "threw");
+      eq("a static group's rows cannot be read: throws", await run(withGroup, fails("org_group_members")), "threw");
+      eq("a database without org_groups (42P01, before 0067): no groups, the read answers", await run(withGroup, (q) => (q.table === "org_groups" ? { data: null, error: { code: "42P01", message: 'relation "public.org_groups" does not exist' } } : undefined)), [null, null]);
+      eq("…an error that only names a relation, with no missing-table code, throws", await run(withGroup, (q) => (q.table === "org_groups" ? { data: null, error: { code: "XX000", message: "could not open relation with OID 16384" } } : undefined)), "threw");
+      eq("the paths cannot be read, in a world where that step is made (a released step holds the course): throws", await run(withPath, fails("learning_paths")), "threw");
+      eq("…its control: the same world with the paths answered", await run(withPath), ["not_started", null]);
+      eq("an answer that is not a list (the course's rows): throws", await run(withGroup, (q) => (q.table === "course_assignments" ? { data: null, error: null } : undefined)), "threw");
+      eq("an answer that is not a list (the learners' rows): throws", await run(withGroup, (q) => (q.table === "course_attempts" ? { data: null, error: null } : undefined)), "threw");
+      eq("a call that throws: throws", await run(withGroup, (q) => { if (q.table === "team_members" || q.table === "learning_path_courses") throw new Error("fetch failed"); return undefined; }), "threw");
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -601,20 +1005,26 @@ const read = (f: string) => fs.readFileSync(path.join(root, f), "utf8");
 const code = (f: string) => read(f).replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, " ")).replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
 
 function sourceCases() {
-  console.log("\nADR 0014:188 — the reminder action skips an unreadable line");
+  // ADR 0014:188's skip ("records could not be read; try again") left with
+  // the Report Card's reader (ADR 0029, note of 2026-11-25, part 1, point
+  // 9): the reminder's own read throws on a failed grant read, and the
+  // request answers 503 and sends nothing (tests/unit/manager-remind-calls.test.ts,
+  // step m).
+  console.log("\nADR 0029 (note of 2026-11-25, part 1) — the reminder's course branch reads its own lines");
   {
     const src = code("lib/manager/actions.ts");
-    const branch = src.slice(src.indexOf('if (target === "course") {'), src.indexOf("// Journey: the learner's ACTIVE enrollment"));
-    const at = branch.indexOf('reason: "records could not be read; try again"');
-    eq("the course branch skips on line.historyUnavailable / status 'unavailable' with its reason", [
-      /if \(line\.historyUnavailable \|\| line\.status === "unavailable"\) \{\s*results\.push\(\{ userId: uid, status: "skipped", reason: "records could not be read; try again" \}\);\s*continue;\s*\}/.test(branch),
-    ], [true]);
-    eq("…after the !line check and before the completed skip, notifyBackground( and the reminder_state upsert", [
-      at > branch.indexOf("if (!line)"),
-      at < branch.indexOf('line.status === "completed"'),
-      at < branch.indexOf("notifyBackground("),
-      at < branch.indexOf('.from("reminder_state").upsert('),
-      branch.indexOf('.from("reminder_state").upsert(') > 0,
+    const branch = src.slice(src.indexOf('if (target === "course") {'), src.indexOf("const tz = await orgTimezone("));
+    const at = (s: string) => branch.indexOf(s);
+    eq("the course branch calls readCourseReminderLines, the file never computeLearnerInsights, and no line is skipped as unreadable", [
+      at("readCourseReminderLines(a.svc, {") > 0, src.includes("computeLearnerInsights"), branch.includes("records could not be read; try again"), branch.includes("historyUnavailable"),
+    ], [true, false, false, false]);
+    // ADR 0029: the sends are one run (sendMany), and the state is written with each group.
+    eq("…its throw answers 503 before the reminder state's read, the run's sends (sendMany) and the reminder_state upsert", [
+      at("readCourseReminderLines(a.svc, {") < at('"The learners\' assignments could not be read. Nothing was sent; try again."'),
+      at('"The learners\' assignments could not be read. Nothing was sent; try again."') < at('.from("reminder_state")'),
+      at('.from("reminder_state")') < at("sendMany("),
+      at("sendMany(") < at('.from("reminder_state").upsert('),
+      at('.from("reminder_state").upsert(') > 0,
     ], [true, true, true, true, true]);
   }
 

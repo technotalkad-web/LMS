@@ -486,15 +486,29 @@ async function stepFails(db, s) {
 // `;`). The text between the markers is run as it is in the file; its rows
 // (check_id, item, observed, verdict) are compared: their number, the exact
 // set of rows whose verdict is not ok or info ("check_id | item | verdict"),
-// and named observed values ("check_id | item" -> observed).
+// and named observed values ("check_id | item" -> observed). With `script`
+// in place of `file` (added for 0114 and 0117, ADR 0029 checklist D3, whose
+// pre-check is a read-only file of the repository's ops/ folder, not part
+// of a migration), the select is read from that file, as `fails` reads one.
 async function stepQuery(db, s) {
-  const [n] = expand([s.file]);
-  const f = byNum.get(n);
-  if (!f) {
-    check(false, `query: migration ${pad(n)} is missing`);
-    return "stop";
+  let f;
+  let raw;
+  if (s.script) {
+    f = s.script;
+    if (!fs.existsSync(path.join(ROOT, f))) {
+      check(false, `query: ${f} is missing`);
+      return "stop";
+    }
+    raw = fs.readFileSync(path.join(ROOT, f), "utf8").replace(/\r\n/g, "\n");
+  } else {
+    const [n] = expand([s.file]);
+    f = byNum.get(n);
+    if (!f) {
+      check(false, `query: migration ${pad(n)} is missing`);
+      return "stop";
+    }
+    raw = fs.readFileSync(path.join(MIG, f), "utf8").replace(/\r\n/g, "\n");
   }
-  const raw = fs.readFileSync(path.join(MIG, f), "utf8").replace(/\r\n/g, "\n");
   const b = raw.indexOf(`${s.begin}\n`);
   const e = raw.indexOf(s.end, b + 1);
   if (b < 0 || e < 0) {

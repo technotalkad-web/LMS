@@ -16,6 +16,11 @@ export function chunk<T>(arr: T[], n: number): T[][] {
   return out;
 }
 
+/**
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call
+ * (every chunk and every page), so a request that counts its calls counts
+ * these.
+ */
 export async function fetchByIds<T>(
   svc: SupabaseClient,
   table: string,
@@ -23,12 +28,14 @@ export async function fetchByIds<T>(
   col: string,
   ids: string[],
   apply?: (q: any) => any,
-  orderBy = "id"
+  orderBy = "id",
+  countCall?: () => unknown
 ): Promise<T[]> {
   const out: T[] = [];
   const uniq = [...new Set(ids.filter(Boolean))];
   for (const part of chunk(uniq, 150)) {
     for (let from = 0; ; from += 1000) {
+      countCall?.();
       let q: any = svc.from(table).select(select).in(col, part).order(orderBy).range(from, from + 999);
       if (apply) q = apply(q);
       const { data, error } = await q;
@@ -41,15 +48,18 @@ export async function fetchByIds<T>(
   return out;
 }
 
+/** `countCall`, when given, is called before each page, as fetchByIds has it. */
 export async function fetchAll<T>(
   svc: SupabaseClient,
   table: string,
   select: string,
   apply: (q: any) => any,
-  orderBy = "id"
+  orderBy = "id",
+  countCall?: () => unknown
 ): Promise<T[]> {
   const out: T[] = [];
   for (let from = 0; ; from += 1000) {
+    countCall?.();
     const { data, error } = await apply(
       svc.from(table).select(select).order(orderBy).range(from, from + 999)
     );
@@ -61,3 +71,137 @@ export async function fetchAll<T>(
   return out;
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
+
+/**
+ * Asked before each outbound call a reader makes (ADR 0029, rule FP2: the
+ * sum counts the calls made, every paged read included). True: the call is
+ * made, and a caller that counts its calls has counted it. False: the read
+ * stops there and answers "no_room", never part of a set.
+ */
+export type CallGate = () => boolean;
+/** A gate that only counts and never refuses: its reader never answers "no_room". */
+export type CallCounter = () => true;
+
+/**
+ * The same house rules for a read that decides who is mailed (ADR 0029):
+ * it never throws and never answers part of a set. `page(from, to)` builds
+ * one page's query, ordered by a stable key; pages of 1000 rows are read
+ * until a short one. `beforePage`, when given, is asked before every page
+ * and may refuse it (a caller that counts its calls has no room left).
+ *
+ * The answer is every row, "unreadable" when a page failed, threw or
+ * answered no list, or "no_room" when `beforePage` refused a page.
+ */
+export async function readAllStrict<T>(
+  page: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+  beforePage?: CallGate
+): Promise<T[] | "unreadable" | "no_room"> {
+  const out: T[] = [];
+  for (let from = 0; ; from += 1000) {
+    if (beforePage && !beforePage()) return "no_room";
+    let answer: { data: unknown; error: unknown };
+    try {
+      answer = await page(from, from + 999);
+    } catch {
+      return "unreadable";
+    }
+    if (answer.error || !Array.isArray(answer.data)) return "unreadable";
+    out.push(...(answer.data as T[]));
+    if (answer.data.length < 1000) break;
+  }
+  return out;
+}
+
+/**
+ * readAllStrict over an `.in()` list: the ids in chunks of 150, each chunk
+ * read in pages of 1000. `page(part, from, to)` builds one page's query for
+ * one chunk. The same three answers; an empty list reads nothing.
+ */
+export async function readByIdsStrict<T>(
+  ids: Iterable<string>,
+  page: (part: string[], from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+  beforePage?: CallGate
+): Promise<T[] | "unreadable" | "no_room"> {
+  const out: T[] = [];
+  for (const part of chunk([...new Set([...ids].filter(Boolean))], 150)) {
+    const rows = await readAllStrict<T>((from, to) => page(part, from, to), beforePage);
+    if (rows === "unreadable" || rows === "no_room") return rows;
+    out.push(...rows);
+  }
+  return out;
+}
+
+/**
+ * The same house rules for a fail-soft read (a page or an audience that only
+ * shows people), which once was one call that read a failure as no rows:
+ * pages of 1000 rows in the order `page` sets, until a short one. A page that
+ * answers an error, or no list, makes the whole read answer no rows, as that
+ * one call did; a call that throws, throws, as it did. `beforePage`, when
+ * given, is called before every page (ADR 0029 rule FP2).
+ */
+export async function readAllSoft<T>(
+  page: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+  beforePage?: () => unknown
+): Promise<T[]> {
+  return (await pagesSoft<T>(page, beforePage)) ?? [];
+}
+
+/**
+ * readAllSoft over an `.in()` list: the ids in chunks of 150, each chunk
+ * read in pages of 1000. A failed page of any chunk: no rows at all. An empty
+ * list reads nothing.
+ */
+export async function readByIdsSoft<T>(
+  ids: Iterable<string>,
+  page: (part: string[], from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+  beforePage?: () => unknown
+): Promise<T[]> {
+  const out: T[] = [];
+  for (const part of chunk([...new Set([...ids].filter(Boolean))], 150)) {
+    const rows = await pagesSoft<T>((from, to) => page(part, from, to), beforePage);
+    if (rows === null) return [];
+    out.push(...rows);
+  }
+  return out;
+}
+
+/** Every page's rows, or null when a page answered an error or no list. */
+async function pagesSoft<T>(
+  page: (from: number, to: number) => PromiseLike<{ data: unknown; error: unknown }>,
+  beforePage?: () => unknown
+): Promise<T[] | null> {
+  const out: T[] = [];
+  for (let from = 0; ; from += 1000) {
+    beforePage?.();
+    const answer = await page(from, from + 999);
+    if (answer.error || !Array.isArray(answer.data)) return null;
+    out.push(...(answer.data as T[]));
+    if (answer.data.length < 1000) break;
+  }
+  return out;
+}
+
+/**
+ * A write's error that carries no database code: its answer was lost on
+ * the way. supabase-js answers code "" when the fetch itself failed (the
+ * connection dropped after the request was sent), and a gateway's error
+ * page that is not JSON comes back with no code at all. Such a write may
+ * have been saved; only a read can tell (ADR 0029: a batch is read back,
+ * never inserted again row by row).
+ */
+export function isLostReply(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  return code === undefined || code === null || code === "";
+}
+
+/**
+ * A database error that one row of a write causes: class 23, an integrity
+ * constraint (a duplicate, 23505; a check, 23514; a foreign key; a missing
+ * value). The database refused the whole insert for that row, so writing
+ * the rows one at a time tells which. Any other error is the whole write's.
+ */
+export function isRowError(error: unknown): boolean {
+  const code = error && typeof error === "object" ? (error as { code?: unknown }).code : null;
+  return typeof code === "string" && code.startsWith("23");
+}

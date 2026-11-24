@@ -537,7 +537,8 @@ async function main() {
         return { data: [] };
       });
     const heldOf = async (client: never, over: { settings?: { enabled?: boolean | null; config?: Record<string, { enabled?: boolean; priority?: string }> | null } | null; dismissals?: Map<string, string> } = {}) => {
-      const out = await collectAttention({ svc: client, orgId: "o1", orgSlug: "qa-org", settings: over.settings ?? null, dismissals: over.dismissals ?? new Map<string, string>() });
+      // The organisation's own email (the tenant-smtp provider, ADR 0029) is not modelled by this stub: it is off here, so the totals count this provider's items alone.
+      const out = await collectAttention({ svc: client, orgId: "o1", orgSlug: "qa-org", settings: over.settings ?? { enabled: true, config: { "tenant-smtp": { enabled: false } } }, dismissals: over.dismissals ?? new Map<string, string>() });
       return { out, items: out.items.filter((i) => i.type === "held-webhooks") };
     };
     {

@@ -64,6 +64,7 @@ DEFAULT_SPECS="00 32 33 34 43 47 48 49 50 51 52 53 54 55 63 64 65 66"
 # pasted (the ADR 0024 step-16 note of 2026-11-16, S6); spec 80 (ADR 0030,
 # the database group of migration 0115) joined after its green hand run of
 # 2026-11-18 on staging with 0115 pasted (ADR 0030 gate G5).
+# Spec 79 is run by hand before a release until its cron posts cannot reach other organisations.
 PRODUCT_SPECS="68 69 78 80"
 PORT="${LIFECYCLE_PORT:-3100}"
 STAGING_REF="zeaclbapadosqqttexxh"

@@ -2,13 +2,19 @@
  * Sign-in links, reset codes and passwords are never stored in the
  * notification log (lib/notifications/send.ts, STORED_CONTEXT_KEYS).
  *
- * A member of a test organisation asks for a password reset and for a
- * sign-in link; the organisation's notification_log rows for that member are
- * then read with an organisation admin's own session, the way the admin
- * pages read the table. No row's context holds a credential key and no row
- * holds a token_hash. The rule is checked on both logged paths:
+ * A member of a test organisation asks, on the organisation's own pages,
+ * for a password reset and for a sign-in link; the organisation's
+ * notification_log rows for that member are then read with an organisation
+ * admin's own session, the way the admin pages read the table. No row's
+ * context holds a credential key and no row holds a token_hash. The rule is
+ * checked on both logged paths:
  *
- *   1. email paused for the organisation (the paused path writes a row too);
+ *   1. the organisation has no SMTP of its own, so neither mail is
+ *      attempted: the rows are the records of sends not attempted (ADR 0029
+ *      section C). Email is paused for the organisation too, and a pause
+ *      does not stop reset codes or sign-in links (default D1), so the
+ *      records are written all the same. The case also marks an alert as
+ *      due on its own organisation, which goes with the organisation;
  *   2. a real send, when the bot inbox is configured (the organisation's
  *      SMTP is the bot relay and the member's address an inbox alias).
  *
@@ -40,7 +46,7 @@ test.describe.serial("Notification log holds no credential", () => {
   });
 
   async function requestBoth(request: import("@playwright/test").APIRequestContext, email: string) {
-    const reset = await request.post("/api/auth/forgot-password/request", { data: { email } });
+    const reset = await request.post("/api/auth/forgot-password/request", { data: { email, orgSlug: s.org!.slug } });
     expect(reset.status(), "password reset request answers 200").toBe(200);
     const link = await request.post("/api/auth/magic-link", { data: { email, orgSlug: s.org!.slug } });
     expect(link.status(), "sign-in link request answers 200").toBe(200);
@@ -71,7 +77,7 @@ test.describe.serial("Notification log holds no credential", () => {
     expect(resetSubjectHasCode, "no password_reset subject holds a six-digit code").toBe(false);
   }
 
-  test("paused path: the log holds no credential", async ({ request }) => {
+  test("no SMTP: the records of sends not attempted hold no credential", async ({ request }) => {
     const member = await createAuthUser({ profile: { first_name: "NL", last_name: "Member", must_change_password: false } });
     await addMember({ organizationId: s.org!.id, userId: member.id, role: "user" });
     const { error } = await svc()
@@ -81,6 +87,21 @@ test.describe.serial("Notification log holds no credential", () => {
 
     await requestBoth(request, member.email);
     await checkLog(member.email.toLowerCase());
+
+    // Each row is the record of a send not attempted: failed, with the
+    // not-ready word, and no other row for the member.
+    const { data, error: readError } = await svc()
+      .from("notification_log")
+      .select("event_type, status, error")
+      .eq("organization_id", s.org!.id)
+      .eq("to_user_id", member.id);
+    expect(readError, "read the member's rows").toBeNull();
+    const rows = (data ?? []) as Array<{ event_type: string; status: string; error: string | null }>;
+    for (const event of ["password_reset", "magic_link"]) {
+      const mine = rows.filter((r) => r.event_type === event);
+      expect(mine.length, `one ${event} row`).toBe(1);
+      expect(mine.every((r) => r.status === "failed" && r.error === "smtp_not_ready"), `the ${event} row is the record of a send not attempted`).toBe(true);
+    }
   });
 
   test("sent path: the log holds no credential", async ({ request }) => {

@@ -10,6 +10,7 @@ import { heldWebhookItem, heldWebhookSummary } from "@/lib/integrations/webhook-
 import { classifyAttempt, type PgError } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews } from "@/lib/scoring/context-read";
 import { NOT_APPLIED_TITLE, attentionContextLine, ignoredPassCount, readIgnoredRecord } from "@/lib/xapi/ignored-pass";
+import { readTenantMailNotice, smtpSettingsPath, type TenantMailNotice } from "@/lib/notifications/smtp-state";
 import {
   ATTENTION_PROVIDERS,
   PRIORITY_RANK,
@@ -486,6 +487,50 @@ async function ignoredPassItems(svc: AnyClient, orgId: string, orgSlug: string, 
   return items;
 }
 
+/**
+ * The organisation's own email (ADR 0029 section E; rule FP4): one item
+ * while it is not ready (its SMTP is not set up, or failing), or while its
+ * daily count is near the limit (a warning from eight tenths), past the
+ * line where routine mail stops, or at the limit itself (critical, with the
+ * count and the limit). It cannot be marked as read; it goes when the cause
+ * is gone. A state that cannot be read (migration 0114 not pasted included)
+ * gives no item, while settings that are incomplete still give the
+ * not-configured item from the settings alone. Never throws.
+ */
+export function tenantSmtpItem(notice: TenantMailNotice | null, orgSlug: string, priority: AttentionPriority, nowIso: string): AttentionItem | null {
+  if (!notice) return null;
+  // Section E: the item links to the SMTP tab of Settings.
+  const base = { type: "tenant-smtp", who: null, href: smtpSettingsPath(orgSlug), inline: null, dismissible: false } as const;
+  switch (notice.kind) {
+    case "not_configured":
+      return { ...base, key: "tenant-smtp:not_configured", priority, title: "Email is not set up: no email reaches your learners", context: "Set the SMTP host, port and From address on the SMTP tab of Settings.", occurredAt: nowIso, actionLabel: "Set up SMTP" };
+    case "failing":
+      return {
+        ...base,
+        key: "tenant-smtp:failing",
+        priority,
+        title: "Email is failing: your learners' email is not being sent",
+        context: `Failing since ${notice.since ? notice.since.slice(0, 16).replace("T", " ") + " UTC" : "a time not recorded"}${notice.lastErrorClass ? ` · last error: ${notice.lastErrorClass}` : ""}`,
+        occurredAt: notice.since ?? nowIso,
+        actionLabel: "Check the SMTP settings and send a test",
+      };
+    case "limit_reached":
+      return { ...base, key: "tenant-smtp:daily_limit", priority, title: "All email has stopped: the daily email limit is reached", context: `${notice.sent24h} of ${notice.limit} sent in the last 24 hours. Email starts again as the 24 hours move on.`, occurredAt: nowIso, actionLabel: "Review today's email" };
+    case "routine_stopped":
+      return { ...base, key: "tenant-smtp:daily_limit", priority, title: "Routine email has stopped for today", context: `${notice.sent24h} of ${notice.limit} sent in the last 24 hours. Reset codes, sign-in links and welcome mail still go until the limit.`, occurredAt: nowIso, actionLabel: "Review today's email" };
+    case "routine_off":
+      // The limit's setting, not a stop for today: a warning, as near_limit.
+      return { ...base, key: "tenant-smtp:routine_off", priority: priority === "critical" ? "high" : priority, title: "Routine email is off at this daily limit", context: `The daily limit of ${notice.limit} is no more than the part kept for reset codes, sign-in links and welcome mail, so reminders, announcements and assignment email are never sent. ${notice.sent24h} sent in the last 24 hours. A platform owner sets the limit.`, occurredAt: nowIso, actionLabel: "Review today's email" };
+    case "near_limit":
+      return { ...base, key: "tenant-smtp:near_limit", priority: priority === "critical" ? "high" : priority, title: "Email is near today's limit", context: `${notice.sent24h} of ${notice.limit} sent in the last 24 hours. Routine email stops before the limit.`, occurredAt: nowIso, actionLabel: "Review today's email" };
+  }
+}
+
+async function tenantSmtpItems(svc: AnyClient, orgId: string, orgSlug: string, priority: AttentionPriority): Promise<AttentionItem[]> {
+  const item = tenantSmtpItem(await readTenantMailNotice(svc, orgId), orgSlug, priority, new Date().toISOString());
+  return item ? [item] : [];
+}
+
 // ---- orchestration ---------------------------------------------------------
 
 export async function collectAttention(args: {
@@ -515,7 +560,8 @@ export async function collectAttention(args: {
   for (const p of ATTENTION_PROVIDERS) {
     const c = byType[p.type];
     if (!c?.enabled) continue;
-    if (p.type === "attempt-request") jobs.push(run(attemptRequestItems(svc, orgId, orgSlug, c.priority)));
+    if (p.type === "tenant-smtp") jobs.push(run(tenantSmtpItems(svc, orgId, orgSlug, c.priority)));
+    else if (p.type === "attempt-request") jobs.push(run(attemptRequestItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "ticket") jobs.push(run(ticketItems(svc, orgId, orgSlug)));
     else if (p.type === "failed-email") jobs.push(run(failedEmailItems(svc, orgId, orgSlug, c.priority)));
     else if (p.type === "overdue") jobs.push(run(overdueItems(svc, orgId, orgSlug, c.priority)));
@@ -527,8 +573,10 @@ export async function collectAttention(args: {
   }
   let items = (await Promise.all(jobs)).flat();
 
-  // Mark-as-read: hide an item while a dismissal exists at/after its latest activity.
+  // Mark-as-read: hide an item while a dismissal exists at/after its latest
+  // activity. An item that cannot be marked as read is never hidden.
   items = items.filter((it) => {
+    if (!it.dismissible) return true;
     const d = dismissals.get(it.key);
     return !(d && new Date(d).getTime() >= new Date(it.occurredAt).getTime());
   });

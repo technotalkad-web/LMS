@@ -4,6 +4,10 @@ import { seedOtp, svc } from "../helpers/supabase";
 
 /** The verify step's one failure answer (lib/auth/password-reset.ts). */
 const VERIFY_FAILED = "That code is incorrect or has expired. Request a new one.";
+/** The one line of the form with no organisation (ADR 0029 section D; LEARNERS_LINE in lib/auth/credential-mail.ts). */
+const LEARNERS_LINE = "Learners: sign in at your organisation's own address.";
+/** The start of the not-ready answer of an organisation's form (PUBLIC_ANSWERS in lib/auth/credential-mail.ts). */
+const NOT_READY_START = "Email could not be sent. Please contact your LMS Administrator.";
 
 /**
  * /forgot-password 3-step OTP flow.
@@ -11,6 +15,15 @@ const VERIFY_FAILED = "That code is incorrect or has expired. Request a new one.
  * We seed the OTP row directly (bypassing /api/auth/forgot-password/request,
  * which would otherwise need SMTP) and then drive the verify + reset steps
  * through the real UI.
+ *
+ * The spec leaves nothing behind on staging: no mail is dispatched, no tenant
+ * row is written and no alert is marked as due (ADR 0029 section E). The
+ * seeded flows ask on the form with no organisation, which serves platform
+ * owners and administrators only, so the fixture's learner is mailed nothing
+ * there. The organisation's own form is opened only with an address that has
+ * no account, so no job runs after its answer. The fixture's organisation
+ * has no SMTP of its own. A member's request on an organisation's form, with
+ * its mail and its alert marks, is lifecycle spec 79's.
  *
  * Page selectors:
  *   - Step 1: placeholder="you@company.com", submit "Send code"
@@ -49,6 +62,8 @@ test.describe("/forgot-password", () => {
     // our own seed (seedOtp invalidates prior unused codes for this email).
     const emailInput = page.getByPlaceholder("you@company.com");
     await expect(emailInput).toBeVisible({ timeout: 15_000 });
+    // The form with no organisation: it mails a learner nothing, and says so.
+    await expect(page.getByText(LEARNERS_LINE)).toBeVisible();
     await fillEmail(page, seededLearner.email);
     await page.getByRole("button", { name: /send code/i }).click();
 
@@ -90,6 +105,7 @@ test.describe("/forgot-password", () => {
     await seedOtp(seededLearner.email); // real code we won't use
 
     await page.goto("/forgot-password");
+    await expect(page.getByText(LEARNERS_LINE)).toBeVisible({ timeout: 15_000 });
     await fillEmail(page, seededLearner.email);
     await page.getByRole("button", { name: /send code/i }).click();
 
@@ -129,14 +145,45 @@ test.describe("/forgot-password", () => {
     expect(await ghost.json()).toEqual({ error: VERIFY_FAILED });
   });
 
+  test("the organisation's own form names it, and an address with no account gets the answer and the code step", async ({
+    page,
+    seededOrg,
+  }) => {
+    await page.goto(`/forgot-password?org=${encodeURIComponent(seededOrg.slug)}`);
+    await expect(page.getByText(`For ${seededOrg.name}.`, { exact: false })).toBeVisible({ timeout: 15_000 });
+    // The learners' line belongs to the form with no organisation only.
+    await expect(page.getByText(LEARNERS_LINE)).toHaveCount(0);
+
+    // An address with no account gets the answer every address gets, and no
+    // job runs after it: nothing is sent and nothing is marked.
+    await fillEmail(page, `ghost-${Date.now()}-no-account@example.test`);
+    await page.getByRole("button", { name: /send code/i }).click();
+    await expect(page.getByPlaceholder("000000")).toBeVisible({ timeout: 15_000 });
+    // The organisation has no SMTP of its own, so its answer is the not-ready one.
+    await expect(page.getByText(NOT_READY_START, { exact: false })).toBeVisible();
+  });
+
   test("never reveals whether an email exists (request endpoint always 200)", async ({
     request,
+    seededOrg,
   }) => {
+    const email = "ghost-does-not-exist@example.test";
     const res = await request.post("/api/auth/forgot-password/request", {
-      data: { email: "ghost-does-not-exist@example.test" },
+      data: { email },
     });
     expect(res.status()).toBe(200);
     const body = await res.json();
     expect(body.ok).toBe(true);
+
+    // The same address on the organisation's own form: 200 and the
+    // organisation's answer, which an address with an account gets too.
+    const onOrg = await request.post("/api/auth/forgot-password/request", {
+      data: { email, orgSlug: seededOrg.slug },
+    });
+    expect(onOrg.status()).toBe(200);
+    const orgBody = await onOrg.json();
+    expect(orgBody.ok).toBe(true);
+    expect(orgBody.ready, "an organisation with no SMTP of its own reads not ready").toBe(false);
+    expect(String(orgBody.message ?? "").startsWith(NOT_READY_START)).toBe(true);
   });
 });

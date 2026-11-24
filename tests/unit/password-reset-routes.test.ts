@@ -149,6 +149,8 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p === "/auth/v1/admin/users" && method === "GET") return json({ users: [USER], aud: "authenticated" });
   if (p === `/auth/v1/admin/users/${USER.id}` && method === "PUT") return json(USER);
   if (p === "/rest/v1/profiles") return new Response(null, { status: 204 });
+  // A completed reset ends the account's open setup link (ADR 0029, rule N9).
+  if (p === "/rest/v1/account_setup_links" && method === "PATCH") return new Response(null, { status: 204 });
   return json({ message: `unexpected ${method} ${p}` }, 500);
 };
 

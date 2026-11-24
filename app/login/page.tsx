@@ -16,6 +16,16 @@ import {
 
 type Mode = "password" | "magic";
 
+/** The one line every visitor of the page with no organisation reads (ADR 0029 section D). */
+const LEARNERS_LINE = "Learners: sign in at your organisation's own address.";
+
+/**
+ * The platform's sign-in page, with no organisation (ADR 0029 section D):
+ * password sign-in for everyone; the sign-in link tab serves platform owners
+ * and administrators only, through the platform's sender, and shows the
+ * route's answer, the same for every address. No field asks for an
+ * organisation; learners are told to use their organisation's own address.
+ */
 export default function LoginPage() {
   const [mode, setMode] = useState<Mode>("password");
   const [email, setEmail] = useState("");
@@ -24,6 +34,8 @@ export default function LoginPage() {
     "idle" | "working" | "redirecting" | "sent" | "error"
   >("idle");
   const [error, setError] = useState<string | null>(null);
+  /** The sign-in link route's answer: its sentence, and whether it was the "could not be sent" one. */
+  const [answer, setAnswer] = useState<{ ready: boolean; message: string } | null>(null);
   // Render the form client-only so password-manager extensions
   // (LastPass, 1Password, Chrome autofill) can't inject autocomplete
   // attributes between SSR and hydrate and trigger a mismatch warning.
@@ -43,18 +55,20 @@ export default function LoginPage() {
     setError(null);
 
     if (mode === "magic") {
-      // Backend mints + sends the link (no Supabase auto-send). Platform login
-      // has no tenant context, so it goes via the global Resend sender.
+      // The backend mints and sends the link (no Supabase auto-send). With no
+      // organisation it serves platform owners and administrators, through
+      // the platform's sender; its answer is the same for every address.
       const res = await fetch("/api/auth/magic-link", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ email }),
       });
+      const j = (await res.json().catch(() => ({}))) as { error?: string; ready?: boolean; message?: string };
       if (!res.ok) {
-        const j = (await res.json().catch(() => ({}))) as { error?: string };
-        setError(j.error ?? "Could not send the sign-in link");
+        setError(res.status === 503 ? "Email could not be sent right now. Please try again in a few minutes." : j.error ?? "Could not send the sign-in link");
         setStatus("error");
       } else {
+        setAnswer({ ready: j.ready === true, message: typeof j.message === "string" ? j.message : "" });
         setStatus("sent");
       }
     } else {
@@ -192,21 +206,25 @@ export default function LoginPage() {
             </button>
           </div>
 
-          {/* Sent state */}
+          {/* Sent state: the route's answer, the same for every address */}
           {status === "sent" ? (
-            <div className="border border-emerald-200 bg-emerald-50 text-emerald-900 rounded-2xl p-5 flex items-start gap-3">
-              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0 mt-0.5" />
+            <div
+              className={`border rounded-2xl p-5 flex items-start gap-3 ${
+                answer?.ready === false
+                  ? "border-amber-200 bg-amber-50 text-amber-900"
+                  : "border-emerald-200 bg-emerald-50 text-emerald-900"
+              }`}
+            >
+              <CheckCircle2 className="w-5 h-5 shrink-0 mt-0.5" />
               <div>
-                <h3 className="font-semibold mb-1">Check your inbox</h3>
-                <p className="text-sm text-emerald-800/90">
-                  We sent a sign-in link to{" "}
-                  <span className="font-medium">{email}</span>. Tap it from any
-                  device to finish signing in.
-                </p>
+                <h3 className="font-semibold mb-1">
+                  {answer?.ready === false ? "Email could not be sent" : "Check your inbox"}
+                </h3>
+                <p className="text-sm">{answer?.message}</p>
                 <button
                   type="button"
                   onClick={() => switchMode("magic")}
-                  className="mt-3 text-xs underline hover:text-emerald-700"
+                  className="mt-3 text-xs underline"
                 >
                   Use a different email
                 </button>
@@ -276,8 +294,8 @@ export default function LoginPage() {
 
               {mode === "magic" && (
                 <p className="text-xs text-muted">
-                  We&apos;ll email you a one-tap link to sign in — no password
-                  needed.
+                  For platform owners and organisation administrators: we&apos;ll
+                  email you a one-tap link to sign in, no password needed.
                 </p>
               )}
 
@@ -302,6 +320,8 @@ export default function LoginPage() {
               )}
             </form>
           )}
+
+          <p className="text-center text-sm text-muted mt-6">{LEARNERS_LINE}</p>
 
           <p className="text-center text-xs text-muted mt-10">
             By signing in you agree to our{" "}

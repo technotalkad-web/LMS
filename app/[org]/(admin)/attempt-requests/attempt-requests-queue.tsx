@@ -25,6 +25,7 @@ import {
   EmptyState,
   StatusPill,
 } from "@/components/admin";
+import { mailOutcomeWords, type MailOutcomeAnswer } from "@/lib/actions/types";
 
 export type AttemptRequestRow = {
   id: string;
@@ -105,6 +106,8 @@ export function AttemptRequestsQueue({
   const [filter, setFilter] = useState<Filter>("pending");
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // What the decision's email did (ADR 0029 rule T4), shown above the list.
+  const [mailNotice, setMailNotice] = useState<string | null>(null);
 
   const stats = useMemo(() => {
     const pending = rows.filter((r) => r.status === "pending").length;
@@ -119,6 +122,7 @@ export function AttemptRequestsQueue({
   async function decide(id: string, action: "approve" | "reject", note: string, expiry: string, overridePassed = false) {
     setBusyId(id);
     setError(null);
+    setMailNotice(null);
     const res = await fetch(`/api/attempt-requests/${id}?orgSlug=${encodeURIComponent(orgSlug)}`, {
       method: "PATCH",
       headers: { "content-type": "application/json" },
@@ -131,11 +135,13 @@ export function AttemptRequestsQueue({
       }),
     });
     setBusyId(null);
+    const j = (await res.json().catch(() => ({}))) as { error?: string; email?: MailOutcomeAnswer | null };
     if (!res.ok) {
-      const j = (await res.json().catch(() => ({}))) as { error?: string };
       setError((j.error && DECIDE_ERRORS[j.error]) ?? j.error ?? `HTTP ${res.status}`);
       return;
     }
+    const words = mailOutcomeWords(j.email);
+    setMailNotice(words ? `Email to the learner: ${words}` : null);
     router.refresh();
   }
 
@@ -167,6 +173,11 @@ export function AttemptRequestsQueue({
       {error && (
         <div className="mb-3 border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-2 text-sm">
           {error}
+        </div>
+      )}
+      {mailNotice && (
+        <div role="status" className="mb-3 border border-line bg-paper text-ink rounded-xl px-3 py-2 text-sm">
+          {mailNotice}
         </div>
       )}
 
@@ -224,11 +235,14 @@ function BulkGrantPanel({
       skipped?: number;
       skipped_live_retake?: number;
       failed_total?: number;
+      email?: MailOutcomeAnswer;
     };
     if (!res.ok) {
       setErr((j.error && BULK_ERRORS[j.error]) ?? j.error ?? `HTTP ${res.status}`);
       return;
     }
+    // ADR 0029 rule T4: what the grants' emails did.
+    const mailWords = mailOutcomeWords(j.email);
     // ADR 0014 step 11 (5): a learner whose granted retake is live is skipped
     // and is not in failed_total, so "nothing to grant" is said only when no
     // learner was skipped for it either.
@@ -240,7 +254,8 @@ function BulkGrantPanel({
         `Granted ${j.granted ?? 0} extra attempt${j.granted === 1 ? "" : "s"}` +
           ((j.skipped ?? 0) > 0 ? ` · ${j.skipped} already had an open grant` : "") +
           (liveRetake > 0 ? ` · ${liveRetake} had a granted retake in progress` : "") +
-          `.`
+          `.` +
+          (mailWords ? ` Email to the learners: ${mailWords}` : "")
       );
     }
     onDone();

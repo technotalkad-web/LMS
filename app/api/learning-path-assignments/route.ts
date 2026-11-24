@@ -1,15 +1,16 @@
 import { NextResponse } from "next/server";
 import { loadOrgGovernance } from "@/lib/org/field-options";
-import { checkScopeTarget, ensureScopeGroup } from "@/lib/org/scope-groups";
+import { checkScopeTarget, ensureScopeGroups } from "@/lib/org/scope-groups";
 import { describeScopes, loadScopesFor, scopeLabel, scopesCover, type ScopePair } from "@/lib/content/scopes";
 import { requireOrgAdminApi } from "@/lib/auth/api-admin";
 import { countingMemberIds } from "@/lib/auth/org-membership";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
-import { resolveEmails } from "@/lib/users/emails";
-import { notifyBackground } from "@/lib/notifications/send";
+import { resolveEmailsStrict } from "@/lib/users/emails";
+import { RECIPIENTS_UNREADABLE, mailCounts, sendMany, type MailOutcome } from "@/lib/notifications/send";
+import { ADMIN_REQUEST_OWN_CALLS, countCalls, openRun, recordRecipientsUnreadable, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 import { originFromRequest } from "@/lib/http/origin";
-import { resolveManyGroups } from "@/lib/org/groups";
-import { convertSelfEnrolments } from "@/lib/assignments/direct";
+import { assigneeRecipientsStrict } from "@/lib/org/groups";
+import { convertSelfEnrolments, writeAssignmentRows } from "@/lib/assignments/direct";
 
 /**
  *   POST /api/learning-path-assignments
@@ -127,8 +128,8 @@ export async function POST(request: Request) {
       if (!t.ok) return NextResponse.json({ error: t.error }, { status: 400 });
       scopeTargets.push(t.pair);
     }
-    for (const pair of scopeTargets) {
-      const g = await ensureScopeGroup(supabase, org.id, pair, userId);
+    // One read of the pairs' groups, not one per pair (ADR 0029 gate G3).
+    for (const g of await ensureScopeGroups(supabase, org.id, scopeTargets, userId)) {
       if ("error" in g) {
         const msg = /system_key|does not exist|schema cache/.test(g.error) ? "Assigning to a vertical / department needs migration 0096" : g.error;
         return NextResponse.json({ error: msg }, { status: 400 });
@@ -224,19 +225,21 @@ export async function POST(request: Request) {
   const inserted: unknown[] = [];
   /** Learners whose direct row was already there: each may be their own self-enrolment (converted below). */
   const alreadyUserIds: string[] = [];
-  for (const row of rows) {
-    const { data, error } = await supabase
-      .from("learning_path_assignments")
-      .insert(row)
-      .select("id, assignee_type, user_id, team_id, due_at, assigned_at")
-      .maybeSingle();
-    if (data) inserted.push(data);
-    else if (error && error.code !== "23505") {
-      return NextResponse.json({ error: error.message }, { status: 400 });
-    } else if (error && row.assignee_type === "user" && row.user_id) {
-      alreadyUserIds.push(row.user_id);
-    }
+  // The rows in one insert per 150 (ADR 0029 gate G3: one insert per named
+  // learner passed the platform's 50 calls from 11 learners on); each row's
+  // outcome is what its own insert answered, and the first error other than
+  // a duplicate answers 400, as before.
+  const written = await writeAssignmentRows(
+    supabase, "learning_path_assignments", { column: "path_id", id: body.pathId }, rows,
+    "id, assignee_type, user_id, team_id, due_at, assigned_at", { stopAtError: true }
+  );
+  if (written.error) {
+    return NextResponse.json({ error: written.error.message }, { status: 400 });
   }
+  written.outcomes.forEach((o, i) => {
+    if (o.kind === "inserted") inserted.push(o.data);
+    else if (o.kind === "duplicate" && rows[i].assignee_type === "user" && rows[i].user_id) alreadyUserIds.push(rows[i].user_id!);
+  });
 
   // ADR 0024 step 24 (P2-6 item 2): a learner who only pressed Start on an
   // "Everyone" path holds a self row; this assignment converts it (source
@@ -253,15 +256,21 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: conversion.error.message ?? "Could not convert a self-enrolment" }, { status: 400 });
   }
 
-  // Fire path_assignment notifications in the background.
+  // Path assignment mail (ADR 0029 rule T4): one run, within this
+  // request's budgets; the answer says how many were emailed and how many
+  // were not. A failed read of the recipients mails nobody, records the skip
+  // and says so.
+  let email: MailOutcome | null = null;
   if (inserted.length > 0) {
-    await (async () => {
+    email = await (async (): Promise<MailOutcome | null> => {
       try {
         const svc = createServiceClient(
           process.env.NEXT_PUBLIC_SUPABASE_URL!,
           process.env.SUPABASE_SERVICE_ROLE_KEY!,
           { auth: { persistSession: false } }
         );
+        const budget = requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
+        spendCalls(budget, 1);
         const { data: pathRow } = await svc
           .from("learning_paths")
           .select("name")
@@ -273,66 +282,58 @@ export async function POST(request: Request) {
         // ADR 0030 rule 10: the organisation mails only members that count
         // (active, in an organisation that is not deleted). One read of them
         // for this request: it is the org-wide audience and the filter on
-        // every other one. Unreadable: no mail.
-        const counting = await countingMemberIds(svc, org.id);
+        // every other one.
+        const counting = await countingMemberIds(svc, org.id, undefined, countCalls(budget));
         if (counting === "unreadable") {
-          console.warn(JSON.stringify({ event: "mail_recipients_unreadable", site: "learning-path-assignments", org_id: org.id }));
-          return;
+          await recordRecipientsUnreadable("learning-path-assignments", org.id);
+          return RECIPIENTS_UNREADABLE;
         }
-        const recipientIds = new Set<string>();
-        for (const row of rows) {
-          if (row.assignee_type === "user" && row.user_id) {
-            recipientIds.add(row.user_id);
-          } else if (row.assignee_type === "team" && row.team_id) {
-            const { data: tm } = await svc
-              .from("team_members")
-              .select("user_id")
-              .eq("team_id", row.team_id);
-            for (const m of tm ?? []) recipientIds.add(m.user_id as string);
-          } else if (row.assignee_type === "group" && row.group_id) {
-            for (const uid of await resolveManyGroups(svc, org.id, [row.group_id])) {
-              recipientIds.add(uid);
-            }
-          } else if (row.assignee_type === "org") {
-            for (const uid of counting) recipientIds.add(uid);
-          }
+        const recipients = await assigneeRecipientsStrict(svc, org.id, rows, counting, countCalls(budget));
+        if (recipients === "unreadable") {
+          await recordRecipientsUnreadable("learning-path-assignments", org.id);
+          return RECIPIENTS_UNREADABLE;
         }
-        // A person named directly, in a team or in a static group may hold a
-        // row that does not count: they get no mail.
-        for (const uid of recipientIds) if (!counting.has(uid)) recipientIds.delete(uid);
+        if (recipients.size === 0) return mailCounts([]);
 
-        const emailById = await resolveEmails(svc, recipientIds);
+        spendCalls(budget, Math.ceil(recipients.size / 150));
+        const emailById = await resolveEmailsStrict(svc, recipients);
+        if (emailById === "unreadable") {
+          await recordRecipientsUnreadable("learning-path-assignments", org.id);
+          return RECIPIENTS_UNREADABLE;
+        }
 
         const portalBase = await originFromRequest();
         const directLink = portalBase
           ? `${portalBase}/${org.slug}/dashboard`
           : `/${org.slug}/dashboard`;
 
-        for (const uid of recipientIds) {
-          const email = emailById.get(uid);
-          if (!email) continue;
-          await notifyBackground({
-            organizationId: org.id,
-            event: "path_assignment",
-            to: { user_id: uid, email },
-            context: {
-              learner_name: email,
-              learner_email: email,
-              path_name: pathName,
-              path_id: body.pathId,
-              org_name: org.name,
-              direct_link: directLink,
-              due_date: dueAt
-                ? `Due ${new Date(dueAt).toISOString().slice(0, 10)}.`
-                : "",
-            },
-          });
-        }
+        const people = [...recipients].flatMap((uid) => {
+          const address = emailById.get(uid);
+          return address ? [{ uid, email: address }] : [];
+        });
+        const run = await openRun({ organizationId: org.id, budget, db: svc });
+        const results = await sendMany(run, people, (p) => ({
+          event: "path_assignment",
+          to: { user_id: p.uid, email: p.email },
+          context: {
+            learner_name: p.email,
+            learner_email: p.email,
+            path_name: pathName,
+            path_id: body.pathId,
+            org_name: org.name,
+            direct_link: directLink,
+            due_date: dueAt
+              ? `Due ${new Date(dueAt).toISOString().slice(0, 10)}.`
+              : "",
+          },
+        }));
+        return mailCounts(results, recipients.size - people.length);
       } catch (e) {
-        console.warn("[path-assignment] notify failed:", e);
+        console.warn(JSON.stringify({ event: "assignment_mail_failed", site: "learning-path-assignments", org_id: org.id, error: e instanceof Error ? e.name : "unknown" }));
+        return null;
       }
     })();
   }
 
-  return NextResponse.json({ assigned: inserted.length, assignments: inserted, warnings });
+  return NextResponse.json({ assigned: inserted.length, assignments: inserted, warnings, email });
 }

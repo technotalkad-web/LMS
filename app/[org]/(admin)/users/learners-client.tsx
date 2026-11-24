@@ -97,8 +97,17 @@ export function LearnersClient({
       updated?: number;
       skipped: number;
       errored: number;
+      emailed?: number;
+      not_emailed?: number;
     };
-    results?: Array<{ row: number; email: string; status: string; message?: string }>;
+    results?: Array<{
+      row: number;
+      email: string;
+      status: string;
+      message?: string;
+      /** The welcome's outcome (ADR 0029 step 16). */
+      email_outcome?: { status: "sent" } | { status: "not_sent"; class: string };
+    }>;
   } | null>(null);
 
   // Member search
@@ -673,18 +682,24 @@ export function LearnersClient({
                     tone="red"
                   />
                 )}
+                {(bulkSummary.summary.emailed ?? 0) > 0 && (
+                  <Counter label="welcome emailed" n={bulkSummary.summary.emailed!} tone="emerald" />
+                )}
+                {(bulkSummary.summary.not_emailed ?? 0) > 0 && (
+                  <Counter label="welcome not emailed" n={bulkSummary.summary.not_emailed!} tone="amber" />
+                )}
               </div>
               {/* Skipped/errored rows, plus rows saved with a note (e.g. a
                   reporting-line chain mismatch — saved, but worth a look). */}
               {(
                 bulkSummary.results?.filter(
-                  (r) => r.status === "skipped" || r.status === "error" || !!r.message
+                  (r) => r.status === "skipped" || r.status === "error" || !!r.message || r.email_outcome?.status === "not_sent"
                 ) ?? []
               ).length > 0 && (
                 <ul className="mt-3 text-xs text-muted space-y-1">
                   {bulkSummary.results
                     ?.filter(
-                      (r) => r.status === "skipped" || r.status === "error" || !!r.message
+                      (r) => r.status === "skipped" || r.status === "error" || !!r.message || r.email_outcome?.status === "not_sent"
                     )
                     .map((r) => (
                       <li key={r.row}>
@@ -702,6 +717,9 @@ export function LearnersClient({
                           {r.status !== "skipped" && r.status !== "error" ? `${r.status} — ` : ""}
                           {r.message}
                         </span>
+                        {r.email_outcome?.status === "not_sent" && (
+                          <span className="text-amber-700"> {welcomeWords(r.email_outcome)}</span>
+                        )}
                       </li>
                     ))}
                 </ul>
@@ -868,4 +886,26 @@ function Counter({
       <span className="font-semibold tabular-nums">{n}</span> {label}
     </span>
   );
+}
+
+/** A welcome's outcome in words (ADR 0029 step 16; a timeout is "not confirmed", rule T2). */
+function welcomeWords(o: { status: "sent" } | { status: "not_sent"; class: string } | null | undefined): string | null {
+  if (!o) return null;
+  if (o.status === "sent") return "The welcome email was sent.";
+  switch (o.class) {
+    case "timeout":
+      return "The welcome email is not confirmed: it may still arrive.";
+    case "inactive":
+      return "No welcome email: the person was added as inactive or suspended.";
+    case "paused":
+      return "The welcome email was not sent: email is paused for your organisation.";
+    case "daily_limit":
+      return "The welcome email was not sent: your organisation reached its daily email limit.";
+    case "not_configured":
+    case "not_ready":
+    case "settings_unreadable":
+      return "The welcome email was not sent: your organisation's email is not working (Settings, SMTP).";
+    default:
+      return "The welcome email was not sent: your organisation's mail server refused it.";
+  }
 }

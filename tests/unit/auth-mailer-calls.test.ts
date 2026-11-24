@@ -16,8 +16,8 @@
  *     reauthenticate), whatever the receiver;
  *   - the same for signUp and resend when the receiver is `…auth` or
  *     `…auth.admin` (other modules may use those words).
- * Planted cases prove each form fires and that generateLink, a Resend helper,
- * a comment and a string pass.
+ * Planted cases prove each form fires and that generateLink, the app's own
+ * send helper, another module's resend or signUp, a comment and a string pass.
  *
  * updateUser({ password }) (the change-password route) is not one of these:
  * Context point 1 names it as the one session call that can reach the mailer,
@@ -96,6 +96,8 @@ console.log("\nthe scan: no code under app/ or lib/ asks Supabase Auth to send m
     generateLink += (src.match(/\.generateLink\(/g) ?? []).length;
   }
   eq(`non-vacuous: files read (${all.length})`, all.length > 300, true);
+  // The four mints: the public sign-in link's job (lib/auth/credential-mail.ts),
+  // the two user routes' invite link, and the CRM's sign-in link.
   eq(`non-vacuous: the links are minted with generateLink (${generateLink} call sites)`, generateLink >= 4, true);
   eq("no call of inviteUserByEmail, signInWithOtp, resetPasswordForEmail, signUp, resend or reauthenticate", problems, []);
 }
@@ -116,7 +118,7 @@ console.log("\nthe scan: planted cases");
   eq("…a unique name on any receiver", one(`const a = client.admin.inviteUserByEmail;`), ["inviteUserByEmail"]);
   eq("generateLink passes (it sends nothing)", one(`await svc.auth.admin.generateLink({ type: "invite", email });`), []);
   eq("updateUser passes (Context point 1's one session call)", one(`await supabase.auth.updateUser({ password });`), []);
-  eq("a Resend helper or another module's signUp passes", one(`await dispatchResend(p); await mailer.resend(x); await form.signUp();`), []);
+  eq("the app's own send helper, or another module's resend or signUp, passes", one(`await dispatchSmtp(p); await mailer.resend(x); await form.signUp();`), []);
   eq("a comment or a string passes", one(`// never call auth.signInWithOtp here\nconst s = "supabase.auth.resetPasswordForEmail";`), []);
 }
 

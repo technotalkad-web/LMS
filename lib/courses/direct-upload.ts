@@ -31,6 +31,8 @@ import {
   storagePrefixFor,
 } from "./upload";
 import { notifyCourseUpdate } from "./notify-update";
+import type { MailOutcome } from "@/lib/notifications/send";
+import type { MailBudget } from "@/lib/notifications/smtp-state";
 import {
   forceRestartOlderVersions,
   forceRestartReport,
@@ -363,6 +365,8 @@ export type FinalizeResult =
        * failed restart into a 500 with `published: true`.
        */
       restart?: ForceRestartReport;
+      /** The "new version" mail to assigned learners, when it was asked for (ADR 0029 rule T4): emailed and not emailed. */
+      updateEmail?: MailOutcome;
     }
   | { ok: false; status: number; error: string; retryable?: boolean };
 
@@ -397,6 +401,8 @@ export async function finalizeDirectUpload(args: {
   origin: string;
   /** ADR 0014 step 8: the learner notifier and email resolver the forced restart's re-issue uses (passed in by the route). */
   notify: ForceRestartNotify;
+  /** ADR 0029 rule T4: the request's mail budgets, shared by the re-issue mails and the update mail. */
+  mailBudget?: MailBudget;
 }): Promise<FinalizeResult> {
   const { supabase, org, versionId } = args;
   const loaded = await loadUploadingVersion(supabase, org.id, versionId);
@@ -493,8 +499,9 @@ export async function finalizeDirectUpload(args: {
     });
     restart = forceRestartReport(run);
   }
+  let updateEmail: MailOutcome | null = null;
   if (args.notifyUpdate && hadCurrent) {
-    await notifyCourseUpdate({ org, courseId: course.id });
+    updateEmail = await notifyCourseUpdate({ org, courseId: course.id, budget: args.mailBudget });
   }
 
   // ADR 0005 note (e) of 2026-10-19 (position: its addition of that date):
@@ -522,6 +529,7 @@ export async function finalizeDirectUpload(args: {
     fileCount: keys.length,
     unitCount,
     ...(restart ? { restart } : {}),
+    ...(updateEmail ? { updateEmail } : {}),
   };
 }
 

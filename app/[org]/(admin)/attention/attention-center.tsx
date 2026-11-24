@@ -23,6 +23,7 @@ import {
   type AttentionProviderMeta,
   type AttentionTypeConfig,
 } from "@/lib/attention/types";
+import { mailOutcomeWords, type MailOutcomeAnswer } from "@/lib/actions/types";
 
 export function AttentionCenter({
   orgSlug,
@@ -46,18 +47,24 @@ export function AttentionCenter({
   const router = useRouter();
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // What an action's email did (ADR 0029 rule T4): the learner's decision
+  // mail, or the requester's when a ticket is closed.
+  const [mailNotice, setMailNotice] = useState<string | null>(null);
   const [showConfig, setShowConfig] = useState(false);
 
-  async function act(busyKey: string, fn: () => Promise<Response>) {
+  async function act(busyKey: string, fn: () => Promise<Response>, mailTo?: string) {
     setBusy(busyKey);
     setError(null);
+    setMailNotice(null);
     try {
       const res = await fn();
+      const j = (await res.json().catch(() => ({}))) as { error?: string; email?: MailOutcomeAnswer | null; requester_email?: MailOutcomeAnswer | null };
       if (!res.ok) {
-        const j = (await res.json().catch(() => ({}))) as { error?: string };
         setError(j.error ?? `HTTP ${res.status}`);
         return;
       }
+      const words = mailTo ? mailOutcomeWords(j.email ?? j.requester_email) : null;
+      setMailNotice(words ? `${mailTo}: ${words}` : null);
       router.refresh();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Something went wrong");
@@ -72,7 +79,8 @@ export function AttentionCenter({
         method: "PATCH",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ action: "approve" }),
-      })
+      }),
+      "Email to the learner"
     );
   const reject = (id: string) =>
     act(`reject:${id}`, () =>
@@ -80,7 +88,8 @@ export function AttentionCenter({
         method: "PATCH",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ action: "reject" }),
-      })
+      }),
+      "Email to the learner"
     );
   const resolveTicket = (id: string) =>
     act(`ticket:${id}`, () =>
@@ -88,7 +97,8 @@ export function AttentionCenter({
         method: "PATCH",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ status: "closed" }),
-      })
+      }),
+      "Email to the requester"
     );
   const markRead = (it: AttentionItem) =>
     act(`read:${it.key}`, () =>
@@ -146,6 +156,11 @@ export function AttentionCenter({
       {error && (
         <div className="mb-3 border border-red-200 bg-red-50 text-red-900 rounded-xl px-3 py-2 text-sm flex items-center gap-2">
           <AlertTriangle className="w-4 h-4" /> {error}
+        </div>
+      )}
+      {mailNotice && (
+        <div role="status" className="mb-3 border border-line bg-paper text-ink rounded-xl px-3 py-2 text-sm">
+          {mailNotice}
         </div>
       )}
 

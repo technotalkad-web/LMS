@@ -187,6 +187,13 @@ async function main() {
       /const next = safeNextPath\(searchParams\.get\("next"\)\) \?\? "\/select-org";/.test(read("app/auth/callback/route.ts")), true);
     eq("the CRM entry route falls back to / when `to` is refused (so /\\host never leaves the site)",
       /const safeTo = safeNextPath\(to\) \?\? "\/";/.test(read("app/api/integrations/enter/route.ts")), true);
+    // ADR 0029 step 13: the sign-in link is minted after the response, by the
+    // route's job, which takes `next` as the route read it through the guard.
+    const magicRoute = read("app/api/auth/magic-link/route.ts");
+    const credentialMail = read("lib/auth/credential-mail.ts");
+    eq("the sign-in link route hands its job only safeNextPath's value", /const safeNext = safeNextPath\(/.test(magicRoute) && /next: safeNext\b/.test(magicRoute), true);
+    eq("…and the job lands a refused next on the organisation's dashboard, or on /select-org for the platform's mail",
+      /ctx\.next \?\? `\/\$\{org\.slug\}\/dashboard`/.test(credentialMail) && /ctx\.next \?\? "\/select-org"/.test(credentialMail), true);
     eq("the org login falls back to the org dashboard",
       /safeNextPath\(new URLSearchParams\(window\.location\.search\)\.get\("next"\)\) \?\? `\/\$\{orgSlug\}\/dashboard`/.test(read("app/[org]/login/branded-login.tsx")), true);
     const mw = read("lib/supabase/middleware.ts");

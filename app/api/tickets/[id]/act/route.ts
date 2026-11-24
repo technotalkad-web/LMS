@@ -3,6 +3,7 @@ import { originFromRequest } from "@/lib/http/origin";
 import { isActionError } from "@/lib/actions/types";
 import { loadTicketForCaller } from "@/lib/tickets/auth";
 import { actOnTicket, type TicketAction } from "@/lib/tickets/actions";
+import { MIDDLEWARE_CALLS, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 
 const ACTIONS: TicketAction[] = ["grant_retry", "assign", "extend_due", "decline", "resolve"];
 
@@ -12,9 +13,22 @@ const ACTIONS: TicketAction[] = ["grant_retry", "assign", "extend_due", "decline
  *
  * Admin-only (decision 12: managers raise, admins act). Runs the matching
  * admin operation on the ticket's context (same code as the admin screens),
- * closes the ticket with an outcome and emails the requester.
+ * closes the ticket with an outcome and emails the requester when the
+ * action is finished (`closed: true`). When it could not finish (people
+ * left marked to try again: not saved for want of the request's room, or
+ * not confirmed), the ticket stays open, in_progress with a thread message
+ * and no mail to the requester, and the answer says so (`closed: false`, a
+ * null outcome); the administrator presses the same action again, which
+ * finishes the rest and closes the ticket once nobody is left (ADR 0029,
+ * note of 2026-11-25, part 2). A ticket closed with an outcome answers 409.
+ *
+ * ADR 0029 rule FP2: the request's one budget starts with the request and
+ * counts from its first call, the middleware's, then the session, ticket
+ * and membership reads, and every call of the action after them
+ * (actOnTicket).
  */
 export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  const budget = requestBudget({ spent: MIDDLEWARE_CALLS });
   const { id } = await params;
   const body = (await request.json().catch(() => ({}))) as {
     action?: string; note?: string; dueAt?: string | null; expires_in_days?: number | null;
@@ -24,6 +38,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
   }
   const c = await loadTicketForCaller(id);
   if (isActionError(c)) return NextResponse.json({ error: c.error }, { status: c.status });
+  spendCalls(budget, c.calls);
   if (c.party !== "admin") return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   if (c.ticket.status === "closed" && c.ticket.outcome) {
     return NextResponse.json({ error: "This ticket is already closed with an outcome" }, { status: 409 });
@@ -34,6 +49,7 @@ export async function POST(request: Request, { params }: { params: Promise<{ id:
     note: typeof body.note === "string" ? body.note.slice(0, 2000) : null,
     dueAt: typeof body.dueAt === "string" ? body.dueAt : null,
     expiresInDays: body.expires_in_days === null || typeof body.expires_in_days === "number" ? body.expires_in_days : undefined,
+    budget,
   });
   if (isActionError(r)) return NextResponse.json({ error: r.error }, { status: r.status });
   return NextResponse.json({ ok: true, ...r });

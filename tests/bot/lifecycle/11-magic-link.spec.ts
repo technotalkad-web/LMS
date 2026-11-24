@@ -6,11 +6,13 @@
  *   from the inbox, follow the link, and confirm the user lands authenticated
  *   (not bounced to /login).
  *
- * NOTE: magic-link emails are sent by Supabase Auth's mailer (not the org
- * SMTP). Delivery + the post-verify redirect depend on the Supabase project's
- * Auth email + Site/redirect URL config. If Supabase Auth SMTP isn't set, the
- * built-in relay is rate-limited (~3-4/hr) and these can be flaky — that's a
- * config finding, not an app bug.
+ * The invite's link is still the auth server's own invite (generateLink with
+ * type invite; tests/unit/auth-mailer-calls.test.ts), but the auth server
+ * sends nothing: the organisation's own SMTP mails it (account_invite), and
+ * the route waits for that send and says what came of it (ADR 0029 section
+ * C, step 16): `invited` true and `email_outcome` { status: "sent" } for a
+ * new account whose welcome was delivered to the mail server. The post-verify
+ * redirect depends on the Supabase project's Site/redirect URL config.
  */
 import { test, expect } from "@playwright/test";
 import { addMember, createAuthUser, createOrg, rand } from "./data";
@@ -61,7 +63,10 @@ test.describe.serial("Phase 1 — magic-link onboarding (3 users)", () => {
           node_id: "root",
         },
       });
-      expect(res.ok(), `invite ${u.email} → ${res.status()}: ${await res.text()}`).toBeTruthy();
+      expect(res.ok(), `invite ${u.tag} → ${res.status()}`).toBeTruthy();
+      const body = (await res.json()) as { invited?: unknown; email_outcome?: { status?: unknown; class?: unknown } | null };
+      expect(body.invited, `${u.tag}: a new account with no password is invited`).toBe(true);
+      expect(body.email_outcome?.status, `${u.tag}: the welcome was sent through the organisation's SMTP (class ${String(body.email_outcome?.class ?? "-")})`).toBe("sent");
     }
     await ctx.close();
   });

@@ -198,10 +198,10 @@ console.log("\nPOST /api/attempt-requests: the page's rule, strict reads, before
   eq("the attempts columns name status", /const ATTEMPT_COLUMNS = "[^"]*\bstatus\b[^"]*";/.test(src), true);
   eq("the attempts read adds is_revision through the narrower-select fallback",
     /readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",[\s\S]*?\.from\("course_attempts"\)[\s\S]*?ATTEMPT_COLUMNS\s*\)/.test(src), true);
-  eq("ADR 0024 P2-5: the query sits in the preview filter, one fresh decision for the request",
-    /const previews: ContextFilterState = \{ applies: null \};\s*const \{ data: attRows, error: attErr \} = await readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",\s*\(columns\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(s\.from\("course_attempts"\)\.select\(columns\)\.eq\("user_id", user\.id\)\.in\("course_version_id", vIds\), apply\)/.test(src), true);
-  eq("versions, attempts and grants are error-checked inside one try: grantSnapshotFor, then computeScoring",
-    inOrder(src, ["try {", 'from("course_versions")', "if (verErr || !verRows) throw", "if (attErr || !attRows) throw", "grantSnapshotFor(s, user.id, course.id)", "computeScoring(attempts, policy, snapshot.retakeIds)", "} catch (e) {", '{ error: "records_unreadable" }, { status: 503 }']), true);
+  eq("ADR 0024 P2-5: the query sits in the preview filter, one fresh decision for the request (ADR 0029 rule FP2: each call counted where it is built)",
+    /const previews: ContextFilterState = \{ applies: null \};\s*const \{ data: attRows, error: attErr \} = await readWithOptionalColumn<ScorableAttempt\[\]>\(\s*"is_revision",\s*\(columns\) =>\s*readWithContextFilter\(previews, \(apply\) => \{\s*spendCalls\(budget, 1\);\s*return withoutPreviews\(s\.from\("course_attempts"\)\.select\(columns\)\.eq\("user_id", user\.id\)\.in\("course_version_id", vIds\), apply\);/.test(src), true);
+  eq("versions, attempts and grants are error-checked inside one try: grantSnapshotFor (its reads counted), then computeScoring",
+    inOrder(src, ["try {", 'from("course_versions")', "if (verErr || !verRows) throw", "if (attErr || !attRows) throw", "grantSnapshotFor(s, user.id, course.id, undefined, countCalls(budget))", "computeScoring(attempts, policy, snapshot.retakeIds)", "} catch (e) {", '{ error: "records_unreadable" }, { status: 503 }']), true);
   eq("requestDecision( and both 409s come before the insert",
     inOrder(src, ["requestDecision({ scoring, attempts })", "REQUEST_MESSAGES.no_official_result }, { status: 409 }", "REQUEST_MESSAGES.retake_live }, { status: 409 }", ".insert({"]), true);
   eq("the fail-soft grantRetakeIdsFor is gone, and one attempts read remains (attempts_used reuses the scoring)",
@@ -245,17 +245,18 @@ console.log("\nPOST /api/attempt-requests/bulk: fail closed, skip a live retake 
   eq("the attempts columns name status, and the read adds is_revision through readPagedWithOptionalColumn (the first page decides)",
     /const ATTEMPT_COLUMNS = "[^"]*\bstatus\b[^"]*";/.test(src) &&
       // ADR 0024 P2-5: the query sits in the preview filter, one decision for every page.
-      /const previews: ContextFilterState = \{ applies: null \};\s*const attemptsRead = await readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) =>\s*withoutPreviews\(s\.from\("course_attempts"\)\.select\(cols\)[\s\S]*?, apply\)\s*\.order\("id"\)\s*\.range\(from, to\)\s*\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);\s*if \(attemptsRead\.error\) return unreadable\("attempts"\);/.test(src), true);
+      /const previews: ContextFilterState = \{ applies: null \};\s*const attemptsRead = await readPagedWithOptionalColumn<Att>\(\s*"is_revision",\s*\(cols, from, to\) =>\s*readWithContextFilter\(previews, \(apply\) => \{\s*spendCalls\(budget, 1\);\s*return withoutPreviews\(s\.from\("course_attempts"\)\.select\(cols\)[\s\S]*?, apply\)\s*\.order\("id"\)\s*\.range\(from, to\);\s*\}\)[^,]*,\s*ATTEMPT_COLUMNS,\s*\{ nullIsError: true \}\s*\);\s*if \(attemptsRead\.error\) return unreadable\("attempts"\);/.test(src), true);
   eq("…a failed page or an empty answer still answers 503 (nullIsError), and no local copy of the first-page closure remains",
     [/\{ nullIsError: true \}/.test(src), /= used;|readWithOptionalColumn\b/.test(src)], [true, false]);
   eq("eligibility is bulkEligibility(…) === \"grant\"; a live retake is counted in skipped_live_retake",
     /const verdict = bulkEligibility\(\{ scoring: sc, attempts: list, passRequired \}\);\s*if \(verdict === "retake_live"\) skippedLiveRetake\+\+;\s*if \(verdict !== "grant"\) continue;/.test(src), true);
-  eq("the strict bulk snapshot replaces the fail-soft read", [/grantSnapshotForUsers\(s, org\.id, \[course\.id\], userIds\)/.test(src), /fetchGrantRetakeIdsForUsers/.test(src)], [true, false]);
+  eq("the strict bulk snapshot replaces the fail-soft read", [/grantSnapshotForUsers\(s, org\.id, \[course\.id\], userIds, undefined, countCalls\(budget\)\)/.test(src), /fetchGrantRetakeIdsForUsers/.test(src)], [true, false]);
   eq("the versions, attempts, grants and open-requests reads each answer 503 (unreadable) before the insert",
     inOrder(src, ['return unreadable("versions")', 'return unreadable("attempts")', 'return unreadable("grants")', 'return unreadable("open requests")', ".insert(rows)"]), true);
   eq("unreadable answers 503 records_unreadable", /const unreadable = \(read: string\) => \{[\s\S]*?\{ error: "records_unreadable" \}, \{ status: 503 \}/.test(src), true);
   eq("no .insert( before the last 503", src.indexOf(".insert(") > src.lastIndexOf('return unreadable("'), true);
-  eq("the answer carries skipped_live_retake", /skipped_live_retake: skippedLiveRetake,\s*failed_total: failedUserIds\.length,\s*\}\);\s*\}\s*$/.test(src), true);
+  // ADR 0029 rule T4: the answer also carries the grants' mail outcome, when a grant was made.
+  eq("the answer carries skipped_live_retake (and the mail's outcome after it)", /skipped_live_retake: skippedLiveRetake,\s*failed_total: failedUserIds\.length,\s*\.\.\.\(email \? \{ email \} : \{\}\),\s*\}\);\s*\}\s*$/.test(src), true);
 }
 
 console.log("\nThe Attempt Requests page: the strict chain read, the request-time result (ADR 0014 steps 7, 11)");
@@ -387,6 +388,10 @@ function fakeDb(tables: Record<string, FRow[]>, fault: Fault = () => null) {
   const db = { from, rpc: async () => ({ data: [], error: null }) } as unknown as SupabaseClient;
   return { db, queries, inserts, updates };
 }
+
+/** The rows of every insert, one insert or several (ADR 0029 gate G3: a call's grants are one insert). */
+const insertedRows = (f: { inserts: Array<{ table: string; payload: unknown }> }) =>
+  f.inserts.flatMap((i) => (Array.isArray(i.payload) ? (i.payload as FRow[]) : [i.payload as FRow]));
 
 const ORG = "org-1";
 const COURSE = "course-1";
@@ -558,7 +563,7 @@ async function ticketCases() {
     const out = await ticketOf(f.db);
     eq("with 0107: only the learners who failed for real are granted; a Preview alone or a failed Preview beside a real pass is not a failure",
       byUid(out), { u1: "granted", u4: "skipped: has not failed this module", u5: "granted", u6: "skipped: has not failed this module" });
-    eq("…attempts_used counts the real attempt only", f.inserts.map((i) => [(i.payload as FRow).user_id, (i.payload as FRow).attempts_used]), [["u1", 1], ["u5", 1]]);
+    eq("…attempts_used counts the real attempt only", insertedRows(f).map((r) => [r.user_id, r.attempts_used]), [["u1", 1], ["u5", 1]]);
     eq("…one attempts read, with context_kind neq preview", f.queries.filter(isAttempts).map(filterOf), ["preview"]);
   }
   {
@@ -579,6 +584,9 @@ async function ticketCases() {
       [byUid(out).u1, byUid(out).u5, f.queries.filter((q) => q.table === "organizations").length, memberReads.length,
         memberReads[0]?.ops.some((o) => o.op === "eq" && o.args[0] === "status" && o.args[1] === "active")],
       ["granted", "granted", 1, 1, true]);
+    // ADR 0029 rule T4: the answer carries the mails' outcome for the administrator at the screen.
+    eq("…the answer's mail outcome: neither granted learner counts, so nobody is counted as emailed or not",
+      (out as { email?: unknown }).email, { recipients_unreadable: false, emailed: 0, not_emailed: 0, not_confirmed: 0 });
   }
   {
     // The members that count cannot be read: the grants stand, no mail, one log line with the organisation's id.
@@ -594,9 +602,43 @@ async function ticketCases() {
     }
     const lines = warned.filter((l) => l.includes("mail_recipients_unreadable"));
     eq("the members that count cannot be read: both grants stand, read once, no member read, one log line with the organisation's id",
-      [byUid(out).u1, byUid(out).u5, f.inserts.length, f.queries.filter((q) => q.table === "organizations").length,
+      [byUid(out).u1, byUid(out).u5, insertedRows(f).length, f.queries.filter((q) => q.table === "organizations").length,
         f.queries.filter((q) => q.table === "organization_members").length, lines.length, lines.every((l) => l.includes(ORG) && !l.includes("@"))],
       ["granted", "granted", 2, 1, 0, 1, true]);
+    eq("…and the answer says nobody was emailed because the recipients could not be read (the inbox shows it)",
+      (out as { email?: unknown }).email, { recipients_unreadable: true });
+  }
+  {
+    // ADR 0029 gate G3: the grants are one insert. One learner's grant made
+    // since the read (23505) fails that insert; each row is then inserted on
+    // its own, so that learner is failed and the other granted, as before.
+    const insertOf = (q: FQ) => q.ops.find((o) => o.op === "insert")?.args[0];
+    const f = fakeDb(withPreviews(true), (q) => {
+      const p = insertOf(q);
+      if (!p) return null;
+      return Array.isArray(p) || (p as FRow).user_id === "u5" ? { code: "23505", message: "duplicate key value violates unique constraint" } : null;
+    });
+    const out = await ticketOf(f.db);
+    eq("one learner's grant already made: the refused insert of both, then one insert each; that learner failed, the other granted",
+      [f.inserts.map((i) => (Array.isArray(i.payload) ? `both ${(i.payload as FRow[]).map((r) => r.user_id).join(",")}` : (i.payload as FRow).user_id)), byUid(out).u1, byUid(out).u5],
+      [["both u1,u5", "u1", "u5"], "granted", "failed: already has an open request or grant"]);
+  }
+  {
+    // An older source CHECK (23514): the insert of both degrades as one, to a bulk-style grant, as each row's own insert did.
+    const f = fakeDb(withPreviews(true), (q) => {
+      const p = q.ops.find((o) => o.op === "insert")?.args[0];
+      return Array.isArray(p) && (p as FRow[]).some((r) => r.source !== "bulk") ? { code: "23514", message: "new row violates check constraint" } : null;
+    });
+    const out = await ticketOf(f.db);
+    eq("23514 on the insert of both: one more insert of both with source bulk; both granted",
+      [f.inserts.map((i) => (i.payload as FRow[]).map((r) => r.source)), byUid(out).u1, byUid(out).u5],
+      [[["ticket", "ticket"], ["bulk", "bulk"]], "granted", "granted"]);
+  }
+  {
+    // Nothing granted: no mail to speak of, and no outcome in the answer.
+    const f = fakeDb(TABLES(), (q) => (q.table === "course_versions" ? BOOM : null));
+    const out = await ticket(f.db);
+    eq("nothing granted (a failed read): the answer carries no mail outcome", "email" in (out as object), false);
   }
   {
     // A database without 0107: the filter answers 42703 naming context_kind.

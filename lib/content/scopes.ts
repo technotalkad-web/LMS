@@ -30,7 +30,9 @@ const key = (t: ContentType, id: string) => `${t}:${id}`;
 export async function loadScopes(
   svc: SupabaseClient,
   orgId: string,
-  items: Array<{ type: ContentType; id: string }>
+  items: Array<{ type: ContentType; id: string }>,
+  /** Called before each call (ADR 0029 rule FP2: a request that counts its calls). */
+  countCall?: () => unknown
 ): Promise<Map<string, ContentScopes>> {
   const out = new Map<string, ContentScopes>();
   for (const it of items) out.set(key(it.type, it.id), { common: false, pairs: [] });
@@ -38,7 +40,7 @@ export async function loadScopes(
   if (ids.length === 0) return out;
   let rows: Array<{ content_type: ContentType; content_id: string; vertical: string; department: string | null }> = [];
   try {
-    rows = await fetchByIds(svc, "content_scopes", "content_type, content_id, vertical, department", "content_id", ids, (q) => q.eq("organization_id", orgId), "content_id");
+    rows = await fetchByIds(svc, "content_scopes", "content_type, content_id, vertical, department", "content_id", ids, (q) => q.eq("organization_id", orgId), "content_id", countCall);
   } catch {
     return out; // pre-0096
   }

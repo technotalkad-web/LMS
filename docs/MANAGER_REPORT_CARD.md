@@ -171,7 +171,12 @@ someone who held the course only via a team / group / org row and sends no
 overrides inherited dates**, so one person can be extended without touching
 the team's date), **Decline** (with a reason), **Mark
 resolved**. Each closes the ticket with an `outcome`, posts a thread message
-and emails the requester (`POST /api/tickets/[id]/act`, admin only). Replies
+and emails the requester (`POST /api/tickets/[id]/act`, admin only). An
+action that could not finish (people left to try again: not saved for want
+of the request's room, or not confirmed) leaves the ticket in progress, with
+a thread message and no email to the requester, and the same action is run
+again; the ticket closes when nobody is left (ADR 0029, note of 2026-11-25,
+part 2). Replies
 in both directions go through `POST /api/tickets/[id]/messages`
 (`help_ticket_messages`; a requester reply reopens a closed ticket as
 in_progress; the other side is emailed). `PATCH /api/tickets/[id]` now checks

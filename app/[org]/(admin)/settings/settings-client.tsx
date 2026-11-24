@@ -73,6 +73,57 @@ export type WorkspaceBranding = {
   learner_theme_custom: Record<string, string> | null;
 };
 
+/** The organisation's SMTP reading for the SMTP tab (ADR 0029 section C). */
+export type MailState =
+  | {
+      known: true;
+      reading: "not_configured" | "configured" | "healthy" | "failing";
+      since: string | null;
+      lastErrorClass: string | null;
+      lastSuccessAt: string | null;
+      sent24h: number;
+      limit: number;
+      routineStop: number;
+    }
+  | { known: false; reading: "not_configured" | "configured" | "healthy" | "failing" };
+
+/** What a Settings test answered (lib/notifications/send.ts, SettingsTestOutcome). */
+type TestOutcome = {
+  status: "sent" | "not_confirmed" | "not_sent";
+  errorClass: string | null;
+  attempted: boolean;
+  reading: MailState["reading"];
+};
+
+const CLASS_WORDS: Record<string, string> = {
+  auth: "the mail server refused the sign-in (user name or app password)",
+  quota: "the mailbox's own sending limit was reached",
+  timeout: "the mail server did not answer in time",
+  unreachable: "the mail server could not be reached as configured",
+  rejected: "the receiving mailbox refused this message",
+  unknown: "the mail server answered with an error",
+  not_configured: "the SMTP settings are not complete (host, port and From address)",
+  daily_limit: "your organisation reached its daily email limit",
+  settings_unreadable: "the settings could not be read; try again",
+  no_address: "your account has no email address to send the test to",
+  call_limit: "the request reached the platform's limit on outbound calls before the test reached your mail server, so your settings were not tested; try again",
+  left: "the request ran out of room before the test could be sent; try again",
+};
+
+const READING_WORDS: Record<MailState["reading"], string> = {
+  not_configured: "Not configured: no email is sent to your learners until host, port and From address are saved.",
+  configured: "Configured: no email has been sent yet. Send a test to check it.",
+  healthy: "Working: the latest email was delivered.",
+  failing: "Failing: email to your learners is not sent until a test or another email is delivered.",
+};
+
+function testWords(t: TestOutcome): { tone: "ok" | "warn" | "bad"; text: string } {
+  if (t.status === "sent") return { tone: "ok", text: "Test sent to your own address. Check your inbox." };
+  if (t.status === "not_confirmed") return { tone: "warn", text: "Not confirmed: the mail may still arrive." };
+  const why = (t.errorClass && CLASS_WORDS[t.errorClass]) || "it could not be sent";
+  return { tone: "bad", text: t.attempted ? `Test not sent: ${why}.` : `Test not attempted: ${why}.` };
+}
+
 export type SsoConfig = {
   enabled: boolean;
   enforced: boolean;
@@ -99,18 +150,33 @@ export type LrsConfigView = {
   last_test_error: string | null;
 };
 
+type SettingsTab = "workspace" | "smtp" | "branding" | "templates";
+const SETTINGS_TABS: readonly SettingsTab[] = ["workspace", "smtp", "branding", "templates"];
+
+/**
+ * The tab Settings opens on, from the page's `?tab=` (ADR 0029 section E:
+ * the email banner and its Attention Center item open the SMTP tab). One of
+ * the four tabs' keys, else Workspace.
+ */
+export function settingsTabOf(value: string | null | undefined): SettingsTab {
+  return SETTINGS_TABS.find((t) => t === value) ?? "workspace";
+}
+
 export function SettingsClient({
   orgSlug,
   settings,
+  mailState,
   templates,
   orgName,
   workspace,
   sso,
   lrs,
   dashboardBackgrounds = [],
+  initialTab,
 }: {
   orgSlug: string;
   settings: Settings;
+  mailState: MailState;
   templates: Tpl[];
   orgName: string;
   workspace: WorkspaceBranding;
@@ -118,13 +184,17 @@ export function SettingsClient({
   lrs: LrsConfigView;
   /** 0074 dashboard background themes. */
   dashboardBackgrounds?: DashboardBackground[];
+  /** The page's `?tab=`, read through settingsTabOf. */
+  initialTab?: string;
 }) {
   const router = useRouter();
-  const [tab, setTab] = useState<
-    "workspace" | "smtp" | "branding" | "templates"
-  >("workspace");
+  const [tab, setTab] = useState<SettingsTab>(() => settingsTabOf(initialTab));
+  // A link to another tab while Settings is already open (the banner's link,
+  // say) changes only the query: follow it.
+  useEffect(() => {
+    if (initialTab !== undefined) setTab(settingsTabOf(initialTab));
+  }, [initialTab]);
 
-  type SettingsTab = "workspace" | "smtp" | "branding" | "templates";
   const settingsTabs: Tab<SettingsTab>[] = [
     { key: "workspace", label: "Workspace", icon: <SettingsIcon className="w-4 h-4" /> },
     { key: "smtp", label: "SMTP", icon: <Mail className="w-4 h-4" /> },
@@ -153,7 +223,7 @@ export function SettingsClient({
         </div>
       )}
       {tab === "smtp" && (
-        <SmtpForm orgSlug={orgSlug} initial={settings} onSaved={() => router.refresh()} />
+        <SmtpForm orgSlug={orgSlug} initial={settings} mailState={mailState} onSaved={() => router.refresh()} />
       )}
       {tab === "branding" && (
         <BrandingPauseForm
@@ -180,16 +250,39 @@ export function SettingsClient({
 function SmtpForm({
   orgSlug,
   initial,
+  mailState,
   onSaved,
 }: {
   orgSlug: string;
   initial: Settings;
+  mailState: MailState;
   onSaved: () => void;
 }) {
   const [form, setForm] = useState({ ...initial, smtp_password: "" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [test, setTest] = useState<TestOutcome | null>(null);
+  const [testing, setTesting] = useState(false);
+
+  async function sendTest() {
+    setTesting(true);
+    setError(null);
+    setTest(null);
+    const res = await fetch("/api/notifications/settings/test", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ orgSlug }),
+    });
+    setTesting(false);
+    const j = (await res.json().catch(() => ({}))) as { error?: string; test?: TestOutcome };
+    if (!res.ok || !j.test) {
+      setError(j.error ?? "The test could not be run");
+      return;
+    }
+    setTest(j.test);
+    onSaved();
+  }
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -213,12 +306,14 @@ function SmtpForm({
       body: JSON.stringify(payload),
     });
     setBusy(false);
-    const j = (await res.json().catch(() => ({}))) as { error?: string };
+    const j = (await res.json().catch(() => ({}))) as { error?: string; test?: TestOutcome | null };
     if (!res.ok) {
       setError(j.error ?? "Save failed");
       return;
     }
     setSaved(true);
+    // A save that changed an SMTP field ran the test: show its result.
+    setTest(j.test ?? null);
     setForm((f) => ({ ...f, smtp_password: "" }));
     onSaved();
   }
@@ -231,7 +326,40 @@ function SmtpForm({
       <h2 className="serif text-2xl">SMTP server</h2>
       <p className="text-xs text-muted -mt-2">
         587 STARTTLS, 465 SSL, 25 unencrypted. Auth via app password recommended.
+        Every email to your learners goes through this server only; nothing is sent another way.
       </p>
+
+      <div
+        className={`rounded-lg border p-3 text-sm ${
+          mailState.reading === "healthy"
+            ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+            : mailState.reading === "configured"
+              ? "border-line bg-canvas text-ink"
+              : "border-amber-200 bg-amber-50 text-amber-900"
+        }`}
+      >
+        <div>{READING_WORDS[mailState.reading]}</div>
+        {mailState.known ? (
+          <div className="mt-1 text-xs opacity-80 space-y-0.5">
+            {mailState.since && <div>Since {new Date(mailState.since).toLocaleString()}.</div>}
+            {mailState.reading === "failing" && mailState.lastErrorClass && (
+              <div>Last error: {CLASS_WORDS[mailState.lastErrorClass] ?? mailState.lastErrorClass}.</div>
+            )}
+            <div>
+              Sent in the last 24 hours: {mailState.sent24h} of the limit of {mailState.limit}.
+              {mailState.sent24h >= mailState.limit
+                ? " All email has stopped until earlier email is more than 24 hours old."
+                : mailState.routineStop === 0
+                  ? " At this limit reminders, announcements and assignment email are never sent: the whole limit is kept for reset codes, sign-in links and welcome email. A platform owner sets the limit."
+                  : mailState.sent24h >= mailState.routineStop
+                  ? " Reminders, announcements and assignment email have stopped; reset codes and welcome email go on until the limit."
+                  : ""}
+            </div>
+          </div>
+        ) : (
+          <div className="mt-1 text-xs opacity-80">{"The server's last result and today's count are not known yet."}</div>
+        )}
+      </div>
 
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <Field label="Host">
@@ -326,11 +454,29 @@ function SmtpForm({
           Saved.
         </div>
       )}
+      {test && (() => {
+        const w = testWords(test);
+        const tone =
+          w.tone === "ok"
+            ? "border-emerald-200 bg-emerald-50 text-emerald-900"
+            : w.tone === "warn"
+              ? "border-amber-200 bg-amber-50 text-amber-900"
+              : "border-red-200 bg-red-50 text-red-900";
+        return <div className={`border rounded-lg p-3 text-sm ${tone}`}>{w.text}</div>;
+      })()}
 
-      <div className="flex justify-end">
+      <div className="flex justify-end gap-2">
+        <button
+          type="button"
+          onClick={sendTest}
+          disabled={busy || testing}
+          className="px-5 py-2 border border-line rounded-lg font-medium hover:bg-canvas disabled:opacity-50"
+        >
+          {testing ? "Sending test…" : "Send test"}
+        </button>
         <button
           type="submit"
-          disabled={busy}
+          disabled={busy || testing}
           className="px-5 py-2 bg-ink text-canvas rounded-lg font-medium hover:opacity-90 disabled:opacity-50"
         >
           {busy ? "Saving…" : "Save SMTP"}
@@ -364,7 +510,19 @@ const PAUSE_EVENTS: NotificationEvent[] = [
   "path_assignment",
   "path_unassignment",
   "path_completion",
+  // ADR 0029, the owner's decision of 2026-11-21: broadcasts, ticket mail
+  // and attempt-request mail all go as custom_broadcast, and its pause
+  // stops all three.
+  "custom_broadcast",
 ];
+
+/**
+ * The pause list's own words for an event whose name alone says too little.
+ * The Templates tab keeps EVENT_LABELS.
+ */
+const PAUSE_LABELS: Partial<Record<NotificationEvent, string>> = {
+  custom_broadcast: "Custom broadcast, ticket and attempt-request email",
+};
 
 function BrandingPauseForm({
   orgSlug,
@@ -420,8 +578,9 @@ function BrandingPauseForm({
           <div>
             <h2 className="serif text-2xl">Master pause</h2>
             <p className="text-xs text-muted">
-              When on, all automatic emails are skipped. Admin-triggered
-              broadcasts still send.
+              When on, every email is skipped, broadcasts, ticket and
+              attempt-request emails included. Only password reset codes and
+              sign-in links still send: the person asked for them.
             </p>
           </div>
           <label className="flex items-center gap-2 text-sm">
@@ -451,7 +610,7 @@ function BrandingPauseForm({
               key={ev}
               className="flex items-center justify-between gap-2 px-3 py-2 border border-line rounded-lg"
             >
-              <span>{EVENT_LABELS[ev]}</span>
+              <span>{PAUSE_LABELS[ev] ?? EVENT_LABELS[ev]}</span>
               <input
                 type="checkbox"
                 checked={!form.event_paused[ev]}

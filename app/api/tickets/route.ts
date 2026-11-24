@@ -8,6 +8,7 @@ import { describeTicket, validateManagerContext } from "@/lib/tickets/context";
 import { notifyAdminsOfTicket } from "@/lib/tickets/notify";
 import { CATEGORY_LABEL, isTicketCategory } from "@/lib/tickets/types";
 import { namesAndEmails } from "@/lib/users/people";
+import { MIDDLEWARE_CALLS, countCalls, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 
 /**
  *   POST /api/tickets
@@ -19,8 +20,14 @@ import { namesAndEmails } from "@/lib/users/people";
  * must be inside their reporting line and the content must belong to the
  * org — all verified here, never trusted from the browser. The subject is
  * generated from the context when blank, and the org's admins are emailed.
+ *
+ * ADR 0029 rule FP2: the request's one budget starts with the request and
+ * counts from its first call (the middleware's), each call where it is
+ * made, so the administrators' mail is sized on the calls really made
+ * (notifyAdminsOfTicket). Its 45 seconds start there too.
  */
 export async function POST(request: Request) {
+  const budget = requestBudget({ spent: MIDDLEWARE_CALLS });
   const body = (await request.json().catch(() => ({}))) as {
     orgSlug?: string;
     subject?: string;
@@ -35,12 +42,15 @@ export async function POST(request: Request) {
   }
 
   const supabase = await createClient();
+  spendCalls(budget, 1);
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   // ADR 0030: the caller must hold a membership in this org that counts
   // (active, in an org that is not deleted), for a learner ticket and a
   // manager ticket alike; anything else is answered as a non-member is.
+  // Two calls: the organisation by its slug, then the caller's member row.
+  spendCalls(budget, 2);
   const membership = await resolveOrgMembership<{ id: string; name: string; slug: string }>(
     supabase,
     { slug: body.orgSlug },
@@ -67,10 +77,13 @@ export async function POST(request: Request) {
   // ---- manager ticket -----------------------------------------------------
   if (!isTicketCategory(body.category)) return NextResponse.json({ error: "category is not valid" }, { status: 400 });
   const svc = svcClient();
-  const v = await validateManagerContext(svc, org.id, user.id, body.context ?? {});
+  const v = await validateManagerContext(svc, org.id, user.id, body.context ?? {}, countCalls(budget));
   if ("error" in v) return NextResponse.json({ error: v.error }, { status: v.status });
+  // The names of the people it names: one call for each 150.
+  spendCalls(budget, Math.ceil(v.context.userIds.length / 150));
   const { subject: generated, lines } = await describeTicket(svc, body.category, v.context);
   const subject = (body.subject?.trim() || generated).slice(0, 200);
+  spendCalls(budget, 1);
   const { data, error } = await svc
     .from("help_tickets")
     .insert({
@@ -85,11 +98,15 @@ export async function POST(request: Request) {
     if (code === "42703" || code === "PGRST204") return NextResponse.json({ error: "Support requests from the Report Card are not enabled yet (migration 0095)" }, { status: 409 });
     return NextResponse.json({ error: error.message }, { status: 400 });
   }
-  const me = (await namesAndEmails(svc, [user.id])).get(user.id);
+  // The ticket is saved: a failed read of the requester's own name is not a
+  // reason to answer an error. The mail then names them by their address.
+  spendCalls(budget, 1);
+  const me = await namesAndEmails(svc, [user.id]).then((m) => m.get(user.id)).catch(() => undefined);
   await notifyAdminsOfTicket(svc, {
     orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: await originFromRequest(),
     subject, requester: { name: me?.name ?? "A manager", email: me?.email ?? user.email ?? null },
     categoryLabel: CATEGORY_LABEL[body.category], lines, note,
+    budget,
   });
   return NextResponse.json({ id: data?.id, subject });
 }

@@ -29,6 +29,7 @@ import {
 } from "@/components/admin";
 import { CATEGORY_LABEL, OUTCOME_LABEL, type TicketCategory, type TicketOutcome } from "@/lib/tickets/types";
 import { GRANT_EXPIRY_CHOICES } from "@/lib/attempts/constants";
+import { mailOutcomeWords, type MailOutcomeAnswer } from "@/lib/actions/types";
 
 export type TicketView = {
   id: string;
@@ -60,18 +61,35 @@ export function TicketsInbox({ tickets, orgSlug, orgName }: { tickets: TicketVie
   const [filter, setFilter] = useState<Filter>(managerOpen > 0 ? "manager" : "open");
   const [busy, setBusy] = useState<string | null>(null);
   const [notes, setNotes] = useState<Record<string, string>>({});
+  // What the last action's emails did (ADR 0029 rule T4). Shown at the top of
+  // the page: a ticket closed by the action may leave the current view.
+  const [mailNotice, setMailNotice] = useState<string | null>(null);
 
   const filtered =
     filter === "all" ? tickets
       : filter === "manager" ? tickets.filter((t) => t.source === "manager" && t.status !== "closed")
       : tickets.filter((t) => t.status === filter);
 
-  const call = async (key: string, path: string, method: string, body: unknown): Promise<string | null> => {
+  const setOpenLine = (id: string, msg: string | null) => setNotes((n) => ({ ...n, [`open:${id}`]: msg ?? "" }));
+  // `ticketId`: the card whose "still open" line this call clears (an
+  // action, or a status change) and, on an action's answer, sets.
+  // A ticket's action that could not finish answers `closed: false` (ADR
+  // 0029, note of 2026-11-25, part 2): the ticket stays open, its answer's
+  // summary says what is left, and the administrator presses the same
+  // action again.
+  const call = async (key: string, path: string, method: string, body: unknown, ticketId?: string): Promise<string | null> => {
     setBusy(key);
+    setMailNotice(null);
+    if (ticketId) setOpenLine(ticketId, null);
     try {
       const res = await fetch(path, { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      const j = (await res.json().catch(() => ({}))) as { error?: string; summary?: string };
+      const j = (await res.json().catch(() => ({}))) as { error?: string; summary?: string; closed?: boolean; email?: MailOutcomeAnswer | null; requester_email?: MailOutcomeAnswer | null };
       if (!res.ok) return j.error ?? "Something went wrong";
+      const people = mailOutcomeWords(j.email);
+      const requester = mailOutcomeWords(j.requester_email);
+      const lines = [people && `Email to the people on the ticket: ${people}`, requester && `Email to the requester: ${requester}`].filter(Boolean);
+      setMailNotice(lines.length > 0 ? lines.join(" ") : null);
+      if (ticketId && j.closed === false) setOpenLine(ticketId, j.summary ?? "The action could not finish for everybody: the ticket stays open. Press the same action again.");
       router.refresh();
       return null;
     } catch {
@@ -117,6 +135,12 @@ export function TicketsInbox({ tickets, orgSlug, orgName }: { tickets: TicketVie
 
       <TabStrip tabs={tabs} active={filter} onChange={setFilter} />
 
+      {mailNotice && (
+        <div role="status" className="mb-3 border border-line bg-paper text-ink rounded-xl px-3 py-2 text-sm">
+          {mailNotice}
+        </div>
+      )}
+
       {filtered.length === 0 ? (
         <Card className="p-0">
           <EmptyState
@@ -134,10 +158,11 @@ export function TicketsInbox({ tickets, orgSlug, orgName }: { tickets: TicketVie
               orgSlug={orgSlug}
               busy={busy}
               error={notes[`err:${t.id}`] || null}
-              onSetStatus={async (s) => setErr(t.id, await call(`status:${t.id}`, `/api/tickets/${t.id}`, "PATCH", { status: s }))}
+              stillOpen={notes[`open:${t.id}`] || null}
+              onSetStatus={async (s) => setErr(t.id, await call(`status:${t.id}`, `/api/tickets/${t.id}`, "PATCH", { status: s }, t.id))}
               onSetPriority={async (p) => setErr(t.id, await call(`priority:${t.id}`, `/api/tickets/${t.id}`, "PATCH", { priority: p }))}
               onReply={async (text) => setErr(t.id, await call(`reply:${t.id}`, `/api/tickets/${t.id}/messages`, "POST", { body: text }))}
-              onAct={async (action, extra) => setErr(t.id, await call(`act:${t.id}`, `/api/tickets/${t.id}/act`, "POST", { action, ...extra }))}
+              onAct={async (action, extra) => setErr(t.id, await call(`act:${t.id}`, `/api/tickets/${t.id}/act`, "POST", { action, ...extra }, t.id))}
             />
           ))}
         </div>
@@ -153,6 +178,7 @@ function TicketCard({
   orgSlug,
   busy,
   error,
+  stillOpen,
   onSetStatus,
   onSetPriority,
   onReply,
@@ -162,6 +188,8 @@ function TicketCard({
   orgSlug: string;
   busy: string | null;
   error: string | null;
+  /** The last action's summary when it could not finish and the ticket stays open (ADR 0029, note of 2026-11-25, part 2). */
+  stillOpen: string | null;
   onSetStatus: (s: TicketView["status"]) => void;
   onSetPriority: (p: TicketView["priority"]) => void;
   onReply: (text: string) => Promise<void>;
@@ -251,6 +279,11 @@ function TicketCard({
       )}
 
       {error && <p role="alert" className="text-xs text-red-700">{error}</p>}
+      {stillOpen && (
+        <p role="status" data-testid="ticket-still-open" className="text-xs rounded-lg border border-amber-200 bg-amber-50/60 text-amber-800 px-2.5 py-1.5">
+          {stillOpen}
+        </p>
+      )}
 
       {mode === "reply" && (
         <div className="space-y-2">

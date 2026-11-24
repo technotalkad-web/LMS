@@ -10,6 +10,8 @@ export const OTP_LENGTH = 6;
 export const OTP_TTL_MINUTES = 10;
 export const MAX_VERIFY_ATTEMPTS = 5;
 export const MAX_REQUESTS_PER_HOUR = 5;
+/** One account's codes or links in 24 hours (ADR 0029 section G), in both systems. */
+export const MAX_REQUESTS_PER_DAY = 10;
 export const RESET_TOKEN_TTL_MINUTES = 15;
 
 /**

@@ -19,7 +19,9 @@ import { computeScoring, type ScorableAttempt, type ScoringResult } from "@/lib/
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { grantSnapshotFor, isMissingColumn, readWithOptionalColumn, type PgError } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
-import { resolveEmails } from "@/lib/users/emails";
+import { resolveEmailsStrict } from "@/lib/users/emails";
+import { recordRecipientsUnreadable } from "@/lib/notifications/smtp-state";
+import { RECIPIENTS_UNREADABLE } from "@/lib/notifications/send";
 
 /**
  *   PATCH /api/attempt-requests/{id}?orgSlug=acme
@@ -218,13 +220,20 @@ export async function PATCH(
     return NextResponse.json({ error: "This request has already been decided." }, { status: 409 });
   }
 
-  // Email the learner (background).
+  // Email the learner. The decision is saved: a failed read of their
+  // address mails nothing and records the skip (ADR 0029). The answer
+  // carries the mail's outcome for the administrator at the screen (rule
+  // T4): emailed or not, or nobody emailed because it could not be read.
   const [{ data: course }, emailMap, origin] = await Promise.all([
     s.from("courses").select("title").eq("id", reqRow.course_id).maybeSingle(),
-    resolveEmails(s, [reqRow.user_id]),
+    resolveEmailsStrict(s, [reqRow.user_id]),
     originFromRequest(),
   ]);
-  await notifyLearnerOfDecision(s, {
+  if (emailMap === "unreadable") {
+    await recordRecipientsUnreadable("attempt-decision", org.id as string);
+    return NextResponse.json({ ok: true, email: RECIPIENTS_UNREADABLE });
+  }
+  const email = await notifyLearnerOfDecision(s, {
     orgId: org.id as string,
     orgName: (org.name as string) ?? "your org",
     orgSlug,
@@ -237,5 +246,5 @@ export async function PATCH(
     expiresAt,
   });
 
-  return NextResponse.json({ ok: true });
+  return NextResponse.json({ ok: true, email });
 }

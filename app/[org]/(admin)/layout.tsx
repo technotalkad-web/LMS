@@ -8,6 +8,33 @@ import { NavItem } from "./_components/nav-item";
 import { Breadcrumbs } from "./_components/breadcrumbs";
 import { ImpersonationBanner } from "@/components/impersonation-banner";
 import { PlatformBroadcastBanner } from "@/components/platform-broadcast-banner";
+import { createClient as createServiceClient } from "@supabase/supabase-js";
+import { readTenantMailNotice, smtpSettingsPath, type TenantMailNotice } from "@/lib/notifications/smtp-state";
+
+/**
+ * The banner of section E (ADR 0029; rule FP4) for the organisation's
+ * super owners and admins: its email is not set up or failing, or its
+ * daily count is near the limit, past the line where routine mail stops,
+ * or at the limit; or its limit is so low that routine mail never goes.
+ * Fixed words, the count and the limit; no address.
+ */
+function tenantMailBanner(notice: TenantMailNotice | null): { tone: "critical" | "warning"; text: string } | null {
+  if (!notice) return null;
+  switch (notice.kind) {
+    case "not_configured":
+      return { tone: "critical", text: "Email is not set up for this organisation, so no email reaches your learners. Set up SMTP on the SMTP tab of Settings." };
+    case "failing":
+      return { tone: "critical", text: `Email is failing for this organisation${notice.lastErrorClass ? ` (last error: ${notice.lastErrorClass})` : ""}, so your learners' email is not being sent. Check the SMTP tab of Settings and send a test.` };
+    case "limit_reached":
+      return { tone: "critical", text: `All email has stopped: ${notice.sent24h} of the daily limit of ${notice.limit} were sent in the last 24 hours. Email starts again as the 24 hours move on.` };
+    case "routine_stopped":
+      return { tone: "critical", text: `Routine email has stopped for today: ${notice.sent24h} of the daily limit of ${notice.limit} were sent in the last 24 hours. Reset codes, sign-in links and welcome mail still go until the limit.` };
+    case "routine_off":
+      return { tone: "warning", text: `Routine email is off for this organisation: its daily limit of ${notice.limit} is no more than the part kept for reset codes, sign-in links and welcome mail, so reminders, announcements and assignment email are never sent. A platform owner sets the limit.` };
+    case "near_limit":
+      return { tone: "warning", text: `Email is near today's limit: ${notice.sent24h} of ${notice.limit} sent in the last 24 hours. Routine email stops before the limit.` };
+  }
+}
 
 /**
  * Section eyebrow inside the admin sidebar. Hidden on mobile so the nav stays a
@@ -74,6 +101,15 @@ export default async function AdminLayout({
     redirect(`/${org.slug}/dashboard?denied=1`);
   }
   const brandColor = (org.brand_color as string | null) || "#4f46e5";
+  // Only the roles that can act on it read and see the banner.
+  const mailBanner = manage
+    ? tenantMailBanner(
+        await readTenantMailNotice(
+          createServiceClient(process.env.NEXT_PUBLIC_SUPABASE_URL!, process.env.SUPABASE_SERVICE_ROLE_KEY!, { auth: { persistSession: false } }),
+          org.id
+        )
+      )
+    : null;
 
   return (
     <div
@@ -89,6 +125,17 @@ export default async function AdminLayout({
         <ImpersonationBanner orgName={org.name} expiresAt={impersonation.expiresAt} />
       )}
       <PlatformBroadcastBanner />
+      {mailBanner && (
+        <div
+          role="alert"
+          className={`px-4 py-2 text-sm border-b ${mailBanner.tone === "critical" ? "bg-red-50 text-red-800 border-red-200" : "bg-amber-50 text-amber-900 border-amber-200"}`}
+        >
+          {mailBanner.text}{" "}
+          <Link href={smtpSettingsPath(org.slug)} className="underline font-medium">
+            Open the SMTP settings
+          </Link>
+        </div>
+      )}
       <div className="flex flex-col md:flex-row flex-1">
         <aside className="w-full md:w-64 md:min-h-screen border-b md:border-b-0 md:border-r border-line bg-paper px-4 py-4 flex flex-col">
           <Link

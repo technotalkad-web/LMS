@@ -44,6 +44,81 @@ export type SmtpDispatchPayload = {
   text: string;
 };
 
+/**
+ * How long one send is waited for, in both systems (ADR 0029, rule T1 of the
+ * timing note of 2026-11-18): the tenant pipeline and the platform sender
+ * both pass it. It is the after-response job's budget (25 s) less 10 s kept
+ * for the job's reads, its rows and an alert; if that budget moves, this
+ * moves with it. send-smtp may still deliver after the wait ends.
+ */
+export const SMTP_SEND_WAIT_MS = 15_000;
+
+/**
+ * Each limit on a public code or link is claimed before the send (ADR 0029,
+ * the notes of 2026-11-22): the job writes its claim, then counts its
+ * account's requests with its own among them, and goes on only within the
+ * account's limit. Only a request that passed its account's count writes a
+ * second row, the in-flight row, and the shares (an organisation's platform
+ * share, the platform's ceiling and a tenant's daily limit) count the rows
+ * sent and the in-flight rows, never the claims. The same two times and the
+ * one word hold in both systems: the platform's claim is a `suppressed` row
+ * with the word `pending`, the tenant's a `queued` row with the word
+ * `claim`, and the in-flight row is `suppressed` or `queued` with the word
+ * IN_FLIGHT_WORD.
+ *
+ * CLAIM_SEND_WITHIN_MS: a job starts its send no later than this after it
+ * wrote its claim; later, it sends nothing.
+ */
+export const CLAIM_SEND_WITHIN_MS = 30_000;
+/**
+ * An in-flight row counts as a send in flight for this long from its row's
+ * time, against an organisation's share, the platform's ceiling and a
+ * tenant's daily limit. It is at least the time to start the send, the
+ * send's own wait, and a minute for the outcome's row and for two clocks
+ * that differ, so a mail that went has its sent row before its in-flight row
+ * stops counting.
+ */
+export const CLAIM_IN_FLIGHT_MS = 120_000;
+/**
+ * The word of an in-flight row, in both systems (the platform's error_code,
+ * the tenant's error). An in-flight row is never a request and never a send:
+ * the account counts read claims only, and the readers of sent and failed
+ * mail read neither row.
+ */
+export const IN_FLIGHT_WORD = "in_flight";
+
+/**
+ * One exact count of an account's rows at or after a time: a read with
+ * `count: "exact", head: true` and the limit's own filters, which returns
+ * the number of rows and no page.
+ */
+export type CountSince = (sinceIso: string) => PromiseLike<{ count: number | null; error: unknown }>;
+
+/**
+ * An account's requests in the last hour and in the last 24 hours (ADR 0029
+ * section G; the note of 2026-11-22), in both systems and for every account,
+ * a platform owner's own included: two exact counts of the rows that limit
+ * names, read together. A count covers every such row, whatever else the log
+ * holds, so the same rows always give the same answer. null when either
+ * count cannot be read: nothing is sent on it.
+ */
+export async function accountRequests(countSince: CountSince, nowMs: number): Promise<{ hour: number; day: number } | null> {
+  const read = (sinceMs: number): Promise<number | null> => exactCount(() => countSince(new Date(sinceMs).toISOString()));
+  const [hour, day] = await Promise.all([read(nowMs - 3_600_000), read(nowMs - 24 * 3_600_000)]);
+  if (hour === null || day === null) return null;
+  return { hour, day };
+}
+
+/**
+ * The number an exact count answers (`count: "exact", head: true`), or null
+ * when it cannot be read: a count that throws, fails or answers no number.
+ */
+export function exactCount(count: () => PromiseLike<{ count: number | null; error: unknown }>): Promise<number | null> {
+  return new Promise<{ count: number | null; error: unknown } | null>((resolve) => resolve(count()))
+    .then((r) => (!r || r.error || typeof r.count !== "number" ? null : r.count))
+    .catch(() => null);
+}
+
 export type SmtpDispatchOptions = {
   /**
    * Stop waiting after this many milliseconds and answer a timeout. The
@@ -179,6 +254,17 @@ export const SMTP_ERROR_CLASS_TABLE: ReadonlyArray<{ cls: SmtpErrorClass; patter
       /connection refused|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENOTFOUND|getaddrinfo|name or service not known|failed to lookup address|no such host|network is unreachable|connection (reset|closed)|certificate|\btls\b|\bssl\b|client construction failed|Edge Function returned HTTP (404|5\d\d)|fetch failed|requires port 465/i,
   },
 ];
+
+/**
+ * The hosting platform's own limit on outbound calls in one request (rule
+ * FP8 of ADR 0029). On Workers a fetch past the limit throws "Too many
+ * subrequests.", which dispatchSmtp and the database client hand back as an
+ * error message. It is the job's own failed step (the word call_limit),
+ * never a tenant's failed send: the mail never left this request.
+ */
+export function isCallLimitMessage(message: string | null | undefined): boolean {
+  return /too many subrequests/i.test(String(message ?? ""));
+}
 
 /** The class of a send-smtp error message; text that matches nothing is "unknown". */
 export function classifySmtpError(message: string | null | undefined): SmtpErrorClass {

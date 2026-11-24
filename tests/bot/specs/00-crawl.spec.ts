@@ -49,7 +49,7 @@ test("anonymous — public pages render cleanly", async ({ browser, baseURL }) =
     baseURL: baseURL!,
     role: "anonymous",
     entryRoutes: anonymousRoutes(seed.org.slug),
-    scopePrefixes: ["/login", "/forgot-password", `/${seed.org.slug}/login`],
+    scopePrefixes: ["/login", "/forgot-password", "/auth/set-password", `/${seed.org.slug}/login`],
   });
   await ctx.close();
 });

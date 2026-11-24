@@ -91,6 +91,8 @@ export function NewUserForm({
     email: string;
     invited: boolean;
     updated: boolean;
+    /** The welcome email's outcome, in words (ADR 0029 step 16); null when none was due. */
+    welcome: string | null;
     /** Reporting-line warnings (chain mismatch) — created, but worth a look. */
     warnings: string[];
   } | null>(null);
@@ -193,6 +195,7 @@ export function NewUserForm({
       email?: string;
       invited?: boolean;
       updated_existing?: boolean;
+      email_outcome?: { status: "sent" } | { status: "not_sent"; class: string } | null;
       warnings?: string[];
       error?: string;
     };
@@ -204,6 +207,7 @@ export function NewUserForm({
       email: j.email ?? form.email,
       invited: !!j.invited,
       updated: !!j.updated_existing,
+      welcome: welcomeWords(j.email_outcome),
       warnings: j.warnings ?? [],
     });
     setForm(INITIAL);
@@ -445,8 +449,9 @@ export function NewUserForm({
             {success.email}.
           </span>{" "}
           {success.invited
-            ? "An invite link has been emailed for them to set a password."
+            ? "An invite link lets them set their own password."
             : "The account is active with the password you set."}
+          {success.welcome && <> {success.welcome}</>}
           {success.warnings.length > 0 && (
             <div className="mt-2 border border-amber-200 bg-amber-50 text-amber-900 rounded-lg p-2 text-xs space-y-0.5">
               {success.warnings.map((w) => (
@@ -518,4 +523,26 @@ function Field({
       {children}
     </label>
   );
+}
+
+/** A welcome's outcome in words (ADR 0029 step 16; a timeout is "not confirmed", rule T2). */
+function welcomeWords(o: { status: "sent" } | { status: "not_sent"; class: string } | null | undefined): string | null {
+  if (!o) return null;
+  if (o.status === "sent") return "The welcome email was sent.";
+  switch (o.class) {
+    case "timeout":
+      return "The welcome email is not confirmed: it may still arrive.";
+    case "inactive":
+      return "No welcome email: the person was added as inactive or suspended.";
+    case "paused":
+      return "The welcome email was not sent: email is paused for your organisation.";
+    case "daily_limit":
+      return "The welcome email was not sent: your organisation reached its daily email limit.";
+    case "not_configured":
+    case "not_ready":
+    case "settings_unreadable":
+      return "The welcome email was not sent: your organisation's email is not working (Settings, SMTP).";
+    default:
+      return "The welcome email was not sent: your organisation's mail server refused it.";
+  }
 }

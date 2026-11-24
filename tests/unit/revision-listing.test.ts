@@ -152,7 +152,7 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
       // reissued_from through the paged fallback, in id order, one decision for
       // every chunk, an empty answer an error; no unpaged chunk read is left.
       ["the paged grant reader: grantSnapshotForUsers pages every chunk in id order through readPagedWithOptionalColumn",
-        /const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,300}?readPagedWithOptionalColumn<GrantPairRow>\(\s*"reissued_from",\s*\(columns, from, to\) => \{\s*const q = svc\.from\("attempt_requests"\)\.select\(columns\)[^;]*;\s*return \(inQuery \? q\.in\("course_id", inQuery\) : q\)\.order\("id"\)\.range\(from, to\);\s*\},\s*`\$\{GRANT_COLUMNS\}, user_id, course_id`,\s*\{ state: decided, nullIsError: true \}\s*\);/],
+        /const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,300}?readPagedWithOptionalColumn<GrantPairRow>\(\s*"reissued_from",\s*\(columns, from, to\) => \{\s*countCall\?\.\(\);\s*const q = svc\.from\("attempt_requests"\)\.select\(columns\)[^;]*;\s*return \(inQuery \? q\.in\("course_id", inQuery\) : q\)\.order\("id"\)\.range\(from, to\);\s*\},\s*`\$\{GRANT_COLUMNS\}, user_id, course_id`,\s*\{ state: decided, nullIsError: true \}\s*\);/],
     ],
   },
   "lib/attempts/force-restart.ts": {
@@ -265,9 +265,18 @@ const SCOPED: Record<string, { calls: string[]; feeds: Array<[string, RegExp]> }
     calls: ["attemptCounts(list)", "computeScoring(scorable)", "officialHistory(scorable)", "officialRetakeState(history)"],
     feeds: [
       ...columnsFeeds(),
-      pagedFeed(/const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,300}?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,600}?ATTEMPT_COLUMNS,\s*\{ state: decided \}\s*\)/),
+      // ADR 0029, note of 2026-11-25: the manager's reminder reads through
+      // the same paged read, narrowed to the course's versions, where an
+      // answer that is not a list is an error (`nullIsError: strict`); the
+      // Report Card's read passes no versions and reads as before.
+      pagedFeed(/const decided: OptionalColumnState = \{ columns: null \};[\s\S]{0,300}?readPagedWithOptionalColumn<unknown>\(\s*"is_revision",[\s\S]{0,600}?ATTEMPT_COLUMNS,\s*\{ state: decided(?:, nullIsError: strict)? \}\s*\)/),
       mapperFeed("toScorable", /const toScorable = \(a: AttemptRow\) => \(\{[^}]*\bis_revision: a\.is_revision \?\? null,/),
       ["computeScoring gets the mapped rows", /const scorable = list\.map\(toScorable\);\s*const scoring = computeScoring\(scorable,/],
+      // One place works out a course line's status (the note's part 1,
+      // point 3): scoreLine, defined once and called by the Report Card's
+      // roll-up and by the reminder's read, which scores with DEFAULT_POLICY.
+      ["one function scores a course line for both readers (scoreLine: its definition and two calls)",
+        /function scoreLine\(list: AttemptRow\[\][\s\S]*?\bscoreLine\(list, policies\.get\(cid\) \?\? DEFAULT_POLICY, retakeIds\)[\s\S]*?\bscoreLine\([^()]*, DEFAULT_POLICY, [^()]*\)/],
     ],
   },
   "lib/scoring/status.ts": {

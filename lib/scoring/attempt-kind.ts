@@ -375,12 +375,17 @@ const GRANT_COLUMNS = "id, used_attempt_id, used_at, expires_at, created_at, dec
  * link; only then is a missing relation (isSchemaMissing, pre-0083) "no
  * grants"; any other error, or an answer with neither rows nor an error,
  * throws GrantReadError.
+ *
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each read,
+ * the re-read without `reissued_from` included, so a request that counts
+ * its calls counts what this makes.
  */
 export async function grantSnapshotFor(
   svc: AnyClient,
   userId: string,
   courseId: string,
-  nowIso: string = new Date().toISOString()
+  nowIso: string = new Date().toISOString(),
+  countCall?: () => unknown
 ): Promise<GrantSnapshot> {
   // Its own abort signal: Next memoizes identical GET fetches within one
   // server render, and the launch page reads the grants again after
@@ -388,14 +393,16 @@ export async function grantSnapshotFor(
   // signal opts the read out of that cache. Elsewhere it costs nothing: the
   // course and attempt pages read the grants once per render, and route
   // handlers have no such cache.
-  const read = (columns: string) =>
-    svc
+  const read = (columns: string) => {
+    countCall?.();
+    return svc
       .from("attempt_requests")
       .select(columns)
       .eq("user_id", userId)
       .eq("course_id", courseId)
       .eq("status", "approved")
       .abortSignal(new AbortController().signal);
+  };
   let res: { data: unknown; error: PgError } = await read(`${GRANT_COLUMNS}, reissued_from`);
   if (res.error && isMissingColumn(res.error, "reissued_from")) res = await read(GRANT_COLUMNS);
   if (res.error) {
@@ -484,13 +491,17 @@ const GRANT_CHUNK = 300;
  * never stands as the whole.
  * Keyed `${user_id}:${course_id}`; a pair with no grant is absent (callers
  * read it as an empty snapshot).
+ * `countCall`, when given, is called once for each call the read makes,
+ * every page and the fallback's re-read included: a request that counts
+ * its calls (ADR 0029, rule FP2) counts them there.
  */
 export async function grantSnapshotForUsers(
   svc: AnyClient,
   orgId: string,
   courseIds: string[] | null,
   userIds: string[],
-  nowIso: string = new Date().toISOString()
+  nowIso: string = new Date().toISOString(),
+  countCall?: () => unknown
 ): Promise<Map<string, GrantSnapshot>> {
   const out = new Map<string, GrantSnapshot>();
   const users = [...new Set(userIds.filter(Boolean))];
@@ -505,6 +516,7 @@ export async function grantSnapshotForUsers(
     const res = await readPagedWithOptionalColumn<GrantPairRow>(
       "reissued_from",
       (columns, from, to) => {
+        countCall?.();
         const q = svc.from("attempt_requests").select(columns).eq("organization_id", orgId).eq("status", "approved").in("user_id", chunk);
         return (inQuery ? q.in("course_id", inQuery) : q).order("id").range(from, to);
       },
@@ -681,13 +693,17 @@ export async function unusedGrantFor(svc: AnyClient, userId: string, courseId: s
   }
 }
 
-/** Course ids configured "pass required" among the given ids; empty set on a pre-0081 database. */
-export async function fetchPassRequired(client: AnyClient, courseIds: string[]): Promise<Set<string>> {
+/**
+ * Course ids configured "pass required" among the given ids; empty set on a pre-0081 database.
+ * `countCall` (ADR 0029 rule FP2), when given, is called before each call.
+ */
+export async function fetchPassRequired(client: AnyClient, courseIds: string[], countCall?: () => unknown): Promise<Set<string>> {
   const out = new Set<string>();
   const ids = [...new Set(courseIds.filter(Boolean))];
   if (ids.length === 0) return out;
   try {
     for (let i = 0; i < ids.length; i += 300) {
+      countCall?.();
       const { data, error } = await client
         .from("courses")
         .select("id, pass_required")

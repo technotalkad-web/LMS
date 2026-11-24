@@ -1,163 +1,51 @@
-import { createClient as createServiceClient, type SupabaseClient } from "@supabase/supabase-js";
-import { notifyBackground } from "@/lib/notifications/send";
-import { dispatchResend, resendConfigured } from "@/lib/email/resend";
-import { resolveOrgMembership } from "@/lib/auth/org-membership";
+import { sendNotification, type SendResult, type TimeLeftMs } from "@/lib/notifications/send";
+import type { MailRun } from "@/lib/notifications/smtp-state";
 
 /**
- * White-label auth emails.
+ * The tenant's sign-in link (ADR 0029 step 12): the one mail of this file.
  *
- * Instead of letting Supabase auto-send invite / magic-link emails (opaque
- * sender, no tenant branding), we mint the link ourselves with the Admin API
- * `generateLink` (which NEVER sends) and dispatch a branded email through the
- * normal notification pipeline — tenant SMTP first, global Resend as fallback.
- *
- * The link uses the cross-device-safe token_hash form our /auth/callback
- * verifies (no PKCE verifier needed), so it works from any device / email app.
- *
- *   invite    → creates the user (if new) + "Activate account" email
- *   magiclink → existing user + "Sign in" email
- *
- * Password reset stays on its existing custom-OTP flow (already tenant SMTP +
- * Resend fallback via the same pipeline).
- *
- * A tenant-branded sign-in link is sent only to a member of that
- * organisation. "Member" is the rule the tenant pages use to let a signed-in
- * user in (lib/auth/require-org-access.ts, ADR 0030): a membership that
- * counts, an active organization_members row in an organisation that is not
- * deleted. Anyone else, and any lookup that fails, gets the generic platform
- * sign-in email instead (the global sender, no tenant branding, no tenant
- * SMTP, no row in that organisation's notification log): the person's own
- * sign-in link, never the organisation's mail.
+ * The link is minted by lib/auth/credential-mail.ts with the Admin API's
+ * generateLink (which sends nothing), for an account rule 2 of section A
+ * serves through this organisation's own SMTP. This file builds the link in
+ * the cross-device form /auth/callback verifies (token_hash, no PKCE
+ * verifier, so it opens from any device or mail app) and sends it as the
+ * event magic_link through the organisation's run: its SMTP only, never
+ * another sender. Which account gets a link, and through which system, is
+ * decided in lib/auth/credential-mail.ts and nowhere here.
  */
 
-type AuthLinkType = "invite" | "magiclink";
-
-function svc() {
-  return createServiceClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!,
-    { auth: { persistSession: false } }
-  );
-}
-
-function signInLink(origin: string, tokenHash: string, type: AuthLinkType, next: string): string {
+/** The address an emailed sign-in link opens: /auth/callback with the token's hash and the page to land on. */
+export function signInLink(origin: string, tokenHash: string, next: string): string {
   const base = origin.replace(/\/$/, "");
   return (
     `${base}/auth/callback?token_hash=${encodeURIComponent(tokenHash)}` +
-    `&type=${type}&next=${encodeURIComponent(next)}`
+    `&type=magiclink&next=${encodeURIComponent(next)}`
   );
 }
 
-/** True only when the user holds a membership in the organisation that counts; false otherwise and on any failed read. */
-async function isMember(client: SupabaseClient, organizationId: string, userId: string): Promise<boolean> {
-  const m = await resolveOrgMembership(client, { id: organizationId }, userId);
-  return typeof m === "object";
-}
-
-/** The generic platform sign-in email (global Resend sender). True when it was sent. */
-async function sendPlatformSignInEmail(email: string, link: string): Promise<boolean> {
-  const res = await dispatchResend({
-    to: email,
-    subject: "Your sign-in link",
-    html: `<p>Click to sign in:</p><p><a href="${link}">Sign in</a></p><p>If you didn't request this, you can ignore this email.</p>`,
-    text: `Sign in: ${link}`,
-  });
-  return res.ok;
-}
-
 /**
- * Platform sign-in (no organisation): mint a magic link and email it through
- * the global sender. Silent when the sender is not configured or the address
- * has no account; the caller answers the same either way.
+ * Send the sign-in link through the organisation's run (its own SMTP). The
+ * link goes in the mail only: the notification_log row keeps no part of it
+ * (STORED_CONTEXT_KEYS in lib/notifications/send.ts).
  */
-export async function sendPlatformMagicLink(opts: { email: string; origin: string }): Promise<boolean> {
-  if (!resendConfigured()) return false;
-  const { data, error } = await svc().auth.admin.generateLink({ type: "magiclink", email: opts.email });
-  if (error || !data) return false;
-  const tokenHash = (data.properties as { hashed_token?: string }).hashed_token;
-  if (!tokenHash) return false;
-  return sendPlatformSignInEmail(opts.email, signInLink(opts.origin, tokenHash, "magiclink", "/select-org"));
-}
-
-export type SendAuthEmailResult = {
-  ok: boolean;
-  /** True when the email pipeline reported a successful send. */
-  sent: boolean;
-  userId?: string | null;
-  error?: string;
-  /** True when generateLink reported the address has no account (magiclink). */
-  unknownUser?: boolean;
-};
-
-/**
- * Generate a Supabase auth link and email it via the tenant's branded pipeline.
- *
- * @param origin  Live request origin (from originFromRequest()) so the link
- *                points at the host the user is actually on.
- */
-export async function sendAuthEmail(opts: {
-  organizationId: string;
-  email: string;
-  type: AuthLinkType;
-  origin: string;
-  next?: string;
-  learnerName?: string;
-}): Promise<SendAuthEmailResult> {
-  const client = svc();
-  const { data, error } = await client.auth.admin.generateLink({
-    type: opts.type,
-    email: opts.email,
-  });
-
-  if (error || !data) {
-    // For magic-link login we must not leak whether an account exists — callers
-    // treat unknownUser as a silent success (no email, but "if you have an
-    // account, we sent a link").
-    const msg = error?.message ?? "generateLink failed";
-    const unknownUser =
-      opts.type === "magiclink" && /not.*found|no.*user|user.*exist/i.test(msg);
-    return { ok: unknownUser, sent: false, error: msg, unknownUser };
-  }
-
-  const tokenHash = (data.properties as { hashed_token?: string }).hashed_token;
-  if (!tokenHash) {
-    return { ok: false, sent: false, error: "generateLink returned no token_hash" };
-  }
-
-  // A sign-in link goes through the tenant pipeline only for a member of
-  // that organisation; anyone else gets the generic platform email.
-  if (opts.type === "magiclink") {
-    const userId = data.user?.id ?? null;
-    const member = userId ? await isMember(client, opts.organizationId, userId) : false;
-    if (!member) {
-      const sent = await sendPlatformSignInEmail(
-        opts.email,
-        signInLink(opts.origin, tokenHash, "magiclink", "/select-org")
-      );
-      return { ok: true, sent, userId };
-    }
-  }
-
-  const link = signInLink(opts.origin, tokenHash, opts.type, opts.next ?? "/select-org");
-
-  const event = opts.type === "invite" ? "account_invite" : "magic_link";
-  const res = await notifyBackground({
-    organizationId: opts.organizationId,
-    event,
-    to: { user_id: data.user?.id ?? null, email: opts.email },
-    context: {
-      learner_name: opts.learnerName,
-      // Both keys point at the link; layout uses direct_link/portal_url as the
-      // primary CTA target.
-      direct_link: link,
-      portal_url: link,
+export async function sendTenantSignInLink(
+  run: MailRun,
+  to: { userId: string; email: string },
+  link: string,
+  opts: { timeLeftMs?: TimeLeftMs } = {}
+): Promise<SendResult> {
+  return sendNotification(
+    {
+      organizationId: run.organizationId,
+      event: "magic_link",
+      to: { user_id: to.userId, email: to.email },
+      context: {
+        // Both keys point at the link; the layout uses direct_link or
+        // portal_url as the button's target.
+        direct_link: link,
+        portal_url: link,
+      },
     },
-  });
-
-  return {
-    ok: res?.status === "sent",
-    sent: res?.status === "sent",
-    userId: data.user?.id ?? null,
-    error: res?.error,
-  };
+    { run, timeLeftMs: opts.timeLeftMs }
+  );
 }

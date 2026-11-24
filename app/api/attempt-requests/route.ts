@@ -10,6 +10,7 @@ import { computeScoring, type ScorableAttempt, type ScoringResult } from "@/lib/
 import { resolvePolicy } from "@/lib/scoring/resolve";
 import { grantSnapshotFor, readWithOptionalColumn, type PgError } from "@/lib/scoring/attempt-kind";
 import { readWithContextFilter, withoutPreviews, type ContextFilterState } from "@/lib/scoring/context-read";
+import { MIDDLEWARE_CALLS, countCalls, requestBudget, spendCalls } from "@/lib/notifications/smtp-state";
 
 /**
  *   POST /api/attempt-requests   body: { orgSlug, courseId, reason }
@@ -33,6 +34,11 @@ import { readWithContextFilter, withoutPreviews, type ContextFilterState } from 
  * never counted in `attempts_used`. On a database without 0107 the filter's
  * missing-column error reads today's select once; any other error answers
  * 503 as before. Phase 4 (step 37) moves this read to readContextResult.
+ *
+ * ADR 0029 rule FP2: the request's one budget starts with the request and
+ * counts from its first call (the middleware's), each call where it is
+ * made, fallbacks included, so the administrators' mail is sized on the
+ * calls really made (notifyAdminsOfRequest). Its 45 seconds start there too.
  */
 /** `status` is a 0002 column; only `is_revision` (0103) can be missing (the narrower-select fallback). */
 const ATTEMPT_COLUMNS = "id, score, started_at, completed_at, completion_status, success_status, status";
@@ -46,6 +52,7 @@ function svc() {
 }
 
 export async function POST(request: Request) {
+  const budget = requestBudget({ spent: MIDDLEWARE_CALLS });
   const body = (await request.json().catch(() => ({}))) as {
     orgSlug?: string;
     courseId?: string;
@@ -63,13 +70,16 @@ export async function POST(request: Request) {
   }
 
   const supabase = await createClient();
+  spendCalls(budget, 1);
   const {
     data: { user },
   } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   // The caller must hold a membership in this org that counts (ADR 0030):
-  // anything else is answered as a signed-in non-member is.
+  // anything else is answered as a signed-in non-member is. Two calls: the
+  // organisation by its slug, then the caller's member row.
+  spendCalls(budget, 2);
   const membership = await resolveOrgMembership<{ id: string; name: string }>(
     supabase,
     { slug: body.orgSlug },
@@ -81,6 +91,7 @@ export async function POST(request: Request) {
   const org = membership.org;
 
   // The course must belong to this org.
+  spendCalls(budget, 1);
   const { data: course } = await supabase
     .from("courses")
     .select("id, title")
@@ -96,6 +107,7 @@ export async function POST(request: Request) {
   let attempts: ScorableAttempt[] = [];
   let scoring: ScoringResult;
   try {
+    spendCalls(budget, 1);
     const { data: verRows, error: verErr } = await s.from("course_versions").select("id").eq("course_id", course.id);
     if (verErr || !verRows) throw new Error("versions");
     const vIds = (verRows as Array<{ id: string }>).map((v) => v.id);
@@ -105,9 +117,10 @@ export async function POST(request: Request) {
       const { data: attRows, error: attErr } = await readWithOptionalColumn<ScorableAttempt[]>(
         "is_revision",
         (columns) =>
-          readWithContextFilter(previews, (apply) =>
-            withoutPreviews(s.from("course_attempts").select(columns).eq("user_id", user.id).in("course_version_id", vIds), apply)
-          ) as unknown as PromiseLike<{
+          readWithContextFilter(previews, (apply) => {
+            spendCalls(budget, 1);
+            return withoutPreviews(s.from("course_attempts").select(columns).eq("user_id", user.id).in("course_version_id", vIds), apply);
+          }) as unknown as PromiseLike<{
             data: ScorableAttempt[] | null;
             error: PgError;
           }>,
@@ -116,7 +129,9 @@ export async function POST(request: Request) {
       if (attErr || !attRows) throw new Error("attempts");
       attempts = attRows;
     }
-    const snapshot = await grantSnapshotFor(s, user.id, course.id);
+    const snapshot = await grantSnapshotFor(s, user.id, course.id, undefined, countCalls(budget));
+    // One call: the policy of one course.
+    spendCalls(budget, 1);
     const policy = await resolvePolicy(s, course.id);
     scoring = computeScoring(attempts, policy, snapshot.retakeIds);
   } catch (e) {
@@ -133,6 +148,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: REQUEST_MESSAGES.retake_live }, { status: 409 });
   }
 
+  spendCalls(budget, 1);
   const { data: inserted, error } = await s
     .from("attempt_requests")
     .insert({
@@ -164,6 +180,7 @@ export async function POST(request: Request) {
   // request.
   try {
     if (inserted?.id) {
+      spendCalls(budget, 1);
       await s.from("attempt_requests").update({ attempts_used: scoring.scoredAttempts }).eq("id", inserted.id);
     }
   } catch (e) {
@@ -172,6 +189,7 @@ export async function POST(request: Request) {
 
   // Tell the admins (background; a mail failure never fails the request).
   const origin = await originFromRequest();
+  spendCalls(budget, 1);
   const { data: profile } = await s
     .from("profiles")
     .select("first_name, last_name")
@@ -187,6 +205,7 @@ export async function POST(request: Request) {
     learnerEmail: user.email ?? "",
     learnerName: name,
     reason,
+    budget,
   });
 
   return NextResponse.json({ ok: true, id: inserted?.id ?? null });

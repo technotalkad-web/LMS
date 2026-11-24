@@ -91,9 +91,20 @@ export const roleScope: Record<Exclude<BotRole, "anonymous">, (org: string) => s
   learner: (org) => [`/${org}`],
 };
 
-/** Public pages the anonymous crawler should reach without a session. */
+/**
+ * Public pages the anonymous crawler should reach without a session. The
+ * forgot-password form comes in both forms (ADR 0029 section D): with no
+ * organisation, and the organisation's own. /auth/set-password opened with
+ * no link shows rule N10's one answer and no error page.
+ */
 export function anonymousRoutes(orgSlug: string): string[] {
-  return ["/login", "/forgot-password", `/${orgSlug}/login`];
+  return [
+    "/login",
+    "/forgot-password",
+    `/forgot-password?org=${encodeURIComponent(orgSlug)}`,
+    "/auth/set-password",
+    `/${orgSlug}/login`,
+  ];
 }
 
 /**

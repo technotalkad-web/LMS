@@ -78,7 +78,10 @@
  *       the whole organisation, from one read of them for the run or the
  *       request; a deleted organisation's course or program is skipped
  *       before any read of it, and a broadcast there is refused as for a
- *       non-member; a learner whose row does not count is not claimed,
+ *       non-member; a broadcast in a paused organisation (the master pause,
+ *       or the custom_broadcast pause) answers 200 that nothing was sent,
+ *       with no row for any recipient (ADR 0029, the owner's decision of
+ *       2026-11-21); a learner whose row does not count is not claimed,
  *       gets no reminder state (not even a stopped one past the cap) and
  *       raises no escalation, and an escalation goes only to a manager
  *       whose row counts; an attempt request reaches the active
@@ -91,7 +94,15 @@
  *       count unreadable_orgs, a heartbeat written as an error), at the
  *       reminders' early exit and at its end, after the other
  *       organisations' mail and state; a deleted organisation is no failure,
- *       and a healthy run answers 200, ok true, with a heartbeat "ok";
+ *       and a healthy run answers 200, ok true, with a heartbeat "ok".
+ *       ADR 0029 (step 16, section Q, and the notes of 2026-11-19 and
+ *       2026-11-20): the Users answers and each bulk row carry the welcome's
+ *       outcome (sent; not_sent with inactive or timeout) and the bulk
+ *       summary counts them; a caller the membership resolver turns away
+ *       gets no Settings test send and no save, so nothing goes out or is
+ *       stored; a single send without 0114 goes as before; each single
+ *       mail answers its outcome; the crons read past the server's 1000-row
+ *       cap in pages and their profiles in lists of 150 ids;
  *   (l) the platform notices (GET /api/broadcasts): an administrators-only
  *       notice is shown only to a person who holds an administrator row
  *       that counts somewhere; one whose only administrator row is inactive,
@@ -146,6 +157,8 @@ type Account = { id: string; email: string };
 let accounts: Account[] = [];
 let invitations: Row[] = [];
 let authCalls: string[] = [];
+/** The auth server answers the list of accounts with an error. */
+let accountsUnreadable = false;
 // (j): attempts, their launch tokens, the organisations' API keys, and what
 // the code logged with console.error.
 let attempts: Row[] = [];
@@ -154,6 +167,13 @@ let apiKeys: Row[] = [];
 let logged: string[] = [];
 // (l): the platform notices.
 let broadcasts: Row[] = [];
+// (k), ADR 0029 step 16 and section Q: the organisation's SMTP settings, what
+// send-smtp answers and what tenant_mail_status answers. Unset (the
+// default), the settings read finds none, send-smtp answers 500 and
+// tenant_mail_status one row with no state, as before.
+let smtpSettings: Row[] | null = null;
+let smtpReply: (() => Response) | null = null;
+let mailStatusReply: (() => Response) | null = null;
 
 const load = (Module as unknown as { _load: (...a: unknown[]) => unknown })._load;
 (Module as unknown as { _load: (...a: unknown[]) => unknown })._load = function (this: unknown, request: unknown, ...rest: unknown[]) {
@@ -208,9 +228,12 @@ const stub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Respo
   if (p.startsWith("/rest/v1/")) requests.push({ method, table, select, query: q, key: h.get("apikey"), body });
   if (p === "/auth/v1/user") return signedIn ? json(ME) : json({ message: "no session" }, 401);
   if (p.startsWith("/auth/v1/")) return authServer(method, p, body);
+  if (p === "/functions/v1/send-smtp" && smtpReply) return smtpReply();
   if (!p.startsWith("/rest/v1/")) return json({ message: "unexpected" }, 500);
+  if (table === "rpc/tenant_mail_status" && mailStatusReply) return mailStatusReply();
   if (method !== "GET") return write(method, table, q, body, h.get("prefer") ?? "");
   if (failing.has(table)) return json({ code: "XX000", message: "stub read failure" }, 500);
+  if (table === "notification_settings" && smtpSettings) return json(smtpSettings);
   const page = (rows: Row[]) => {
     const offset = Number(q.get("offset") ?? 0);
     const limit = q.has("limit") ? Number(q.get("limit")) : rows.length;
@@ -264,7 +287,10 @@ const userJson = (a: Account) => ({ id: a.id, aud: "authenticated", role: "authe
 /** The auth server: the admin user list, a new account, and a password sign-in. */
 function authServer(method: string, p: string, body: unknown): Response {
   authCalls.push(`${method} ${p}`);
-  if (p === "/auth/v1/admin/users" && method === "GET") return json({ users: accounts.map(userJson), aud: "authenticated" });
+  if (p === "/auth/v1/admin/users" && method === "GET") {
+    if (accountsUnreadable) return json({ code: 500, error_code: "unexpected_failure", msg: "stub failure" }, 500);
+    return json({ users: accounts.map(userJson), aud: "authenticated" });
+  }
   if (p === "/auth/v1/admin/users" && method === "POST") {
     const a = { id: `u-new-${accounts.length + 1}`, email: (body as { email: string }).email };
     accounts.push(a);
@@ -285,6 +311,8 @@ function authServer(method: string, p: string, body: unknown): Response {
  */
 function write(method: string, table: string, q: URLSearchParams, body: unknown, prefer = ""): Response {
   if (failing.has(`${method} ${table}`)) return json({ code: "XX000", message: "stub write failure" }, 500);
+  // ADR 0029: each send opens its run with tenant_mail_status (migration 0114), a read by POST: one row, no state yet.
+  if (table === "rpc/tenant_mail_status") return json([{ organization_id: (body as Row | null)?.p_org ?? null, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
   if (table === "organization_members" && method === "POST") {
     const ignoreDuplicates = /resolution=ignore-duplicates/.test(prefer);
     for (const rec of (Array.isArray(body) ? body : [body]) as Row[]) {
@@ -326,7 +354,11 @@ const world = (o: { members?: Row[]; failing?: string[]; platformOwner?: boolean
   apiKeys = (o.apiKeys ?? []).map((r) => ({ ...r }));
   logged = [];
   authCalls = [];
+  accountsUnreadable = false;
   requests = [];
+  smtpSettings = null;
+  smtpReply = null;
+  mailStatusReply = null;
 };
 const row = (org: { id: string }, role: string, status: string, user = ME.id): Row => ({ organization_id: org.id, user_id: user, role, status });
 const reads = (table: string) => requests.filter((r) => r.table === table && r.method === "GET");
@@ -1125,6 +1157,144 @@ async function main() {
           eq(`bulk, a new row written ${status}: 200, the row is ${status}, ${status === "active" ? "and the welcome is sent" : "and no welcome is sent"}`,
             [res.status, memberOf(LIVE, N.id)?.status, sentEvents()], [200, status, status === "active" ? [`account_creation ${N.id}`] : []]);
         }
+
+        // ADR 0029 step 16 and section Q point 5: the answer, and each bulk
+        // row, carry the welcome's outcome. A row written inactive or
+        // suspended reads not_sent with the class inactive (no send, no row,
+        // no state); a timeout reads not_sent, timeout ("not confirmed").
+        // Here the organisation's SMTP is complete and send-smtp answers.
+        const SMTP: Row[] = [{ smtp_host: "smtp.tenant.stub", smtp_port: 465, smtp_secure: true, smtp_user: null, smtp_password: null, from_email: "noreply@tenant.stub", from_name: null, reply_to: null, email_paused: false, event_paused: {}, logo_url: null, brand_color: null, footer_text: null }];
+        const TIMED_OUT = "Timed out after 15000ms waiting for the send-smtp function.";
+        let smtpSends = 0;
+        const smtpWorld = (answer: Row = { ok: true }) => {
+          smtpSettings = SMTP;
+          smtpSends = 0;
+          smtpReply = () => { smtpSends++; return json(answer); };
+        };
+        const addOne = async (status: string) => {
+          const res = await usersRoute.POST(new Request("http://lms.test/api/users", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, first_name: "New", email: N.email, employee_id: "E-N", lms_role: "user", node_id: "N1", status }),
+          }));
+          return { status: res.status, body: (await res.json()) as Row };
+        };
+        for (const status of ["inactive", "suspended"]) {
+          newcomerWorld();
+          smtpWorld();
+          const r = await addOne(status);
+          eq(`POST /api/users, a row written ${status}: the answer's email_outcome is not_sent with the class inactive; nothing is sent and no row is written`,
+            [r.status, r.body.email_outcome, smtpSends, sentEvents(), writes().filter((w) => w.endsWith("tenant_smtp_state"))], [200, { status: "not_sent", class: "inactive" }, 0, [], []]);
+        }
+        newcomerWorld();
+        smtpWorld();
+        {
+          const r = await addOne("active");
+          eq("POST /api/users, a row written active: the welcome is sent, and the answer's email_outcome says sent",
+            [r.status, r.body.email_outcome, smtpSends, sentEvents()], [200, { status: "sent" }, 1, [`account_creation ${N.id}`]]);
+        }
+        newcomerWorld();
+        smtpWorld({ ok: false, error: TIMED_OUT });
+        {
+          const r = await addOne("active");
+          eq("POST /api/users, a welcome that timed out: the answer's email_outcome is not_sent with the class timeout (the page reads \"not confirmed\")",
+            [r.status, r.body.email_outcome], [200, { status: "not_sent", class: "timeout" }]);
+        }
+        newcomerWorld();
+        smtpWorld();
+        mailStatusReply = () => json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+        {
+          const r = await addOne("active");
+          eq("POST /api/users without 0114 (one single send): sent as before, with no limit, and the same answer",
+            [r.status, r.body.email_outcome, smtpSends, sentEvents()], [200, { status: "sent" }, 1, [`account_creation ${N.id}`]]);
+        }
+        {
+          // The bulk file: each row carries its welcome's outcome, and the
+          // summary counts them.
+          const N2: Account = { id: "u-n2", email: "second.newcomer@example.test" };
+          world({ accounts: [N, N2], members: [row(LIVE, "admin", "active")] });
+          smtpWorld();
+          const res = await bulkRoute.POST(new Request("http://lms.test/api/users/bulk", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, csv: [HEADER, `New,E-N,${N.email},user,N1,active`, `Two,E-N2,${N2.email},user,N1,inactive`].join("\n") }),
+          }));
+          const body = (await res.json()) as { summary: Row; results: Array<{ email: string; email_outcome?: Row }> };
+          eq("bulk, one row active and one inactive: each row's email_outcome (sent; not_sent, inactive), and the summary's emailed 1 and not_emailed 1",
+            [res.status, body.results.map((r) => [r.email, r.email_outcome ?? null]), body.summary.emailed, body.summary.not_emailed, smtpSends],
+            [200, [[N.email, { status: "sent" }], [N2.email, { status: "not_sent", class: "inactive" }]], 1, 1, 1]);
+        }
+        {
+          world({ accounts: [N], members: [row(LIVE, "admin", "active")] });
+          smtpWorld({ ok: false, error: TIMED_OUT });
+          const res = await bulkRoute.POST(new Request("http://lms.test/api/users/bulk", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, csv: [HEADER, `New,E-N,${N.email},user,N1,active`].join("\n") }),
+          }));
+          const body = (await res.json()) as { summary: Row; results: Array<{ email_outcome?: Row }> };
+          eq("bulk, a welcome that timed out: the row reads not_sent, timeout, and the summary counts it as not emailed",
+            [res.status, body.results.map((r) => r.email_outcome ?? null), body.summary.emailed, body.summary.not_emailed],
+            [200, [{ status: "not_sent", class: "timeout" }], 0, 1]);
+        }
+        {
+          // ADR 0029, stage 2's one rule: whether an account is new decides
+          // whether an account and a welcome are made, so a failed read of
+          // the accounts is never "no account": nothing is made or sent.
+          const BRAND_NEW = "brand.new@example.test";
+          newcomerWorld();
+          smtpWorld();
+          accountsUnreadable = true;
+          const one = await usersRoute.POST(new Request("http://lms.test/api/users", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, first_name: "New", email: BRAND_NEW, employee_id: "E-B", lms_role: "user", node_id: "N1", status: "active" }),
+          }));
+          eq("POST /api/users, the accounts cannot be read: 503, no account made, no member written, nothing sent",
+            [one.status, authCalls.filter((c) => c === "POST /auth/v1/admin/users").length, writes().filter((w) => w.endsWith("organization_members")), smtpSends], [503, 0, [], 0]);
+          newcomerWorld();
+          smtpWorld();
+          accountsUnreadable = true;
+          const file = await bulkRoute.POST(new Request("http://lms.test/api/users/bulk", {
+            method: "POST",
+            body: JSON.stringify({ orgSlug: LIVE.slug, csv: [HEADER, `New,E-B,${BRAND_NEW},user,N1,active`].join("\n") }),
+          }));
+          eq("bulk, the accounts cannot be read: 503 before any row, no account made, no member written, nothing sent",
+            [file.status, authCalls.filter((c) => c === "POST /auth/v1/admin/users").length, writes().filter((w) => w.endsWith("organization_members")), smtpSends], [503, 0, [], 0]);
+        }
+
+        // ADR 0029 section Q, point 7: whoever the membership resolver turns
+        // away gets neither a Settings test send nor a save that would run
+        // one; nothing goes out and nothing is stored. A membership that
+        // cannot be read answers 503.
+        {
+          const settingsRoute = await import("../../app/api/notifications/settings/route");
+          const testRoute = await import("../../app/api/notifications/settings/test/route");
+          const sendTest = async (slug: string) => {
+            const res = await testRoute.POST(new Request("http://lms.test/api/notifications/settings/test", { method: "POST", body: JSON.stringify({ orgSlug: slug }) }));
+            return res.status;
+          };
+          const save = async (slug: string) => {
+            const res = await settingsRoute.POST(new Request("http://lms.test/api/notifications/settings", { method: "POST", body: JSON.stringify({ orgSlug: slug, smtp_host: "smtp.changed.stub" }) }));
+            return res.status;
+          };
+          const REFUSED: Array<[string, Row[], string[], string, number]> = [
+            ["an administrator whose row is inactive", [row(LIVE, "admin", "inactive")], [], LIVE.slug, 404],
+            ["an administrator whose row is suspended", [row(LIVE, "admin", "suspended")], [], LIVE.slug, 404],
+            ["an active administrator of a deleted organisation", [row(GONE, "admin", "active")], [], GONE.slug, 404],
+            ["a person with no row here", [row(SECOND, "admin", "active")], [], LIVE.slug, 404],
+            ["an active learner, who is no administrator", [row(LIVE, "user", "active")], [], LIVE.slug, 403],
+            ["an administrator whose membership cannot be read", [row(LIVE, "admin", "active")], ["organization_members"], LIVE.slug, 503],
+          ];
+          for (const [who, rows, failingReads, slug, want] of REFUSED) {
+            for (const [what, run] of [["the Settings test send", sendTest], ["a save of the SMTP settings", save]] as const) {
+              world({ members: rows, failing: failingReads });
+              smtpWorld();
+              const status = await run(slug);
+              eq(`${what}, by ${who}: ${want}, nothing sent and nothing written`, [status, smtpSends, writes()], [want, 0, []]);
+            }
+          }
+          world({ members: [row(LIVE, "admin", "active")] });
+          smtpWorld();
+          eq("…the control: an active administrator of the live organisation sends the test", [await sendTest(LIVE.slug), smtpSends], [200, 1]);
+        }
+
         for (const org of [LIVE, GONE]) {
           world({ platformOwner: true });
           const res = await adminsRoute.POST(
@@ -1133,9 +1303,19 @@ async function main() {
           );
           const j = (await res.json()) as Row;
           const live = org.deleted_at === null;
-          eq(`console add of a new administrator to ${live ? "a live" : "a deleted"} organisation: 200, the row written active, the password in the answer, ${live ? "and the welcome is sent" : "and no welcome is sent"}`,
-            [res.status, memberOf(org, String(j.user_id))?.status, typeof j.temp_password, sentEvents()],
-            [200, "active", "string", live ? [`account_creation ${j.user_id}`] : []]);
+          // ADR 0029 step 15: the account is made with no password and a setup
+          // link, and the welcome is platform mail. Its row is written in both
+          // organisations (section Q, point 6); only the live one is mailed.
+          const linkRows = requests.filter((r) => r.table === "account_setup_links" && r.method === "POST").map((r) => r.body as Row);
+          const welcomes = requests.filter((r) => r.table === "platform_email_log" && r.method === "POST").map((r) => `${(r.body as Row).event_type} ${(r.body as Row).to_user_id}`);
+          eq(`console add of a new administrator to ${live ? "a live" : "a deleted"} organisation: 200, the row written active, no password in the answer, no tenant mail, ${live ? "and the welcome goes to the platform sender" : "and no welcome is sent"}`,
+            [res.status, memberOf(org, String(j.user_id))?.status, "temp_password" in j, sentEvents(), welcomes],
+            [200, "active", false, [], live ? [`platform_admin_welcome ${j.user_id}`] : []]);
+          eq(`…the link's row is written for that organisation either way, by the platform`,
+            linkRows.map((b) => [b.user_id, b.organization_id, b.issuer]), [[j.user_id, org.id, "platform"]]);
+          eq(`…${live ? "the welcome to a reserved test address is suppressed, so the answer holds the link" : "the answer says inactive and holds no link"}`,
+            [j.email_outcome, typeof j.setup_link],
+            [live ? { status: "not_sent", class: "test_domain" } : { status: "not_sent", class: "inactive" }, live ? "string" : "undefined"]);
         }
       }
 
@@ -1145,7 +1325,7 @@ async function main() {
       const nudges = await import("../../app/api/cron/journey-nudges/route");
       const broadcast = await import("../../app/api/notifications/broadcast/route");
       const { notifyCourseUpdate } = await import("../../lib/courses/notify-update");
-      const { notifyAdminsOfRequest, notifyLearnerOfDecision } = await import("../../lib/attempts/requests");
+      const { notifyAdminsOfRequest, notifyLearnerOfDecision, reissueNotifier } = await import("../../lib/attempts/requests");
       const { notifyRequesterOfTicket } = await import("../../lib/tickets/notify");
       const SECRET = "stub-cron-secret";
       process.env.CRON_SECRET = SECRET;
@@ -1197,7 +1377,12 @@ async function main() {
       const GONE_ROWS = [ca("c-gone", GONE, "org"), ca("c-gone", GONE, "user", "u-g")];
 
       let mt: Record<string, Row[]> = {};
+      // ADR 0029 stage 2: what send-smtp and tenant_mail_status answer in this world.
+      let smtpAnswer: () => Response = () => json({ ok: true });
+      let statusAnswer: ((org: unknown) => Response) | null = null;
       let mFail: (table: string, select: string, query: URLSearchParams) => boolean = () => false;
+      /** The pause fields of the organisation's settings answer (email_paused, event_paused). */
+      let mSettings: Row = {};
       let warned: string[] = [];
       const mailStub = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
         const url = new URL(input instanceof Request ? input.url : String(input));
@@ -1212,12 +1397,21 @@ async function main() {
         if (raw) { try { body = JSON.parse(raw); } catch { body = raw; } }
         if (p.startsWith("/rest/v1/")) requests.push({ method, table, select, query: q, key: h.get("apikey"), body });
         if (p === "/auth/v1/user") return json(ME);
+        // ADR 0029: a loop is one run, and a run attempts a mail only through
+        // an organisation's complete SMTP settings; the send then goes.
+        if (p === "/functions/v1/send-smtp") return smtpAnswer();
         if (!p.startsWith("/rest/v1/")) return json({ message: "unexpected" }, 500);
+        if (table === "notification_settings" && method === "GET") {
+          return json([{ smtp_host: "smtp.tenant.stub", smtp_port: 465, smtp_secure: true, smtp_user: null, smtp_password: null, from_email: "noreply@tenant.stub", from_name: null, reply_to: null, email_paused: false, event_paused: {}, logo_url: null, brand_color: null, footer_text: null, ...mSettings }]);
+        }
         if (table === "rpc/journey_reminder_counts") {
           // Nothing credited yet: every enrolment is behind.
           const ids = (body as { p_ids?: string[] } | null)?.p_ids ?? [];
           return json(ids.map((id) => ({ enrollment_id: id, done: 0, done_today: false, credited: [] })));
         }
+        // ADR 0029: each send opens its run with tenant_mail_status (migration 0114): one row, no state yet.
+        if (table === "rpc/tenant_mail_status" && statusAnswer) return statusAnswer((body as Row | null)?.p_org ?? null);
+        if (table === "rpc/tenant_mail_status") return json([{ organization_id: (body as Row | null)?.p_org ?? null, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: null, sent_24h: 0 }]);
         if (table.startsWith("rpc/")) return json([]);
         if (method === "GET") {
           if (mFail(table, select, q)) return json({ code: "XX000", message: "stub read failure" }, 500);
@@ -1229,7 +1423,8 @@ async function main() {
           let rows = (mt[table] ?? []).filter((r) => matches(r, q));
           if (table === "organization_members") rows = [...rows].sort((a, b) => String(a.user_id).localeCompare(String(b.user_id)));
           const offset = Number(q.get("offset") ?? 0);
-          const limit = q.has("limit") ? Number(q.get("limit")) : rows.length;
+          // The server answers at most 1000 rows, whatever the read asks (lib/db/chunked.ts).
+          const limit = Math.min(q.has("limit") ? Number(q.get("limit")) : rows.length, 1000);
           const out = rows.slice(offset, offset + limit).map((r) => (select.includes("(") || select.includes("*") ? r : project(r, select)));
           if ((h.get("accept") ?? "").includes("vnd.pgrst.object")) return json(out[0] ?? null);
           return json(out);
@@ -1246,6 +1441,7 @@ async function main() {
         assignments?: Row[]; pathAssignments?: Row[]; reminderState?: Row[]; extraMembers?: Row[];
         reminderSettings?: Row[]; programs?: Row[]; enrolments?: Row[];
         fail?: (table: string, select: string, query: URLSearchParams) => boolean;
+        settings?: Row;
       } = {}) => {
         mt = {
           organizations: [LIVE, SECOND, GONE].map((x) => ({ ...x })),
@@ -1265,12 +1461,16 @@ async function main() {
           ],
         };
         mFail = o.fail ?? (() => false);
+        mSettings = { ...(o.settings ?? {}) };
         requests = [];
         warned = [];
+        smtpAnswer = () => json({ ok: true });
+        statusAnswer = null;
       };
       /** The user ids the sender logged a mail for (for one event, when named), sorted. */
       const mailed = (event?: string) => requests.filter((r) => r.table === "notification_log" && r.method === "POST")
-        .map((r) => r.body as Row).filter((b) => !event || b.event_type === event).map((b) => String(b.to_user_id)).sort();
+        // One insert holds one row, or a group's rows (ADR 0029: one insert for each group of a run).
+        .flatMap((r) => (Array.isArray(r.body) ? (r.body as Row[]) : [r.body as Row])).filter((b) => !event || b.event_type === event).map((b) => String(b.to_user_id)).sort();
       /** The sender's first read: false means it was never entered. */
       const senderEntered = () => requests.some((r) => r.table === "notification_settings");
       /** countingMemberIds' member read. */
@@ -1420,8 +1620,8 @@ async function main() {
         });
         {
           const r = await nudge();
-          // The claim stamps today's date (a send the stub's sender does not
-          // report as sent then releases it, as for every learner here).
+          // The claim stamps today's date (a give-back, after a send that was
+          // not delivered, writes the earlier value).
           const stamped = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && (q.body as Row | null)?.last_daily_reminder_on)
             .map((q) => String(q.query.get("id")));
           eq("journey nudges, one live organisation unreadable and one readable: the readable one's learner is reminded and claimed",
@@ -1432,6 +1632,286 @@ async function main() {
             [r.body.unreadable_orgs, r.body.skipped_org_programs], [1, 3]);
           eq("…the unreadable organisation is read once and logged by its id for each program",
             [countingReads(), unreadableLogged().map((l) => [l.org_id, l.program_id])], [2, [[LIVE.id, "p-live"], [LIVE.id, "p-live2"]]]);
+        }
+
+        // ---- ADR 0029 stage 2: the two crons' failed runs, their detail, and the carry ----
+        {
+          /** The heartbeat a run wrote: its status and its detail. */
+          const beat = (name: string) => {
+            const b = requests.filter((r) => r.table === "ops_heartbeats" && r.method === "POST" && (r.body as Row).name === name).map((r) => r.body as Row);
+            return b.length === 1 ? { status: b[0].last_status, detail: (b[0].last_detail ?? {}) as Row } : null;
+          };
+          const flat = (body: Row) => Object.values(body).every((v) => typeof v === "number" || typeof v === "boolean");
+          const textIn = (o: unknown) => JSON.stringify(o).match(/"[^"]*"\s*:\s*"[^"]*"/g) ?? [];
+          // The reminders: each named failed read answers 500 with a failed heartbeat and its word; nobody is mailed.
+          const REMINDER_READS: Array<[string, (t: string, sel: string) => boolean, string]> = [
+            ["the reminder settings", (t) => t === "course_reminder_settings", "config_read"],
+            ["the assignments", (t) => t === "course_assignments", "assignments_read"],
+            ["a team's members", (t) => t === "team_members", "members_read"],
+            ["the completed attempts", (t) => t === "course_attempts", "progress_read"],
+            ["the reminder state", (t) => t === "reminder_state", "state_read"],
+            ["the addresses", (t) => t === "profiles", "profiles_read"],
+          ];
+          for (const [what, fails, word] of REMINDER_READS) {
+            mailWorld({ assignments: [ca("c-live", LIVE, "team", "t-live"), ca("c-live", LIVE, "user", "u-act2")], fail: (t, sel) => fails(t, sel) });
+            const r = await remindRun();
+            const b = beat("reminders");
+            eq(`reminders, ${what} cannot be read: 500, a failed heartbeat with the word ${word}, stopped before any send, nobody mailed, no state written`,
+              [r.status, r.body.ok, b?.status, (b?.detail.errors as Row | undefined)?.[word], b?.detail.stopped_before_send, mailed(), stateFor()], [500, false, "error", 1, true, [], []]);
+            eq("…a number it never counted is left out of the answer, never 0; the answer holds numbers and booleans only",
+              ["due" in r.body, "left" in r.body, flat(r.body)], [false, false, true]);
+          }
+          {
+            // A tenant's failed send is not a failed run: the reminder was tried, and counts.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            smtpAnswer = () => json({ ok: false, error: "550 5.1.1 user unknown" });
+            const r = await remindRun();
+            eq("reminders, a tenant's failed send: a clean run (200, ok), the reminder counted as tried, nothing pending",
+              [r.status, r.body.ok, r.body.failed, r.body.left, beat("reminders")?.status, stateFor()], [200, true, 1, 0, "ok", ["u-act"]]);
+          }
+          {
+            // tenant_mail_status missing (no 0114): a clean run that says so, the reminder sent with no limit.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            statusAnswer = () => json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+            const r = await remindRun();
+            eq("reminders without 0114: 200, ok, no_0114 true, the reminder sent as before", [r.status, r.body.ok, r.body.no_0114, mailed("asset_reminder")], [200, true, true, ["u-act"]]);
+            // Any other failure of it is the job's own failed read; the send is still attempted with no limit.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            statusAnswer = () => json({ code: "57014", message: "canceling statement due to statement timeout" }, 500);
+            const r2 = await remindRun();
+            eq("reminders, tenant_mail_status failing otherwise: a failed run (mail_status_read), and the reminder still attempted",
+              [r2.status, r2.body.ok, (beat("reminders")?.detail.errors as Row | undefined)?.mail_status_read, mailed("asset_reminder")], [500, false, 1, ["u-act"]]);
+          }
+          {
+            // The daily limit is a clean run: what it left is counted, and its state is not written.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act"), ca("c-live", LIVE, "user", "u-act2")] });
+            statusAnswer = (org) => json([{ organization_id: org, state: null, state_changed_at: null, last_success_at: null, last_failure_at: null, last_error_code: null, failed_recipients: [], last_alert_at: null, alert_due_at: null, daily_limit: 30, sent_24h: 5 }]);
+            const r = await remindRun();
+            eq("reminders at the daily limit's routine line: a clean run, both left for a later call (left_daily_limit), no state written",
+              [r.status, r.body.ok, r.body.sent, r.body.left, r.body.left_daily_limit, stateFor()], [200, true, 0, 2, 2, []]);
+          }
+          {
+            // The carry: a failed run reads its own row once and carries the last successful run; a clean run reads none.
+            mailWorld({ fail: (t) => t === "course_reminder_settings" });
+            mt.ops_heartbeats = [{ name: "reminders", last_status: "ok", last_run_at: "2026-11-19T21:00:00.000Z", last_detail: { v: 1 } }];
+            await remindRun();
+            const carried = beat("reminders");
+            eq("reminders, a failed run: one read of its own heartbeat row, and last_ok_at carried from the last good run",
+              [requests.filter((r) => r.table === "ops_heartbeats" && r.method === "GET").length, carried?.detail.last_ok_at], [1, "2026-11-19T21:00:00.000Z"]);
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            await remindRun();
+            eq("…a clean run reads no row and stores no last_ok_at", [requests.filter((r) => r.table === "ops_heartbeats" && r.method === "GET").length, "last_ok_at" in (beat("reminders")?.detail ?? {})], [0, false]);
+          }
+          {
+            // Without 0114: the journey nudges are a clean run that says so, and mail as before.
+            mailWorld();
+            statusAnswer = () => json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+            const r = await nudge();
+            eq("journey nudges without 0114: 200, ok, no_0114 true, both learners nudged as before",
+              [r.status, r.body.ok, r.body.no_0114, mailed("journey_nudge")], [200, true, true, ["u-act", "u-act2"]]);
+            // …and an administrator's loop: the broadcast mails as before, with an unchanged answer.
+            mailWorld();
+            statusAnswer = () => json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+            const res = await broadcast.POST(new Request("http://lms.test/api/notifications/broadcast", {
+              method: "POST",
+              body: JSON.stringify({ orgSlug: LIVE.slug, subject: "Hello", body_md: "Body", audience: "all" }),
+            }));
+            const b = (await res.json()) as Row;
+            eq("a broadcast without 0114: every member that counts mailed, no limit applied, the answer as before",
+              [res.status, mailed("custom_broadcast"), b.total, b.sent], [200, COUNTING, COUNTING.length, COUNTING.length]);
+          }
+          {
+            // Rule FP7: the calls before the sends do not grow with the learners due.
+            const before = async (n: number) => {
+              const extra = Array.from({ length: n }, (_, i) => `u-due${String(i).padStart(2, "0")}`);
+              mailWorld({
+                programs: [journeyProgram("p-live", LIVE)],
+                extraMembers: extra.map((u) => M(LIVE, u, "user", "active")),
+                enrolments: extra.map((u, i) => enrol(`e-due${String(i).padStart(2, "0")}`, u, "p-live")),
+              });
+              await nudge();
+              const firstClaim = requests.findIndex((q) => q.table === "journey_enrollments" && q.method === "PATCH");
+              return firstClaim;
+            };
+            eq("journey nudges: 50 learners due cost the same calls before the first claim as 5 do", await before(50), await before(5));
+          }
+          {
+            // The house rule (lib/db/chunked.ts): a page of 160 due learners
+            // reads their and their managers' profiles in lists of at most 150
+            // ids, never one list of them all; every one is read, the run has
+            // no profiles_read failure, and the learners are reminded.
+            const extra = Array.from({ length: 160 }, (_, i) => `u-many${String(i).padStart(3, "0")}`);
+            mailWorld({
+              programs: [journeyProgram("p-live", LIVE)],
+              extraMembers: extra.map((u) => M(LIVE, u, "user", "active")),
+              enrolments: extra.map((u, i) => enrol(`e-many${String(i).padStart(3, "0")}`, u, "p-live")),
+            });
+            await nudge();
+            const lists = requests.filter((q) => q.table === "profiles").map((q) => (q.query.get("id") ?? "").replace(/^in\.\(|\)$/g, "").split(","));
+            // 162 learners due (the 160, u-act and u-act2) and u-act's manager.
+            eq("journey nudges, 160 learners due on one page: the profiles in two lists of at most 150 ids, 163 read in all, no profiles_read, and nudges sent",
+              [lists.map((l) => l.length <= 150), new Set(lists.flat()).size, (beat("journey-nudges")?.detail.errors as Row | undefined)?.profiles_read ?? 0, mailed("journey_nudge").length > 0],
+              [[true, true], 163, 0, true]);
+          }
+          {
+            // ADR 0029, note of 2026-11-21, part 2 (c): a call that sends no
+            // alert has room for one full page, 500 due learners with 500
+            // different managers (1,000 profiles, seven lists of 150), and for
+            // its first group of sends. If it had not, the page would be left
+            // whole (a clean run that says "at least n"), and that comes back
+            // to the architect.
+            const learners = Array.from({ length: 500 }, (_, i) => `u-pg${String(i).padStart(3, "0")}`);
+            const managers = learners.map((u) => `${u}-mgr`);
+            mailWorld({
+              programs: [journeyProgram("p-live", LIVE)],
+              extraMembers: [
+                ...learners.map((u, i) => M(LIVE, u, "user", "active", { line_manager_id: managers[i] })),
+                ...managers.map((u) => M(LIVE, u, "user", "active")),
+              ],
+            });
+            mt.journey_enrollments = learners.map((u, i) => enrol(`e-pg${String(i).padStart(3, "0")}`, u, "p-live"));
+            const r = await nudge();
+            const lists = requests.filter((q) => q.table === "profiles").map((q) => (q.query.get("id") ?? "").replace(/^in\.\(|\)$/g, "").split(","));
+            eq("journey nudges, one full page with no alert due (500 due learners, 500 different managers): every profile read in seven lists, and the first group of nudges sent",
+              [r.status, r.body.ok, lists.length, new Set(lists.flat()).size, mailed("journey_nudge").length > 0, r.body.left_complete === false && Number(r.body.sent) === 0],
+              [200, true, 7, 1000, true, false]);
+          }
+          {
+            // The house rule's other half: every read of the reminders is
+            // paged at the server's 1000-row cap, so no set is cut there.
+            const many = Array.from({ length: 1100 }, (_, i) => `u-st${String(i).padStart(4, "0")}`);
+            const everyone = [...many, ...COUNTING];
+            const HOUR_AGO = new Date(Date.now() - 3_600_000).toISOString();
+            const DAY_AGO = new Date(Date.now() - 86_400_000).toISOString();
+            const pages = (table: string) => requests.filter((q) => q.table === table && q.method === "GET").length;
+            mailWorld({
+              assignments: [ca("c-live", LIVE, "org")],
+              extraMembers: many.map((u) => M(LIVE, u, "user", "active")),
+              reminderState: everyone.map((u) => ({ user_id: u, course_id: "c-live", organization_id: LIVE.id, first_assigned_at: DAY_AGO, last_nudge_at: HOUR_AGO, nudge_count: 1, stopped: false })),
+            });
+            const r = await remindRun();
+            eq("reminders, 1,105 learners each reminded an hour ago (state past the 1000-row cap): every state row is read in two pages, so nobody is reminded again and no state is written over",
+              [r.status, r.body.ok, mailed(), stateFor(), pages("reminder_state")], [200, true, [], [], 2]);
+            mailWorld({
+              assignments: many.map((u) => ca("c-live", LIVE, "user", u)),
+              extraMembers: many.map((u) => M(LIVE, u, "user", "active")),
+            });
+            const r2 = await remindRun();
+            eq("reminders, 1,100 assignment rows (past the cap): every row is read in two pages, so all 1,100 learners are due (those the call has no room for are left)",
+              [r2.status, r2.body.ok, r2.body.due, pages("course_assignments")], [200, true, 1100, 2]);
+            mailWorld({ assignments: [ca("c-live", LIVE, "org")], extraMembers: many.map((u) => M(LIVE, u, "user", "active")) });
+            mt.course_attempts = everyone.map((u, i) => ({ id: `at-${i}`, user_id: u, course_versions: { course_id: "c-live" }, completion_status: "completed", success_status: "passed" }));
+            const r3 = await remindRun();
+            eq("reminders, 1,105 finished learners (attempts past the cap): every attempt is read in two pages, so nobody who finished is reminded",
+              [r3.status, r3.body.due, mailed(), pages("course_attempts")], [200, 0, [], 2]);
+          }
+          {
+            // ADR 0029, note of 2026-11-21, part 2 (b): only finished rows are
+            // asked for, by the attempt row's own columns, beside the course
+            // filter on the embedded version; the route's own test stays.
+            mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] });
+            await remindRun();
+            const q = requests.find((x) => x.table === "course_attempts" && x.method === "GET")?.query;
+            eq("reminders: the finished attempts are asked for by completion_status or success_status, with the course filter, the order and the range kept",
+              [q?.get("or"), q?.get("course_versions.course_id")?.startsWith("in."), q?.get("order"), q?.has("offset") || q?.has("limit")],
+              ["(completion_status.eq.completed,success_status.eq.passed)", true, "id.asc", true]);
+          }
+          {
+            // ADR 0029, note of 2026-11-21, part 2 (a): a read before the sends
+            // that has no room to finish, and reminders due with no room to
+            // open any run, are the job's own failed step: 500, call_limit
+            // once, stopped before any send, nobody mailed, no state written,
+            // and one fixed line. The clock is the test's, so the call's 240
+            // seconds can end at a chosen read; the count ends one too.
+            const realNow = Date.now;
+            let clock = realNow();
+            /** Advance the call's clock past its 240 seconds when `table` is first read. */
+            const jumpAt = (table: string) => {
+              let done = false;
+              mFail = (t) => {
+                if (t === table && !done) { done = true; clock += 300_000; }
+                return false;
+              };
+            };
+            const noRoomLines = () => warned.map((l) => { try { return JSON.parse(l) as Row; } catch { return null; } }).filter((l): l is Row => l?.event === "cron_no_room");
+            const stopCase = async (label: string, setup: () => void, step: string, by: "clock" | "count", counts: Row = {}) => {
+              setup();
+              clock = realNow();
+              Date.now = () => clock;
+              let r: { status: number; body: Row };
+              try { r = await remindRun(); } finally { Date.now = realNow; }
+              const b = beat("reminders");
+              const errs = (b?.detail.errors ?? {}) as Row;
+              eq(`reminders, ${label}: 500, call_limit once, stopped before any send, nobody mailed, no state written`,
+                [r.status, r.body.ok, b?.status, errs.call_limit, Object.keys(errs), b?.detail.stopped_before_send, mailed(), stateFor()],
+                [500, false, "error", 1, ["call_limit"], true, [], []]);
+              const line = noRoomLines();
+              eq("…one fixed line: the job, the step's word, the calls spent, what ended it; numbers and fixed words only",
+                [line.length, line[0]?.job, line[0]?.step, typeof line[0]?.calls, line[0]?.ended_by, JSON.stringify(line[0] ?? {}).includes("@")], [1, "reminders", step, "number", by, false]);
+              eq("…the counts it knew are written, the others left out (never 0 for \"not known\")",
+                ["due", "sent", "failed", "left", "left_complete"].map((k) => (k in r.body ? r.body[k] : "absent")),
+                ["due", "sent", "failed", "left", "left_complete"].map((k) => (k in counts ? counts[k] : "absent")));
+            };
+            await stopCase("a paged read with no room left (the call's clock ends at the assignments)",
+              () => { mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act")] }); jumpAt("course_assignments"); }, "progress_read", "clock");
+            await stopCase("the groups' members with no room left (the clock ends at the groups)",
+              () => { mailWorld({ assignments: [ca("c-live", LIVE, "group", "g-live")] }); jumpAt("org_groups"); }, "members_read", "clock");
+            const many = Array.from({ length: 4300 }, (_, i) => `u-many${String(i).padStart(4, "0")}`);
+            await stopCase("the addresses with no room left (4,305 learners: 29 lists of 150 do not fit the count)",
+              () => mailWorld({ assignments: [ca("c-live", LIVE, "org")], extraMembers: many.map((u) => M(LIVE, u, "user", "active")) }), "profiles_read", "count");
+            await stopCase("reminders due and no room to open any run (the clock ends at the addresses)",
+              () => { mailWorld({ assignments: [ca("c-live", LIVE, "user", "u-act"), ca("c-live", LIVE, "user", "u-act2")] }); jumpAt("profiles"); },
+              "mail_status_read", "clock", { due: 2, sent: 0, failed: 0, left: 2, left_complete: false });
+          }
+          {
+            // Rule T5 stays clean: an organisation whose run was not opened
+            // once another organisation's mail had gone.
+            const live = Array.from({ length: 40 }, (_, i) => `u-lv${String(i).padStart(2, "0")}`);
+            const second = ["u-sec1", "u-sec2", "u-sec3"];
+            mailWorld({
+              reminderSettings: [reminderSetting("c-live", LIVE), reminderSetting("c-sec", SECOND)],
+              assignments: [ca("c-live", LIVE, "org"), ca("c-sec", SECOND, "org")],
+              extraMembers: [...live.map((u) => M(LIVE, u, "user", "active")), ...second.map((u) => M(SECOND, u, "user", "active"))],
+            });
+            const r = await remindRun();
+            eq("reminders: an organisation left after another's mail went is a clean run (200, ok, an ok heartbeat), counted in left_orgs",
+              [r.status, r.body.ok, Number(r.body.sent) > 0, Number(r.body.left_orgs) >= 1, mailed().some((u) => second.includes(u)), beat("reminders")?.status],
+              [200, true, true, true, false, "ok"]);
+          }
+          // The journey nudges: no slug, no id and no free text in the answer or the heartbeat.
+          {
+            mailWorld();
+            const r = await nudge();
+            const b = beat("journey-nudges");
+            eq("journey nudges: the answer and the heartbeat hold numbers and booleans only: no organisation's slug or id, no list",
+              [flat(r.body), b ? flat(b.detail) : false, "details" in r.body, textIn(r.body), textIn(b?.detail)], [true, true, false, [], []]);
+          }
+          {
+            mailWorld({ fail: (t) => t === "journey_programs" });
+            const r = await nudge();
+            const b = beat("journey-nudges");
+            eq("journey nudges, the programs cannot be read: 500, config_read, stopped before any send, and no database message anywhere",
+              [r.status, (b?.detail.errors as Row | undefined)?.config_read, b?.detail.stopped_before_send, flat(r.body), JSON.stringify(r.body).includes("stub read failure")], [500, 1, true, true, false]);
+          }
+          {
+            mailWorld({ fail: (t) => t === "profiles" });
+            const r = await nudge();
+            eq("journey nudges, the profiles cannot be read: never \"no address\": 500 (profiles_read), nobody mailed, no claim taken, the learners owed",
+              [r.status, (beat("journey-nudges")?.detail.errors as Row | undefined)?.profiles_read, mailed(), claims(), Number(r.body.left) > 0], [500, 1, [], [], true]);
+          }
+          {
+            // A timeout keeps the claim (the mail may still arrive); another failure gives it back (rule T2).
+            mailWorld({ programs: [journeyProgram("p-live", LIVE)], enrolments: [] });
+            smtpAnswer = () => json({ ok: false, error: "Timed out after 15000ms waiting for the send-smtp function." });
+            const r = await nudge();
+            const giveBacks = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && (q.body as Row | null)?.last_daily_reminder_on === null);
+            eq("journey nudges, a timed-out nudge keeps its claim and is not owed", [r.status, r.body.ok, giveBacks.length, r.body.left], [200, true, 0, 0]);
+            mailWorld({ programs: [journeyProgram("p-live", LIVE)], enrolments: [] });
+            smtpAnswer = () => json({ ok: false, error: "550 5.1.1 user unknown" });
+            const r2 = await nudge();
+            const back = requests.filter((q) => q.table === "journey_enrollments" && q.method === "PATCH" && (q.body as Row | null)?.last_daily_reminder_on === null);
+            eq("…a nudge that failed otherwise gives its claim back and is owed", [r2.status, back.length > 0, Number(r2.body.left) > 0], [200, true, true]);
+          }
         }
 
         // ---- the broadcast route (the session is an active administrator of LIVE) ----
@@ -1480,6 +1960,30 @@ async function main() {
           const r = await cast({ audience: "all" });
           eq("…the control: the same session in the live organisation still reaches every member that counts", [r.status, mailed("custom_broadcast")], [200, COUNTING]);
         }
+        // ADR 0029, the owner's decision of 2026-11-21: the pause stops a
+        // broadcast. The route asks the run once, before its loop, and
+        // answers that nothing was sent, with no row for any recipient.
+        for (const [label, settings] of [["the master pause", { email_paused: true }], ["the custom_broadcast pause", { event_paused: { custom_broadcast: true } }]] as const) {
+          mailWorld({ settings });
+          let smtp = 0;
+          smtpAnswer = () => { smtp++; return json({ ok: true }); };
+          const r = await cast({ audience: "all" });
+          eq(`broadcast under ${label}: 200 with paused, the sentence and the counts of nobody emailed, no row written, nothing sent`,
+            [r.status, r.body.message, r.body.paused, r.body.sent, r.body.failed, r.body.total, r.body.email, mailed(), smtp],
+            [200, "Email is paused for this organisation. Nothing was sent.", true, 0, COUNTING.length, COUNTING.length, { recipients_unreadable: false, emailed: 0, not_emailed: COUNTING.length, not_confirmed: 0 }, [], 0]);
+        }
+        {
+          // The broadcast page shows that sentence for a paused answer, and keeps the draft.
+          const page = fs.readFileSync(path.resolve(__dirname, "../..", "app/[org]/(admin)/notifications/broadcast-client.tsx"), "utf8");
+          const pausedBranch = page.slice(page.indexOf("if (j.paused)"), page.indexOf("return;", page.indexOf("if (j.paused)")));
+          eq("…the broadcast page reads paused, shows the answer's sentence, and keeps the draft",
+            [pausedBranch.includes("paused: j.message"), /\{result\.paused && <p[^>]*>\{result\.paused\}<\/p>\}/.test(page), pausedBranch.includes("setSubject")], [true, true, false]);
+        }
+        {
+          mailWorld({ settings: { event_paused: { asset_reminder: true } } });
+          const r = await cast({ audience: "all" });
+          eq("…the control: another event's pause leaves a broadcast alone", [r.status, mailed("custom_broadcast")], [200, COUNTING]);
+        }
 
         // ---- the course update mail ----
         const update = (org: typeof LIVE, course: string) => notifyCourseUpdate({ org: { id: org.id, slug: org.slug, name: org.name }, courseId: course });
@@ -1497,8 +2001,9 @@ async function main() {
         await update(GONE, "c-gone");
         eq("course update in a deleted organisation: nobody, the sender not entered", [mailed(), senderEntered()], [[], false]);
         mailWorld({ assignments: [ca("c-live", LIVE, "org")], fail: COUNTING_READ });
-        await update(LIVE, "c-live");
+        const updateOutcome = await update(LIVE, "c-live");
         eq("course update, the members that count cannot be read: nobody, the sender not entered", [mailed(), senderEntered()], [[], false]);
+        eq("…and its outcome says the recipients were unreadable (the upload page shows it)", updateOutcome, { recipients_unreadable: true });
 
         // ---- the attempt request, to the administrators ----
         const asked = (org: typeof LIVE) => notifyAdminsOfRequest(svc(), {
@@ -1522,7 +2027,7 @@ async function main() {
         });
         const reply = (org: typeof LIVE, who: string) => notifyRequesterOfTicket(svc(), {
           orgId: org.id, orgName: org.name, orgSlug: org.slug, origin: "",
-          requester: { id: who, email: `${who}@example.test` }, subject: "Help", headline: "Reply from your admin", message: "Done",
+          requester: { id: who }, subject: "Help", headline: "Reply from your admin", message: "Done",
         });
         for (const [kind, send] of [["attempt decision", decide], ["ticket reply", reply]] as const) {
           for (const [who, org, want] of [["u-act", LIVE, true], ["u-ina", LIVE, false], ["u-sus", LIVE, false], ["u-out", LIVE, false], ["u-g", GONE, false]] as const) {
@@ -1543,6 +2048,51 @@ async function main() {
         mailWorld();
         await decide(LIVE, "u-act", new Set());
         eq("…an id not among them: not sent, the sender not entered", [mailed(), senderEntered()], [[], false]);
+
+        // ADR 0029 rule T4: each of these single mails answers its outcome
+        // for the administrator at the screen: emailed; nothing counted for a
+        // person whose membership does not count; nobody emailed because the
+        // recipient could not be read.
+        const COUNTS = (emailed: number) => ({ recipients_unreadable: false, emailed, not_emailed: 0, not_confirmed: 0 });
+        for (const [kind, send] of [["attempt decision", decide], ["ticket reply", reply]] as const) {
+          mailWorld();
+          const sent = await send(LIVE, "u-act");
+          mailWorld();
+          const notCounting = await send(LIVE, "u-ina");
+          mailWorld({ fail: (t) => t === "organization_members" });
+          const unread = await send(LIVE, "u-act");
+          eq(`${kind}: its outcome says emailed 1; nothing counted for an inactive person; the recipient unreadable when the membership cannot be read`,
+            [sent, notCounting, unread], [COUNTS(1), COUNTS(0), { recipients_unreadable: true }]);
+        }
+        // Without 0114: one single send as before, with no limit and the same outcome.
+        mailWorld();
+        statusAnswer = () => json({ code: "PGRST202", message: "Could not find the function public.tenant_mail_status(p_org) in the schema cache" }, 404);
+        {
+          const out = await reply(LIVE, "u-act");
+          eq("a ticket reply without 0114 (one single send): sent as before, with no limit, and its outcome says emailed 1",
+            [mailed("custom_broadcast"), out], [["u-act"], COUNTS(1)]);
+        }
+        {
+          // A forced restart's notifier keeps its mails' outcome for the
+          // upload's answer (beside the restart's report, never inside it).
+          const regrant = (who: string) => ({
+            orgId: LIVE.id, orgName: LIVE.name, orgSlug: LIVE.slug, origin: "", courseId: "c-live", courseTitle: "Course L",
+            learner: { id: who, email: `${who}@example.test` }, approved: true, note: null, expiresAt: null, counting: new Set(["u-act", "u-act2"]),
+          });
+          mailWorld();
+          const r = reissueNotifier();
+          const before = r.outcome();
+          await r.notify.decision(svc(), regrant("u-act"));
+          await r.notify.decision(svc(), regrant("u-act2"));
+          await r.notify.decision(svc(), regrant("u-ina"));
+          eq("a forced restart's notifier: no outcome before a mail; then two emailed, and nothing counted for a learner who does not count",
+            [before, r.outcome(), mailed()], [undefined, COUNTS(2), ["u-act", "u-act2"]]);
+          mailWorld();
+          const skipped = reissueNotifier();
+          await skipped.notify.skipped("force-restart", LIVE.id);
+          eq("…a skip: the outcome says the recipients were unreadable, and the skip is logged with the organisation's id",
+            [skipped.outcome(), unreadableLogged().map((l) => [l.site, l.org_id])], [{ recipients_unreadable: true }, [["force-restart", LIVE.id]]]);
+        }
       } finally {
         globalThis.fetch = stub as typeof fetch;
         console.warn = realWarn;

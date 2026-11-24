@@ -30,9 +30,11 @@ export type TeamRef = { managerId: string; memberIds: string[]; isOwn: boolean }
 export async function loadManagerContext(
   svc: SupabaseClient,
   orgId: string,
-  viewerId: string
+  viewerId: string,
+  /** Called before each call the hierarchy's read makes (ADR 0029 rule FP2: a request that counts its calls). */
+  countCall?: () => unknown
 ): Promise<ManagerContext> {
-  const members = await fetchHierarchyMembers(svc, orgId);
+  const members = await fetchHierarchyMembers(svc, orgId, countCall);
   // The viewer must be an ACTIVE member themselves: a suspended/inactive
   // manager is not a valid manager (decision 9) and keeps a session, so the
   // read side must refuse exactly like the action side does.

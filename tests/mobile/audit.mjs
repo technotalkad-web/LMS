@@ -140,7 +140,7 @@ const adminRoutes = [
   "/library", `/library/${course?.id}`, `/library/${course?.id}/learners`, `/library/${course?.id}/reports`, "/library/upload",
   "/master-data", "/notifications", "/reports", "/settings", "/teams", "/tickets", "/users", `/users/${lr}/edit`, "/users/new",
 ].filter(Boolean);
-const publicRoutes = ["/login", `/${SLUG}/login`, "/forgot-password", "/select-org", "/change-password"];
+const publicRoutes = ["/login", `/${SLUG}/login`, "/forgot-password", `/forgot-password?org=${SLUG}`, "/auth/set-password", "/select-org", "/change-password"];
 
 const VIEWPORTS = [
   { name: "360", width: 360, height: 800 },

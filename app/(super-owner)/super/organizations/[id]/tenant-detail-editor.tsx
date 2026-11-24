@@ -3,17 +3,43 @@
 
 import { useToast } from "@/components/ui/toast";
 import { useConfirm } from "@/components/ui/confirm";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { Plus, Trash2, Save, Mail, ShieldAlert } from "lucide-react";
+import { Plus, Trash2, Save, Mail, ShieldAlert, Send } from "lucide-react";
 
-type Admin = { user_id: string; role: string; status: string; email: string };
+/** `setup_link`: "Send setup link again" is offered (ADR 0029, rule N12). */
+type Admin = { user_id: string; role: string; status: string; email: string; setup_link?: boolean };
+
+/** What the admins route says of the welcome email. */
+type WelcomeOutcome = { status: "sent" } | { status: "not_sent"; class: string };
+
+/** Why a welcome was not sent, by the platform sender's class. */
+const WHY: Record<string, string> = {
+  not_configured: "the platform sender is not configured",
+  test_domain: "the address is a reserved test address",
+  not_allowed: "the address is not on this environment's allow-list",
+  ceiling: "the platform's daily email ceiling was reached",
+  org_limit: "this organisation's daily platform email limit was reached",
+  account_limit: "too many emails to this person today",
+  log_unreadable: "the platform's email limits could not be read",
+  timeout: "the mail server did not answer in time",
+  auth: "the platform mailbox refused the sign-in",
+  quota: "the platform mailbox's own sending limit was reached",
+  unreachable: "the platform mail server could not be reached",
+  rejected: "the receiving mailbox refused the message",
+  unknown: "the mail server answered with an error",
+};
 
 const ROLE_LABEL: Record<string, string> = {
   super_owner: "Super owner",
   admin: "Admin",
   data_analyst: "Data analyst",
 };
+
+/** ADR 0029 rule T2: what "Send setup link again" tells the administrator, word for word. */
+const SEND_AGAIN_NOTE = "The first mail may still arrive. Its link stops working when you send a new one.";
+/** The link on the screen is the link in the mail (rule N8): a new one ends it. */
+const LATER_LINK_NOTE = "If you send a new setup link later, this one stops working.";
 
 /** A row that is not active gives no access; adding the person again sets it active. */
 const STATUS_LABEL: Record<string, string> = {
@@ -45,6 +71,8 @@ export function TenantDetailEditor({
   const [newRole, setNewRole] = useState<"super_owner" | "admin" | "data_analyst">("admin");
   const [busy, setBusy] = useState(false);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
+  /** A setup link the answer returned because the welcome was not sent; shown once, until dismissed. */
+  const [shownLink, setShownLink] = useState<{ url: string; mayHaveArrived: boolean; why: string } | null>(null);
 
   async function saveOrg() {
     setBusy(true);
@@ -73,6 +101,45 @@ export function TenantDetailEditor({
     setTimeout(() => setSavedMsg(null), 3000);
   }
 
+  /** The list again, with whether "Send setup link again" is offered for each person. */
+  async function refreshAdmins() {
+    const listRes = await fetch(`/api/super/tenants/${tenantId}/admins`);
+    const listJson = await listRes.json().catch(() => ({}));
+    if (listRes.ok && Array.isArray(listJson.admins)) setAdmins(listJson.admins);
+  }
+
+  useEffect(() => {
+    void refreshAdmins();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenantId]);
+
+  /**
+   * What the answer says of the welcome (ADR 0029, rule N8). The link is in
+   * the answer only when the welcome was not sent; it is then shown once
+   * here for the platform owner to pass on, and kept nowhere else.
+   */
+  function showWelcomeOutcome(j: { email_outcome?: WelcomeOutcome | null; setup_link?: string }) {
+    const outcome = j.email_outcome;
+    if (!outcome) return;
+    if (outcome.status === "sent") {
+      setShownLink(null);
+      toast.success("Welcome email sent, with a link to set a password. It works once and expires in 7 days.");
+      return;
+    }
+    if (j.setup_link) {
+      setShownLink({ url: new URL(j.setup_link, window.location.origin).toString(), mayHaveArrived: outcome.class === "timeout", why: outcome.class });
+      return;
+    }
+    setShownLink(null);
+    if (outcome.class === "inactive") {
+      toast.info("No welcome email was sent: this person's membership here does not count (the organisation is deleted, or the row is not active).");
+    } else if (outcome.class === "link_failed") {
+      toast.error("The account was added, but its setup link could not be saved, so no welcome email was sent. The person can choose \"Forgot password?\" on the sign-in page.");
+    } else {
+      toast.error(`No welcome email was sent (${WHY[outcome.class] ?? outcome.class}).`);
+    }
+  }
+
   async function addAdmin() {
     if (!newEmail.trim()) return;
     setBusy(true);
@@ -87,21 +154,38 @@ export function TenantDetailEditor({
       toast.error(j.error ?? "Failed");
       return;
     }
-    const wasInvited = j.invited;
+    const wasInvited = j.invited === true;
     const wasReactivated = j.reactivated === true;
     setNewEmail("");
     // Refresh admin list locally + server
-    const listRes = await fetch(`/api/super/tenants/${tenantId}/admins`);
-    const listJson = await listRes.json().catch(() => ({}));
-    setAdmins(listJson.admins ?? []);
+    await refreshAdmins();
     router.refresh();
     if (wasInvited) {
-      toast.success(
-        "User didn't exist — a magic-link invitation has been emailed. They'll set their password on first sign-in."
-      );
+      showWelcomeOutcome(j);
     } else if (wasReactivated) {
       toast.success("This person's membership was not active. It is active again, so they have access.");
+    } else {
+      toast.success("Added. This person already had an account and signs in as before; no email was sent.");
     }
+  }
+
+  async function sendSetupLinkAgain(admin: Admin) {
+    // Rule T2: the action says that the first mail may still arrive.
+    if (!await confirm(`Send ${admin.email} a new setup link? ${SEND_AGAIN_NOTE}`)) return;
+    setBusy(true);
+    const res = await fetch(`/api/super/tenants/${tenantId}/admins`, {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ user_id: admin.user_id }),
+    });
+    setBusy(false);
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      toast.error(j.error ?? "Failed");
+      return;
+    }
+    showWelcomeOutcome(j);
+    await refreshAdmins();
   }
 
   async function changeRole(admin: Admin, role: string) {
@@ -196,6 +280,44 @@ export function TenantDetailEditor({
           Admins & data analysts
         </h2>
 
+        {shownLink && (
+          <div className="mb-4 border border-amber-200 bg-amber-50 text-amber-900 rounded-lg p-3 text-sm space-y-2">
+            <p className="font-semibold">
+              {shownLink.mayHaveArrived
+                ? "The welcome email may have been sent: the mail server did not answer in time."
+                : `The welcome email was not sent (${WHY[shownLink.why] ?? shownLink.why}).`}
+            </p>
+            <p>
+              Pass this link to the person by another way. It lets them set their own password, works once and
+              expires in 7 days. It is shown only now. {LATER_LINK_NOTE}
+            </p>
+            {shownLink.mayHaveArrived && <p>{SEND_AGAIN_NOTE}</p>}
+            <div className="flex gap-2 items-center">
+              <input
+                readOnly
+                value={shownLink.url}
+                onFocus={(e) => e.currentTarget.select()}
+                aria-label="Setup link"
+                className="flex-1 min-w-0 border border-amber-300 rounded-md px-2 py-1 text-xs font-mono bg-paper"
+              />
+              <button
+                onClick={() => {
+                  void navigator.clipboard?.writeText(shownLink.url).then(
+                    () => toast.success("Link copied."),
+                    () => toast.error("Could not copy; select the link and copy it.")
+                  );
+                }}
+                className="px-2 py-1 border border-amber-300 rounded-md text-xs font-semibold bg-paper"
+              >
+                Copy
+              </button>
+              <button onClick={() => setShownLink(null)} className="px-2 py-1 text-xs underline">
+                Done
+              </button>
+            </div>
+          </div>
+        )}
+
         {admins.length === 0 ? (
           <p className="text-sm text-muted mb-4">No admins yet. Add one below.</p>
         ) : (
@@ -217,6 +339,16 @@ export function TenantDetailEditor({
                   <p className="text-xs text-muted font-mono truncate">{a.user_id}</p>
                 </div>
                 <div className="flex items-center gap-2">
+                  {a.setup_link && (
+                    <button
+                      onClick={() => sendSetupLinkAgain(a)}
+                      disabled={busy}
+                      className="px-2 py-1 border border-line rounded-md text-xs font-semibold text-ink hover:bg-canvas flex items-center gap-1 disabled:opacity-60"
+                      title={`This person has not set a password yet. Email them a new link. ${SEND_AGAIN_NOTE}`}
+                    >
+                      <Send className="w-3.5 h-3.5" /> Send setup link again
+                    </button>
+                  )}
                   <select
                     value={a.role}
                     onChange={(e) => changeRole(a, e.target.value)}
@@ -280,7 +412,9 @@ export function TenantDetailEditor({
             </button>
           </div>
           <p className="text-xs text-muted mt-2">
-            If the email doesn&apos;t already have an account, a magic-link invitation is emailed.
+            If the email has no account yet, one is created without a password and the person is emailed a link
+            to set their own (it works once and expires in 7 days). An existing account is added as it is, and no
+            email is sent.
           </p>
         </div>
       </section>
