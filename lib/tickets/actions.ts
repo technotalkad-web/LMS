@@ -10,7 +10,12 @@ import type { TicketRow } from "./auth";
 
 export type TicketAction = "grant_retry" | "assign" | "extend_due" | "decline" | "resolve";
 
-/** The ticket's close and its thread message: two calls after the action, made whatever its mail did. */
+/**
+ * The ticket's status write and its thread message: two calls after the
+ * action, made whatever its mail did. On an action that finishes they are
+ * the close and its message; on one that does not, the move to in_progress
+ * and its message (ADR 0029, note of 2026-11-25, part 2, point 5).
+ */
 const TICKET_CLOSE_CALLS = 2;
 
 /**
@@ -18,6 +23,23 @@ const TICKET_CLOSE_CALLS = 2;
  * one-click actions run the same code the admin screens use, then the ticket
  * is closed with an outcome, a thread message and an email to the requester.
  * Nothing here checks the role — the route does (admin only).
+ *
+ * ADR 0029, note of 2026-11-25, part 2: the ticket closes only when the
+ * action is finished. A result with a row marked `retry` (not saved for
+ * want of the request's room, or its save not confirmed; the mark is read,
+ * never the reason's words) leaves it open: what was written stands and its
+ * learners are mailed as usual, the ticket moves to in_progress with no
+ * closing time and no outcome written (the same columns a requester's
+ * reply writes when it reopens a ticket), one thread message says what was
+ * done, how many are left and that the action is run again (the
+ * administrator's note waits for the close), and the requester is not
+ * mailed (their one mail goes at the close). The answer says so
+ * (`closed: false`, a null outcome and a null `requester_email`), and the
+ * administrator presses the same action again: the people already served
+ * read "already" and are not written twice, the rest are written, and the
+ * ticket then closes as usual. Every other answer is `closed: true`. An
+ * action that serves nobody answers 409 before any of this, as before, and
+ * leaves the ticket as it was.
  *
  * ADR 0029 rule FP2: the request is one budget and one run. `budget` is
  * the request's, its count holding the calls made before this (the route's
@@ -30,7 +52,8 @@ const TICKET_CLOSE_CALLS = 2;
  * learners' mail is sized without them. The requester's hold is given back
  * just before their mail, which then counts its own calls where it makes
  * them (fewer when their membership does not count or no address is
- * found); the close's two are always made. The requester's mail goes in
+ * found), or given back unused when the ticket stays open; the two held
+ * for the ticket are always made. The requester's mail goes in
  * the same run (opened here when the action mailed nobody), or, with no
  * room left (the clock, or a last group that needed more of its tail), is
  * left and answered as such (`left`).
@@ -48,12 +71,13 @@ export async function actOnTicket(
     expiresInDays?: number | null;
     budget?: MailBudget;
   }
-): Promise<ActionError | { outcome: TicketOutcome; summary: string; results: PerLearnerResult[]; email?: MailOutcome | null; requester_email: RequesterMailOutcome | null }> {
+): Promise<ActionError | { closed: boolean; outcome: TicketOutcome | null; summary: string; results: PerLearnerResult[]; email?: MailOutcome | null; requester_email: RequesterMailOutcome | null }> {
   const { ticket } = args;
   const note = args.note?.trim() || null;
   const budget = args.budget ?? requestBudget({ spent: ADMIN_REQUEST_OWN_CALLS });
-  // Held back: the close and its thread message come after the action's
-  // mail, whatever it does (they are not counted again when made).
+  // Held back: the ticket's status write and its thread message come after
+  // the action's mail, whatever it does (they are not counted again when
+  // made).
   spendCalls(budget, TICKET_CLOSE_CALLS);
   // Held back too: the requester's room, given back before their mail.
   spendCalls(budget, REQUESTER_HELD_CALLS);
@@ -144,6 +168,26 @@ export async function actOnTicket(
     summary = note ? `Resolved: ${note}` : "Resolved.";
   }
 
+  // ADR 0029, note of 2026-11-25, part 2: an action that could not finish
+  // (a row marked `retry`) leaves the ticket open. Its two held calls are the
+  // move to in_progress and the thread message; the requester's hold is
+  // given back unused, and the requester is mailed at the close.
+  const left = results.filter((r) => r.retry === true).length;
+  if (left > 0) {
+    const openIso = new Date().toISOString();
+    const stillOpen = `${summary} ${left} left to try again: the ticket stays open (in progress), and the same action is run again for ${left === 1 ? "that person" : "them"}.`;
+    const { error: openErr } = await svc
+      .from("help_tickets")
+      .update({ status: "in_progress", closed_at: null, updated_at: openIso })
+      .eq("id", ticket.id);
+    if (openErr) return { error: openErr.message, status: 400 };
+    await svc.from("help_ticket_messages").insert({
+      organization_id: args.org.id, ticket_id: ticket.id, author_id: args.admin.id, author_role: "admin", body: stillOpen,
+    });
+    spendCalls(budget, -REQUESTER_HELD_CALLS);
+    return { closed: false, outcome: null, summary: stillOpen, results, ...(email !== undefined ? { email } : {}), requester_email: null };
+  }
+
   const nowIso = new Date().toISOString();
   const adminNote = note && outcome !== "declined" && outcome !== "resolved" ? `${summary} ${note}` : summary;
   const { error } = await svc
@@ -168,5 +212,5 @@ export async function actOnTicket(
     },
     { budget, run }
   );
-  return { outcome, summary, results, ...(email !== undefined ? { email } : {}), requester_email: requesterEmail };
+  return { closed: true, outcome, summary, results, ...(email !== undefined ? { email } : {}), requester_email: requesterEmail };
 }

@@ -13,7 +13,14 @@ const ACTIONS: TicketAction[] = ["grant_retry", "assign", "extend_due", "decline
  *
  * Admin-only (decision 12: managers raise, admins act). Runs the matching
  * admin operation on the ticket's context (same code as the admin screens),
- * closes the ticket with an outcome and emails the requester.
+ * closes the ticket with an outcome and emails the requester when the
+ * action is finished (`closed: true`). When it could not finish (people
+ * left marked to try again: not saved for want of the request's room, or
+ * not confirmed), the ticket stays open, in_progress with a thread message
+ * and no mail to the requester, and the answer says so (`closed: false`, a
+ * null outcome); the administrator presses the same action again, which
+ * finishes the rest and closes the ticket once nobody is left (ADR 0029,
+ * note of 2026-11-25, part 2). A ticket closed with an outcome answers 409.
  *
  * ADR 0029 rule FP2: the request's one budget starts with the request and
  * counts from its first call, the middleware's, then the session, ticket

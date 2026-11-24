@@ -53,9 +53,15 @@
  *   - refused with 23505 (another request wrote one of its rows since the
  *     read). Its rows go one at a time while the request has room; the
  *     rest are not tried and answered as not saved ("try again"), and the
- *     request stays within 40. At 50 the inserts use the room up: no
- *     learner is emailed, the requester's mail is left, and the ticket
- *     still closes with its outcome.
+ *     request stays within 40. At 50 the inserts use the room up and no
+ *     learner is emailed. The ticket stays open (ADR 0029, note of
+ *     2026-11-25, part 2): in_progress, no outcome, one thread message,
+ *     the requester not mailed, `closed: false`. A second press of the
+ *     same action finds the rows written the first time ("already"),
+ *     writes the rest in one insert, closes the ticket and mails the
+ *     requester, and nobody holds two rows. A press that finds everybody
+ *     served answers 409 and leaves the ticket open; "Mark resolved"
+ *     closes it.
  * And a vertical target whose group cannot be created leaves the
  * deactivated groups the request named deactivated.
  *
@@ -141,6 +147,8 @@ let failRead: ((c: Call) => boolean) | null = null;
  */
 let refuse: ((c: Call, rows: Row[]) => Row | null) | null = null;
 let dropWrite: ((c: Call) => boolean) | null = null;
+/** The nullable columns with no default (0083) that the grant's insert leaves out and its open-grant read selects. */
+const COLUMN_NULLS: Record<string, Row> = { attempt_requests: { used_at: null, used_attempt_id: null } };
 const json = (body: unknown, status: number) => new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
 const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
   const url = new URL(input instanceof Request ? input.url : String(input));
@@ -156,6 +164,14 @@ const fetchAll = async (input: RequestInfo | URL, init?: RequestInit): Promise<R
   calls.push(call);
   if (url.pathname === "/auth/v1/user") return new Response(JSON.stringify(USER), { status: 200, headers: { "content-type": "application/json" } });
   if (method === "GET" && failRead?.(call)) return json({ code: "XX000", message: "stub read failure" }, 500);
+  // A column the insert leaves out is stored as the server stores it
+  // (COLUMN_NULLS), so a later read that selects it answers null, not a
+  // missing key. A second press reads back the first press's grants.
+  if (method === "POST" && COLUMN_NULLS[table] && body && typeof body === "object") {
+    const fill = (r: Row) => ({ ...COLUMN_NULLS[table], ...r });
+    body = Array.isArray(body) ? (body as Row[]).map(fill) : fill(body as Row);
+    init = { ...init, body: JSON.stringify(body) };
+  }
   if (method === "POST" && UNIQUE[table]) {
     beforeWrite?.(call);
     const refused = refuse?.(call, (Array.isArray(body) ? body : [body]) as Row[]);
@@ -531,9 +547,9 @@ async function main() {
       const done = action === "grant_retry"
         ? world.tables.attempt_requests.filter((x) => x.status === "approved").length
         : world.tables.course_assignments.filter((x) => x.assignee_type === "user").length;
-      eq(`200, all ${N} ${action === "grant_retry" ? "granted" : "assigned"}, the ticket closed with its outcome, its thread message written`,
-        [r.status, done, closed(), world.tables.help_ticket_messages.length],
-        [200, N, [["closed", action === "grant_retry" ? "granted" : "assigned"]], 1]);
+      eq(`200, all ${N} ${action === "grant_retry" ? "granted" : "assigned"}, the ticket closed with its outcome (closed true), its thread message written`,
+        [r.status, done, r.body.closed, closed(), world.tables.help_ticket_messages.length],
+        [200, N, true, [["closed", action === "grant_retry" ? "granted" : "assigned"]], 1]);
       eq(`the whole request, with the middleware's call: ${total} calls, within 40`, [calls.length + MIDDLEWARE_CALLS, calls.length + MIDDLEWARE_CALLS <= 40], [total, true]);
       eq("…one run: the organisation's mail state read once", runsOpened(), 1);
       eq(`…${firstSend} calls before the first send, as counted`, beforeFirstSend(), firstSend);
@@ -624,9 +640,9 @@ async function main() {
       console.log(`\nPOST /api/tickets/[id]/act, "decline": a ticket naming ${N} learners`);
       seed({ ticket: ticketRow("grant_retry", LEARNERS) });
       const r = await actOn({ action: "decline", note: "Not this quarter" });
-      eq("200, declined, nobody named is mailed, the requester emailed in the request's one run",
-        [r.status, closed(), learnerSends(), requesterSends(), counts(r.body.requester_email), runsOpened()],
-        [200, [["closed", "declined"]], 0, 1, [1, 0, 0, null], 1]);
+      eq("200, declined (closed true), nobody named is mailed, the requester emailed in the request's one run",
+        [r.status, r.body.closed, closed(), learnerSends(), requesterSends(), counts(r.body.requester_email), runsOpened()],
+        [200, true, [["closed", "declined"]], 0, 1, [1, 0, 0, null], 1]);
       eq(`…${calls.length + MIDDLEWARE_CALLS} calls with the middleware's, within 40`, calls.length + MIDDLEWARE_CALLS <= 40, true);
     }
 
@@ -647,10 +663,33 @@ async function main() {
         ? world.tables.attempt_requests.filter((x) => x.status === "approved" && x.decided_by === ADMIN).map((x) => String(x.user_id))
         : world.tables.course_assignments.filter((x) => x.assignee_type === "user" && x.assigned_by === ADMIN).map((x) => String(x.user_id));
       return {
-        status: r.status, results: (r.body.results as Row[] | undefined) ?? [], rows,
+        status: r.status, results: (r.body.results as Row[] | undefined) ?? [], rows, body: r.body, closed: r.body.closed ?? null,
         email: counts(r.body.email), requester: counts(r.body.requester_email),
         learners: learnerSends(), requesterSent: requesterSends(), total: calls.length + MIDDLEWARE_CALLS,
       };
+    };
+    /**
+     * The same ticket pressed again, in the same world: the calls counted
+     * afresh and the case's switches cleared (a new request). The answer,
+     * the sends and the calls of this press alone.
+     */
+    const pressAgain = async (body: Row) => {
+      calls = [];
+      beforeWrite = null;
+      loseReply = null;
+      failRead = null;
+      refuse = null;
+      dropWrite = null;
+      const r = await actOn(body);
+      return {
+        status: r.status, body: r.body, results: (r.body.results as Row[] | undefined) ?? [], closed: r.body.closed ?? null,
+        learners: learnerSends(), requesterSent: requesterSends(), requester: counts(r.body.requester_email), total: calls.length + MIDDLEWARE_CALLS,
+      };
+    };
+    /** The keys held by more than one row of `table` (a person with two open grants, or two direct assignments of the course). */
+    const heldTwice = (table: string) => {
+      const keys = (world.tables[table] ?? []).map(UNIQUE[table]).filter((k): k is string => k !== null);
+      return [...new Set(keys.filter((k, i) => keys.indexOf(k) !== i))];
     };
     /** The first insert into `table` is saved, and its answer lost. */
     const loseFirstInsertInto = (table: string) => {
@@ -708,6 +747,19 @@ async function main() {
       eq("409, the ticket still open; each of the 3 not confirmed; nobody emailed; no insert tried again",
         [a.status, closed(), a.results.length === 0 || a.results.every((x) => String(x.reason ?? "").startsWith("not confirmed")), a.learners, insertsInto(table).length],
         [409, [["open", null]], true, 0, 1]);
+      // ADR 0029, note of 2026-11-25, part 2, point 4: the rows had been
+      // saved after all, so a second press finds everybody served. It
+      // answers today's 409 with "already" as its reason, writes nothing and
+      // leaves the ticket open; "Mark resolved" closes it. (The assignment is
+      // pressed without a date: a date written counts as served, and the
+      // ticket would close as assigned.)
+      const b = await pressAgain(action === "grant_retry" ? { action, expires_in_days: 30 } : { action });
+      eq("…pressed again, everybody served: 409 reading \"already\", no insert, nobody emailed, the ticket still open",
+        [b.status, String(b.body.error ?? "").includes(action === "grant_retry" ? "already has an open request or grant" : "already assigned"), insertsInto(table).length, b.learners, b.requesterSent, closed(), heldTwice(table)],
+        [409, true, 0, 0, 0, [["open", null]], []]);
+      const c = await pressAgain({ action: "resolve" });
+      eq("…\"Mark resolved\" closes it: 200, closed true, the outcome resolved, the requester emailed",
+        [c.status, c.closed, closed(), c.requesterSent], [200, true, [["closed", "resolved"]], 1]);
     }
 
     // A batch refused with 23505: another request wrote one of its rows
@@ -716,7 +768,9 @@ async function main() {
     // left for are not tried and answered as not saved ("try again"). The
     // mail's reads and the run's opening are made only while they fit.
     // Before, all 50 were tried one at a time, past 40 and past the
-    // platform's 50.
+    // platform's 50. Those rows are marked to try again, so the ticket stays
+    // open, and a second press of the same action finishes the rest and
+    // closes it (ADR 0029, note of 2026-11-25, part 2).
     for (const [action, dueAt] of [["grant_retry", undefined], ["assign", undefined], ["assign", dueIn30]] as const) {
       const table = tableOf(action);
       const people = LEARNERS.slice(0, MAX_TICKET_PEOPLE);
@@ -738,11 +792,16 @@ async function main() {
       console.log(`  (tried one at a time, raced one included: ${people.length - untried.length}; calls ${a.total})`);
       eq("200, the whole request within 40", [a.status, a.total <= 40], [200, true]);
       // What the room left: the row-by-row inserts use it up, so the
-      // learners' mail is not read or opened and the requester's is left;
-      // the ticket still closes with its outcome (its two calls were held).
-      eq("…measured: no learner emailed (each saved one reported as not emailed), the requester's mail left, the ticket closed with its outcome",
-        [a.email, a.learners, a.requester, a.requesterSent, closed()],
-        [[0, a.rows.length, 0, null], 0, [0, 1, 0, 1], 0, [["closed", action === "grant_retry" ? "granted" : "assigned"]]]);
+      // learners' mail is not read or opened. The rows not tried are marked
+      // to try again, so the ticket stays open: in_progress with no outcome
+      // and no closing time, one thread message (its two calls were held),
+      // and the requester neither read nor mailed: the last call is the
+      // thread message.
+      eq("…measured: no learner emailed (each saved one reported as not emailed); closed false, no outcome, no requester_email; the ticket in_progress, no closing time; one thread message; the requester not mailed",
+        [a.email, a.learners, a.closed, a.body.outcome, a.body.requester_email, closed(), world.tables.help_tickets[0].closed_at, world.tables.help_ticket_messages.length, a.requesterSent, last()],
+        [[0, a.rows.length, 0, null], 0, false, null, null, [["in_progress", null]], null, 1, 0, "POST help_ticket_messages"]);
+      eq("…the answer's summary says how many are left and that the ticket stays open",
+        String(a.body.summary ?? "").includes(`${a.results.filter((x) => x.retry === true).length} left to try again: the ticket stays open`), true);
       eq("…the rows not tried answered as not saved, \"try again\", and none of them written",
         [untried.length > 0, untried.some((u) => a.rows.includes(u))], [true, false]);
       eq("…each row tried and saved is written, and each written row was tried; the raced one is answered as already there",
@@ -753,6 +812,48 @@ async function main() {
       eq("…each row not saved for room carries retry: true, and no other row does",
         [a.results.filter((x) => x.retry === true).map((x) => String(x.userId)).sort(), [...untried].sort()].map((l) => l.join(",")),
         [[...untried].sort().join(","), [...untried].sort().join(",")]);
+
+      // The second press (part 2, point 3): everything read again. The
+      // people served the first time, and the raced one, read "already" and
+      // are not written twice; the rest are written in one insert; the
+      // ticket closes with its outcome and the requester is mailed.
+      const b = await pressAgain(action === "grant_retry" ? { action, expires_in_days: 30 } : { action, ...(dueAt ? { dueAt } : {}) });
+      const word = action === "grant_retry" ? "granted" : "assigned";
+      const servedNow = b.results.filter((x) => x.status === word).map((x) => String(x.userId)).sort();
+      const servedBefore = [...a.rows, raced];
+      console.log(`  (second press: ${servedNow.length} ${word}, ${b.learners} learners emailed; calls ${b.total})`);
+      eq("…pressed again: 200, closed true, the ticket closed with its outcome, a second thread message, the requester emailed in the same run, within 40",
+        [b.status, b.closed, b.body.outcome, closed(), world.tables.help_ticket_messages.length, b.requesterSent, b.requester, b.total <= 40],
+        [200, true, word, [["closed", word]], 2, 1, [1, 0, 0, null], true]);
+      eq("…one insert, of exactly the people left to try again; nobody left marked to try again",
+        [insertsInto(table).length, rowsOf(insertsInto(table)).map((r) => String(r.user_id)).sort(), servedNow, b.results.filter((x) => x.retry === true).length],
+        [1, [...untried].sort(), [...untried].sort(), 0]);
+      eq("…each person served before, and the raced one, reads \"already\" and is not written again",
+        servedBefore.every((u) => /already/.test(String(b.results.find((x) => x.userId === u)?.reason ?? ""))), true);
+      eq("…every person named holds exactly one row, and nobody holds two",
+        [people.every((u) => (world.tables[table] ?? []).filter((r) => UNIQUE[table](r) !== null && r.user_id === u && r.course_id === COURSE).length === 1), heldTwice(table)], [true, []]);
+      eq("…the learners served now mailed within the room (each counted, emailed or not)",
+        [b.learners >= 1, (b.body.email as Row | undefined)?.emailed === b.learners], [true, true]);
+    }
+
+    // Case E (ADR 0029, note of 2026-11-25, part 2): a grant for 50 whose
+    // batch is refused for one row leaves people marked to try again, and
+    // the ticket stays open. Red on 10f13cd: the ticket closed as granted.
+    {
+      console.log("\n[E] POST /api/tickets/[id]/act, grant_retry for 50, the batch refused for one row (23505): the ticket stays open");
+      const people = LEARNERS.slice(0, MAX_TICKET_PEOPLE);
+      const a = await actWith("grant_retry", people, () => {
+        let done = false;
+        beforeWrite = (c) => {
+          if (done || c.table !== "attempt_requests" || !Array.isArray(c.body)) return;
+          done = true;
+          world.tables.attempt_requests.push({ organization_id: ORG, course_id: COURSE, user_id: people[6], status: "pending", used_at: null, decided_by: null, decided_at: null, expires_at: null });
+        };
+      });
+      const t = world.tables.help_tickets[0];
+      eq("[E] 200, closed false, status in_progress, outcome null, closed_at null, one thread message, no requester send, within 40",
+        [a.status, a.closed, t.status, t.outcome, t.closed_at, world.tables.help_ticket_messages.length, a.requesterSent, a.total <= 40],
+        [200, false, "in_progress", null, null, 1, 0, true]);
     }
 
     // ADR 0029, note of 2026-11-25, part 3: the writes of a grant and of an
