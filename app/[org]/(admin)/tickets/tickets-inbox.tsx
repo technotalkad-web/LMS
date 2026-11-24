@@ -71,7 +71,8 @@ export function TicketsInbox({ tickets, orgSlug, orgName }: { tickets: TicketVie
       : tickets.filter((t) => t.status === filter);
 
   const setOpenLine = (id: string, msg: string | null) => setNotes((n) => ({ ...n, [`open:${id}`]: msg ?? "" }));
-  // `ticketId`: the card whose "still open" line this call sets or clears.
+  // `ticketId`: the card whose "still open" line this call clears (an
+  // action, or a status change) and, on an action's answer, sets.
   // A ticket's action that could not finish answers `closed: false` (ADR
   // 0029, note of 2026-11-25, part 2): the ticket stays open, its answer's
   // summary says what is left, and the administrator presses the same
@@ -158,7 +159,7 @@ export function TicketsInbox({ tickets, orgSlug, orgName }: { tickets: TicketVie
               busy={busy}
               error={notes[`err:${t.id}`] || null}
               stillOpen={notes[`open:${t.id}`] || null}
-              onSetStatus={async (s) => setErr(t.id, await call(`status:${t.id}`, `/api/tickets/${t.id}`, "PATCH", { status: s }))}
+              onSetStatus={async (s) => setErr(t.id, await call(`status:${t.id}`, `/api/tickets/${t.id}`, "PATCH", { status: s }, t.id))}
               onSetPriority={async (p) => setErr(t.id, await call(`priority:${t.id}`, `/api/tickets/${t.id}`, "PATCH", { priority: p }))}
               onReply={async (text) => setErr(t.id, await call(`reply:${t.id}`, `/api/tickets/${t.id}/messages`, "POST", { body: text }))}
               onAct={async (action, extra) => setErr(t.id, await call(`act:${t.id}`, `/api/tickets/${t.id}/act`, "POST", { action, ...extra }, t.id))}
