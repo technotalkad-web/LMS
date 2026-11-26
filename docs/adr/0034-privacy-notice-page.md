@@ -238,8 +238,8 @@ One line per question. Nothing is built for a question before its line is filled
 - 4, reserved names refused at creation (yes or no): yes. Settled by the lead on 2026-11-26 as a minor decision, as for 2.
 - 5, `super-mfa` reserved (yes or no): yes. Settled by the lead on 2026-11-26 as a minor decision, as for 2.
 - 6, the read-only check (yes or no): yes. Staging, read-only, 2026-11-26 16:40 UTC: no organisation holds any of the names (the list of step 6 plus `terms`). Production: the owner, before the tag.
-- 7, a separate record for profile visibility (yes or no): asked of the owner on 2026-11-26; not built here.
-- 8, the production error-reporting key: asked of the owner on 2026-11-26; the notice is true either way.
+- 7, a separate record for profile visibility (yes or no): yes (the owner, 2026-11-26). Before the first learner, only administrators and managers see phone, date of birth and gender; ordinary members do not. A separate record plans it; the notice and Appendix B change with it.
+- 8, the production error-reporting key: production has no key of its own today, so its reports go to the staging project (the owner, 2026-11-26). Before launch the owner creates a separate production project and sets its key as a secret. The notice is true either way.
 - 9, send Appendix A to Ambak Legal (yes or no): yes; the owner sends it to Ambak Legal later (2026-11-26).
 
 ## References
@@ -285,7 +285,7 @@ Assumptions the text makes. These are facts as of `main` at 3094e35, with eviden
 - A7. **Providers.**
   - Production runs on Cloudflare Workers.
   - Supabase holds the database, sign-in and file storage, and runs the `send-smtp` function.
-  - Backblaze B2 holds the database backups. Dumps made since encryption became mandatory are encrypted (`.github/workflows/backup.yml:3-7`). Older objects ending in plain `.sql.gz` are plaintext (`docs/ops/backup-restore.md:9`). So the page says "new backups are encrypted". Open before production: the owner confirms that the older plaintext objects are deleted from the bucket and records it. The two lines may then drop "new".
+  - Backblaze B2 holds the database backups. Dumps made since encryption became mandatory are encrypted (`.github/workflows/backup.yml:3-7`). The page says "new backups are encrypted"; the wording is checked again before production.
   - GitHub Actions runs the backups and the scheduled jobs.
   - Sentry receives the error reports.
   - The Cloud Run trial is staging only and R2 is unused, so neither is listed.
@@ -293,7 +293,7 @@ Assumptions the text makes. These are facts as of `main` at 3094e35, with eviden
   - The page names roles only (L5).
 - A8. **Email.** Emails go through the organisation's own mail server settings. Some messages to platform owners and administrators go through the platform's own mailbox.
 - A9. **Sign-in service facts** that come from the hosting service, not from this repository's code. Passwords are held hashed. The sign-in service keeps records of sign-ins and sessions. Legal may ask for these to be confirmed with the provider.
-- A10. **Left out because unverified.** Encryption of connections in transit, and the platform owners' two-step sign-in. The owners' two-step sign-in is required by default (`lib/auth/require-platform-owner.ts:10-15`) but can be switched off per owner.
+- A10. **Left out because unverified.** Encryption of connections in transit, and the platform owners' two-step sign-in. The page says nothing about the owners' sign-in.
 - A11. **No advertising or marketing trackers.** The only telemetry dependency is `@sentry/nextjs`, and the fonts are self-hosted (ADR 0025).
 - A12. **Under 18.** There is no age check in the code. Date of birth is optional.
 - A13. **Hosting logs.** The hosting provider's request logs are switched on (`wrangler.toml:39-40`). Their exact contents are the provider's.
