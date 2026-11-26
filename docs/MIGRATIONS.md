@@ -85,15 +85,15 @@ Each file's header is the full rule; this is the cross-file summary.
   before `ops/0112-reverse.sql` or `ops/0107-reverse.sql`, in the same
   sitting.
 - **0108** (the end of 0107's paste window: the derive trigger, its function
-  and  are dropped, and so is the paste-window trigger
-  that fills ;  becomes not null).
+  and `context_derive_log` are dropped, and so is the paste-window trigger
+  that fills `journey_versions.day_ids`; `day_ids` becomes not null).
   **On staging** since 2026-11-26, about 14:30 UTC: the owner pasted it in
   the SQL editor after its preconditions were read that day (the derive
-  trigger last fired 2026-11-17; no journey version without ; both
-  staging deployments on  3094e35; the nightly and the pull-request
+  trigger last fired 2026-11-17; no journey version without `day_ids`; both
+  staging deployments on `main` 3094e35; the nightly and the pull-request
   e2e green on 3094e35; no open pull request). The file ran its own before-
   and after-checks, and the read-only after-reads (the log and both triggers
-  gone,  and  not null) were all true. **Not yet
+  gone, `day_ids` and `context_kind` not null) were all true. **Not yet
   pasted on production**: in the owner's sitting of step 74, after 0107 and
   the release tag, before 0109.
 - After 0112, every later paste of 0107 (staging, until 0109) is followed by
