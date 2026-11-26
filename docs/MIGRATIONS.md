@@ -71,10 +71,14 @@ Each file's header is the full rule; this is the cross-file summary.
 - **0112** (the completion sweep's time box and its own calls; five
   functions, no relation, no row write): written and rehearsed
   (`scripts/migration-rehearsal`, scenarios `0107-then-0112` and
-  `0107-0112-then-0107-then-0112`); **not yet pasted on staging or
-  production** (2026-11-16). Staging paste: the owner, in the SQL editor, as
-  soon as its pull request is merged, with the read-only reads before and
-  after that its header lists (the note's S3); record the date here.
+  `0107-0112-then-0107-then-0112`). **On staging** by 2026-11-17: spec 78
+  ran green by hand on staging that day with 0112 pasted
+  (`scripts/lifecycle-nightly.sh`, pull request 273); the paste date was not
+  recorded here. **Not yet pasted on production** (2026-11-16). The
+  production paste: recommended in the owner's sitting of step 74, directly
+  after 0107 (the note's D-S2; the owner's answer pending, ADR 0033
+  section 4), with the read-only reads before and after that 0112's header
+  lists; record the date here.
   Reverse: `ops/0112-reverse.sql`, staging only (`ops/0107-reverse.sql`
   drops 0112's two functions too); if the staging job of the note's D-S3 was
   scheduled, `select cron.unschedule('completion-sweep');` comes first,
@@ -191,9 +195,13 @@ Each file's header is the full rule; this is the cross-file summary.
   `0115-then-0107-again`, `0115-undone-then-0115`, `0115-extra-policy`,
   `0115-missing-policy`, `0115-no-analyst-helper`,
   `0115-with-0110-stand-in`, `0115-hand-made`, `0115-hand-made-at-0104` and
-  `0115-hand-made-off-list`); **not yet applied on staging or production**
-  (2026-11-18; a first staging paste that day was refused by its section 0c
-  and changed nothing). Before each paste the owner runs its before-check (section
+  `0115-hand-made-off-list`). **On staging** by 2026-11-18: a first staging
+  paste that day was refused by its section 0c and changed nothing; spec 80's
+  database group then ran green by hand on staging with 0115 pasted, the
+  same day (`scripts/lifecycle-nightly.sh`, pull request 280), and
+  `ops/0115-after-checks.sql` passed there in the 0114 and 0117 sitting of
+  2026-11-19 (above); the paste date was not recorded here. **Not yet
+  applied on production** (2026-11-18). Before each paste the owner runs its before-check (section
   0b of the file, one read-only select) and answers every row whose verdict
   is not `ok` or `info`, and keeps the `B11` rows whole with the record of
   the sitting (the stored definitions, the reverse's source for an object
