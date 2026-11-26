@@ -84,8 +84,8 @@ http://localhost:3000/**
 ```
 
 The two `*.workers.dev` lines cover production and staging; the localhost line
-lets `next dev` work locally. Add the Cloud Run staging address
-(`docs/CLOUD_RUN_STAGING.md` §4) and any custom domain the same way. Save.
+lets `next dev` work locally. Add any custom domain the same way. Save. Cloud
+Run staging is retired (ADR 0037); its lines, if still listed, may be removed.
 
 ### Sanity check
 

@@ -1,5 +1,12 @@
 # Cloud Run trial staging (Google Cloud credits)
 
+> **Retired 2026-11-27 (ADR 0037).** The Cloud Run staging trial is stopped and
+> will not be used again. The Workers staging is the only deployed staging
+> environment; a check its free plan cannot finish runs on an in-runner build
+> (`scripts/lifecycle-nightly.sh`, `scripts/e2e-in-runner.sh`). Do not run
+> `scripts/cloud-run-deploy.sh`, and do not create or rotate secrets for this
+> service. The rest of this page is kept as history only.
+
 **Decisions (2026-09-26):** dedicated Google Cloud project, **staging**
 Supabase only, temporary `run.app` URL for now (custom domain later, before
 any real-user rollout), Cloudflare left untouched, CI and crons NOT

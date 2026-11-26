@@ -220,7 +220,7 @@ carries the sender, ADR 0029 section M):
    `PLATFORM_EMAIL_REPLY_TO`, `PLATFORM_EMAIL_DAILY_CEILING` and
    `PLATFORM_EMAIL_ORG_DAILY_LIMIT`.
    Workers: `wrangler secret put <NAME>` (`--env production` for production;
-   comments in `wrangler.toml`). Cloud Run: `docs/CLOUD_RUN_STAGING.md` §2.
+   comments in `wrangler.toml`). Cloud Run staging is retired (ADR 0037).
    Staging and production never share a credential.
 3. **The ceiling.** `PLATFORM_EMAIL_DAILY_CEILING` is three quarters of the
    mailbox's daily sending cap. The platform mailbox is a personal Google
@@ -255,8 +255,8 @@ under "Missing or invalid", and `platform_email` reads `fail`. `*` beside other 
 everything. Reserved test domains are never mailed, whatever the list holds,
 and tenant mail is never read against the list.
 
-Staging's value, the same for the staging Worker and Cloud Run staging. The
-real addresses are typed only into the two secrets, never into a file, a page,
+Staging's value, set on the staging Worker only (ADR 0037). The
+real addresses are typed only into its secret, never into a file, a page,
 a commit or a chat:
 ```
 <send-test-local>@<send-test-domain>,<test-mailbox-local>@<test-mailbox-domain>,<test-mailbox-local>+p0029h-welcome@<test-mailbox-domain>,<test-mailbox-local>+g1-alert@<test-mailbox-domain>
@@ -272,16 +272,16 @@ Nobody else on staging receives platform mail: their codes, links and alerts
 are logged as `suppressed` with `not_allowed`, and they use their password to
 sign in. Only the owner adds a name to the list, one address per entry.
 Setting it: on the staging Worker, `wrangler secret put
-PLATFORM_EMAIL_ALLOW_DOMAINS` takes effect immediately; on Cloud Run staging,
-add a version to the secret `lms-platform-email-allow-domains`, and each
-instance started after that, like the next deploy, picks it up (the deploy
-script mounts the newest version). Then "Send test". Code from before ADR 0029 pull request B
+PLATFORM_EMAIL_ALLOW_DOMAINS` takes effect immediately. Cloud Run staging
+is retired (ADR 0037): no secret is added there, and the staging
+Worker is the only staging deployment that reads this list.
+Then "Send test". Code from before ADR 0029 pull request B
 reads an address entry as a domain that matches nobody: with only address
 entries it sends no platform mail at all, and "Send test" reads not sent there
 until that pull request's code is deployed.
 
 **Rotation:** set `PLATFORM_SMTP_PASSWORD` again (Workers: `wrangler secret
-put`; Cloud Run: a new secret version and a redeploy), then "Send test".
+put`), then "Send test".
 
 **Dead app password** (`platform_email` `fail` with the newest row `auth`;
 console banner): Google withdraws an app password when the account's password
