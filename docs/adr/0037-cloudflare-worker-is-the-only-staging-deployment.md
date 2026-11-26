@@ -34,7 +34,7 @@ This record changes, going forward, the staging rules of the accepted records li
 
 ### 2. What this changes in accepted records
 
-Line numbers are those on `main` at fbea6d9 and only help today's reader. Rows marked "done" were met before this date. They bind only a repeat.
+Line numbers in this record are those on `main` at fbea6d9 and only help today's reader. Rows marked "done" were met before this date. They bind only a repeat.
 
 | Record | Where | It says | From 2026-11-27 |
 |---|---|---|---|
@@ -62,7 +62,7 @@ Line numbers are those on `main` at fbea6d9 and only help today's reader. Rows m
 | ADR 0033 | Part 2, step 4 and risk 16 (`0033:95`, `:195-197`, `:293`) | The Cloud Run deploy script sets both switches for staging; the step-4 unit test reads the script | Not built. The switches go in the Worker's top-level `[vars]`, the two in-runner scripts and `scripts/run-unit-tests.mjs`. The step-4 test reads those, not the script. `docs/CLOUD_RUN_STAGING.md` is not edited for it. Risk 16's protection is that test on `wrangler.toml` |
 | ADR 0034 | Step 8 and the Consequences (`0034:153`, `:195`) | The staging check on the Workers staging and on Cloud Run after the owner's next deploy | (W) only. The container-host case of its unit test stays, because it tests the middleware behind any proxy |
 
-ADR 0002 (owner events), ADR 0008, ADR 0019's and ADR 0021's staging-proof notes, and ADR 0025's list of builds name Cloud Run as history or context only. No rule in them changes. ADR 0023 is superseded and is not read.
+ADR 0002 (owner events), ADR 0008, ADR 0019's and ADR 0021's staging-proof notes, and ADR 0025's list of builds name Cloud Run as history or context only. So does ADR 0015's merge-day rule for `WEBHOOK_HOLD_SWEEP_FROM` (`0015:169`): the constant is set and live, so the rule has nothing left to bind. No rule in them changes. ADR 0023 is superseded and is not read.
 
 #### 2a. Three real changes, not remaps
 
@@ -92,13 +92,13 @@ A search of `.github/` for "Cloud Run", "cloud-run" and "run.app" finds nothing.
 
 | Tool or spec | Its Cloud Run part | From 2026-11-27 |
 |---|---|---|
-| `scripts/staging-cron-post.mjs` | It accepts the Cloud Run host as well as the Workers staging (`:13-16`, `:39`, `:59`) | The Workers staging only, which it already accepts. Each call is one request. F2 removes the Cloud Run host and flips the matching row of its address test (`scripts/check-auth-setup-link-proofs.mjs:1500-1509`) |
-| Specs 56 and 57 | The ADR 0015 sweep POSTs run "on Cloud Run only", with `KIVO_CLOUD_RUN_CRON_SECRET`; a Workers host is refused (`56-kivo-release-a-cmi5.spec.ts:17-20`, `:2152-2166`; `57-kivo-release-a-xapi.spec.ts:27-30`, `:631-647`) | **Decided: (R).** `LIFECYCLE_SPECS=56` or `57` with `bash scripts/lifecycle-nightly.sh` on the developer machine, because the kit those specs need is outside this repository. The specs read `LIFECYCLE_CRON_SECRET`, which that script sets for the app it starts. The Workers host stays refused. F1 |
+| `scripts/staging-cron-post.mjs` | It accepts the Cloud Run host as well as the Workers staging (`:13-16`, `:39`, `:59`) | The Workers staging only, which it already accepts. On the Worker it is run with `--once`, one request per call; without it, the script repeats its POST every 2 seconds for up to 4 minutes (`:9-11`, `:40-41`). F2 removes the Cloud Run host and flips the matching row of its address test (`scripts/check-auth-setup-link-proofs.mjs:1500-1509`) |
+| Specs 56 and 57 | The ADR 0015 sweep POSTs run "on Cloud Run only", with `KIVO_CLOUD_RUN_CRON_SECRET`; a Workers host is refused (`56-kivo-release-a-cmi5.spec.ts:17-20`, `:2152-2166`; `57-kivo-release-a-xapi.spec.ts:27-30`, `:631-647`) | **Proposed: (R).** `LIFECYCLE_SPECS=56` or `57` with `bash scripts/lifecycle-nightly.sh` on the developer machine, because the kit those specs need is outside this repository. After F1 the specs read `LIFECYCLE_CRON_SECRET`, which that script sets for the app it starts. Until F1 lands, their sweep cases (56: §3.4 and CR (iii); 57: unscored) cannot run on any target, because they need `KIVO_CLOUD_RUN_CRON_SECRET`, which only Cloud Run had. Their other cases are unaffected. The Workers host stays refused. F1 |
 | `tests/bot/env.bot.example:22-24` | Names `KIVO_CLOUD_RUN_CRON_SECRET` | Names `LIFECYCLE_CRON_SECRET`. F1 |
 | Spec 66 | "Cloud Run staging or an in-runner build" (`:23-25`, `:94`, `:173`, `:176`, `:310-311`) | The in-runner build, as the nightly already runs it. The messages change. F1 |
 | Specs 78 and 79 | `LIFECYCLE_CRON_SECRET`, else `KIVO_CLOUD_RUN_CRON_SECRET` (`78-sweep-time-box.spec.ts:64-67`, `:75-79`, `:101`, `:242-243`; `79-email-separation.spec.ts:45-48`, `:64`, `:449`) | `LIFECYCLE_CRON_SECRET` only. F1 |
 | Specs 48 and 63 | Comments on timings measured on Cloud Run (`48-abandoned-terminal.spec.ts:101`; `63-continue-next-step.spec.ts:109`, `:553`) | No change needed |
-| `scripts/cloud-run-deploy.sh`, `cloudbuild.yaml`, `Dockerfile`, `.dockerignore` | The container build and deploy of the trial (`docs/CLOUD_RUN_STAGING.md:13-16`) | Nobody runs them. `tests/unit/no-email-fallback.test.ts:60` reads the deploy script, so it is removed together with that test's change. F3 |
+| `scripts/cloud-run-deploy.sh`, `cloudbuild.yaml`, `.gcloudignore`, `Dockerfile`, `.dockerignore` | The container build and deploy of the trial (`docs/CLOUD_RUN_STAGING.md:13-16`) | Nobody runs them. `tests/unit/no-email-fallback.test.ts:60` reads the deploy script, so it is removed together with that test's change. F3 |
 | App code comments | `lib/http/after-response.ts`, `lib/auth/safe-next.ts`, `app/auth/callback/route.ts`, `app/api/integrations/enter/route.ts`, `app/api/integrations/exit/route.ts`, `lib/alds/flag.ts`, `next.config.ts` | The handling of a request behind a proxy stays. It protects any proxy host, and `tests/unit/sign-in-next.test.ts:92-167` and `tests/unit/privacy-notice.test.ts` keep their container-host cases. Comment edits are optional. F3 |
 | `docs/CLOUD_RUN_STAGING.md` | The trial's runbook | A retired banner. The rest is kept as history (section 6) |
 
@@ -121,7 +121,7 @@ With (R) the loopback receiver also works, which ADR 0015 step 9 found unreachab
 
 **The rule.** The owner answers the figures in decision request 2.
 1. **No load test against either Worker** while the account is on the free plan. A load test runs only against a local `next start` build, and its figures say nothing about the Workers.
-2. **Heavy or repeated runs go in-runner (R).** That means lifecycle specs by default, re-runs until green, loops, bisects, and any spec that launches packages more than a few times. Nothing runs against the Worker with `--repeat-each` or in a loop.
+2. **Heavy or repeated runs go in-runner (R).** That means lifecycle specs by default, re-runs until green, loops, bisects, and any spec that launches packages more than a few times. Nothing runs against the Worker with `--repeat-each` or in a loop, and `scripts/staging-cron-post.mjs` is run there only with `--once`.
 3. **On the Workers staging:** `nightly-e2e` (one run a night), page checks after a staging deploy, and a single hand run of a named spec or harness when its record asks for the deployed site.
 4. **Each hand run on the Worker states its request count** in its pull request or dated note. The figure comes from a measured earlier run: the staging Worker's count read before and after, with nothing else running.
 5. **Ceilings.** Staging's own share of a day stays under 20,000 requests. A hand run expected to send more than 5,000 goes in-runner. No hand run starts on the Worker while the account's count for the day reads above 50,000. If `nightly-e2e` measures above 10,000 a night, the owner is asked whether to cut its browser matrix or move it in-runner.
@@ -407,7 +407,7 @@ No step starts before the owner accepts this record. Each is its own small pull 
    - If decision request 5 is yes, the route list (`:36`) gains `gamification-refresh` and `refresh-report-views`, each used with `--once`.
    - Verified by running that proof script's address test and the unit job.
 3. **F3. Container files.**
-   - Remove `scripts/cloud-run-deploy.sh` and `cloudbuild.yaml`, and the script's entry in `tests/unit/no-email-fallback.test.ts:60`.
+   - Remove `scripts/cloud-run-deploy.sh`, `cloudbuild.yaml` and `.gcloudignore`, and the script's entry in `tests/unit/no-email-fallback.test.ts:60`.
    - Keep `Dockerfile`, `.dockerignore` and the `NEXT_OUTPUT=standalone` switch in `next.config.ts`. They cost nothing and are not tied to one host.
    - Optional comment edits in the app files of section 4. No behaviour change.
    - Verified by the unit job, typecheck, lint, and the pull-request e2e build.
@@ -419,7 +419,7 @@ No step starts before the owner accepts this record. Each is its own small pull 
 
 - After the edits of section 6, no line in `docs/ARCHITECTURE.md`, `ops/RUNBOOK.md` or `docs/ops/supabase-auth-smtp.md` directs a future staging step to Cloud Run. Lines that name it as history stay.
 - The first `nightly-e2e` and `lifecycle-nightly` runs after 2026-11-27 are read by the lead with `gh run list`. A red run is checked for any Cloud Run cause, and section 3 expects none.
-- Owner checks (a) to (d) are recorded as dated notes under this record.
+- Owner checks (a) to (e) are recorded as dated notes under this record.
 - Each follow-up carries the verification named in its step.
 
 ## Risks and protections
@@ -427,7 +427,7 @@ No step starts before the owner accepts this record. Each is its own small pull 
 | # | Risk | Protection |
 |---|---|---|
 | 1 | A staging run uses up the account's day and stops production (learners, crons, health) until the count resets | Section 5: no load test on any Worker; heavy and repeated runs in-runner; the staging share and per-run ceilings; the day's count read before a hand run; `nightly-e2e` measured (F5) |
-| 2 | A check the free plan cannot finish runs on the Worker and fails at random (error 1102), or a Guardian run stays pending | (R) for those checks. Specs 56, 57, 66 and 78 refuse a `.workers.dev` host before writing. A page check that fails with 1102 is reloaded once, never looped |
+| 2 | A check the free plan cannot finish runs on the Worker and fails at random (error 1102), or a Guardian run stays pending | (R) for those checks. Spec 66 refuses a `.workers.dev` host before anything is written. Specs 56 and 57 refuse one at the start of each sweep case, and spec 78 at the start of part B, so no sweep or cron POST reaches a Worker. A page check that fails with 1102 is reloaded once, never looped |
 | 3 | The in-runner build is Next on Node, not the OpenNext Workers build, so a fault in the adapter shows only on a Worker | `nightly-e2e` on the Workers staging every night; page checks after each staging deploy (W) |
 | 4 | Time bounds set on Cloud Run fail in-runner. From the runner each database call costs about 260 ms (ADR 0019, note at `0019:298`) | A bound is measured again in-runner and set from that run, never past the product's own bound, as spec 63's were. A red bound is a spec fix, not a product change |
 | 5 | The stopped service is resumed and serves its last revision against a staging database that has moved on (0107, 0108 and later) | Decision request 3: the trial project is shut down. Until then nothing points at it: no CI, no cron and, after section 6, no document |
@@ -471,6 +471,7 @@ Owner checks, read-only, each recorded as a dated note:
 - (b) On staging, in the SQL editor: `select jobname, schedule, command from cron.job;`. Every command is SQL, with no `net.` call.
 - (c) Any outside uptime monitor (`nightly-e2e.yml:13` names one) that watches a Cloud Run address is removed.
 - (d) Where the Cloudflare dashboard shows the account's requests for the day, and when the day rolls over; then the `nightly-e2e` figure of F5.
+- (e) Any automation outside this repository that could still name the old staging address or its cron secret (a local environment file used for hand runs, a scheduled task on a developer machine, a scheduled cloud agent, or a scheduler or build trigger inside the stopped trial project) is removed or pointed at the Workers staging.
 
 ### Owner answers
 
