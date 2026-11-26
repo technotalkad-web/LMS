@@ -29,7 +29,7 @@ export const PRIVACY_NOTICE_VERSION = "Version 1, draft for legal review, 2026-1
 
 export const PRIVACY_NOTICE_INTRO: readonly string[] = [
   "This notice explains what personal data this learning platform holds about you, why, who can see it, how long it is kept and what you can ask for.",
-  "In this notice, \"your organisation\" means the organisation that gave you access to this platform (usually your employer). It decides who gets access, what training you are given and how your training records are used. It may also give you its own privacy notice.",
+  "In this notice, \"your organisation\" means the organisation that gave you access to this platform (usually your employer). It gives you access to this platform and assigns your training. It may also give you its own privacy notice.",
 ];
 
 export const PRIVACY_NOTICE_SECTIONS: readonly PrivacyNoticeSection[] = [
@@ -98,11 +98,11 @@ export const PRIVACY_NOTICE_SECTIONS: readonly PrivacyNoticeSection[] = [
       },
       {
         lead: "Other people in your organisation who use the platform:",
-        text: "the details in your profile (your name, work email, photo and any optional details) and your leaderboard places. Where your organisation allows it, you can hide yourself from leaderboards on your profile page; administrators still see you. Your photo's web address works for anyone who has it.",
+        text: "the details in your profile (your name, work email, photo and any optional details) and, on leaderboards, your place with your points, average score, active days and streak, and your designation, team, branch and city where recorded. Where your organisation allows it, you can hide yourself from leaderboards on your profile page; administrators still see you. Your photo's web address works for anyone who has it.",
       },
       {
         lead: "The platform's operators:",
-        text: "to give support, they can enter your organisation's workspace with administrator access. Each visit lasts at most one hour and is recorded.",
+        text: "to give support, they can enter your organisation's workspace with administrator access. Each visit lasts at most one hour and is recorded. They also run the platform's database and its backups, and can reach your data there when they maintain, repair or restore the platform.",
       },
     ],
   },
@@ -116,7 +116,7 @@ export const PRIVACY_NOTICE_SECTIONS: readonly PrivacyNoticeSection[] = [
       },
       {
         lead: "A learning record store:",
-        text: "your organisation can have a copy of your learning records sent to its own store. Each copy carries your name and email address.",
+        text: "your organisation can have a copy of your learning records sent to its own store. Each copy carries your name, email address, employee ID and work details (such as your role, designation, grade, branch, location, joining date, manager, teams and groups).",
       },
     ],
   },
@@ -127,7 +127,7 @@ export const PRIVACY_NOTICE_SECTIONS: readonly PrivacyNoticeSection[] = [
       { text: "a database, sign-in and file storage provider, which also hands emails to the email service;" },
       { text: "a hosting provider that runs the website and keeps technical logs of requests;" },
       { text: "an automation service that runs scheduled jobs, including backups;" },
-      { text: "a separate storage provider that holds encrypted copies of the database;" },
+      { text: "a separate storage provider that holds database backups (new backups are encrypted);" },
       { text: "an error-reporting service (see above);" },
       { text: "your organisation's own email service or, for some messages to administrators, the platform's email account." },
     ],
@@ -136,7 +136,7 @@ export const PRIVACY_NOTICE_SECTIONS: readonly PrivacyNoticeSection[] = [
     heading: "How it is protected",
     items: [
       { text: "Database rules keep each organisation's data apart. Each person sees only what their role allows." },
-      { text: "Passwords and reset codes are stored only in scrambled form, and database backups are encrypted." },
+      { text: "Passwords and reset codes are stored only in scrambled form, and new database backups are encrypted." },
       { text: "Your training history is not deleted or rewritten; a correction is recorded alongside it." },
     ],
     after: ["If a security breach affects your personal data, you will be told as the law requires."],
@@ -144,7 +144,7 @@ export const PRIVACY_NOTICE_SECTIONS: readonly PrivacyNoticeSection[] = [
   {
     heading: "How long it is kept",
     paragraphs: [
-      "Your organisation decides how long your data is kept, and keeps it only as long as it needs it for the purposes in this notice or as the law requires. Your training history is kept as a lasting record, also after you leave your organisation's workspace.",
+      "The platform does not delete your data on its own. Your training history and profile are kept as a lasting record, also after you leave your organisation's workspace, and copies stay in database backups until they are deleted.",
     ],
   },
   {

@@ -254,9 +254,9 @@ One line per question. Nothing is built for a question before its line is filled
 
 Placeholders that Ambak Legal fills. Until then, the page uses the neutral wording shown and no brackets.
 
-- L1. **The responsible party.** The data fiduciary, and whether the platform's operator acts for the organisation. The page says "your organisation" throughout.
+- L1. **The responsible party.** The data fiduciary, and whether the platform's operator acts for the organisation. The page says "your organisation" throughout. It does not say who decides why the data is used or how long it is kept: the organisation gives access and assigns training, and the platform's design also fixes how records are used and kept (lasting history, error reporting, backups).
 - L2. **A grievance contact.** A role, an address and a response time. The page sends people to "your organisation's HR or Learning & Development team, or the administrator who invited you".
-- L3. **Retention periods** for each kind of data. The page says the organisation decides.
+- L3. **Retention periods** for each kind of data. The page states no period. It says what happens today: the platform deletes nothing on its own, training history and the profile are kept after a person leaves, and copies stay in database backups until they are deleted (A1).
 - L4. **Breach notice.** Who tells people, and how. The page says "you will be told as the law requires".
 - L5. **Providers and data location.** Whether to name the service providers, and where the data is stored. The page names roles only and states no location.
 - L6. **Nomination.** How a person names someone to use their rights. The page states the right only.
@@ -269,21 +269,23 @@ Assumptions the text makes. These are facts as of `main` at 3094e35, with eviden
 
 - A1. **Nothing is deleted automatically.**
   - Learner history is never rewritten or deleted (principle 3).
-  - Removing a member deletes only their membership row.
+  - Removing a member deletes only their membership row. The profile row, with any phone, date of birth, gender and photo, stays.
   - Deleted organisations are soft-deleted.
-  - The one automatic delete is of LRS outbox rows after forwarding.
+  - The automatic deletes are of LRS outbox rows after forwarding, and of cached report rows for people no longer active, which the nightly report-card refresh drops (`lib/manager/cache.ts:147-157`). That cache is a derived copy; the records it is built from stay. The preview purge (`purge_preview_data`) deletes test-run attempts only, and only when it is called by hand.
   - Database backups are kept until someone deletes them.
-  - No route in the code deletes an account (no `auth.admin.deleteUser` call). An account deleted by hand in the database host's console would take its attempts with it (`supabase/migrations/0002_courses.sql:87`, on delete cascade).
-  - So the page promises no period and no erasure of training history. This conflicts with a plain "erase on request", and legal must reconcile the two.
+  - No route in the code deletes an account (`auth.admin.deleteUser` appears only under `scripts/`). An account deleted by hand in the database host's console would take its attempts with it (`supabase/migrations/0002_courses.sql:87`, on delete cascade).
+  - The only periods in the code are set by the platform owner, not by an organisation: the platform owner deletes platform email log rows and account setup link rows older than 90 days by hand in the SQL editor (`supabase/migrations/0113_platform_email_log.sql:52-55`, `0117_account_setup_links.sql:70-74`). No organisation-level retention setting exists.
+  - So the page promises no period and no erasure of training history. It says only that the platform deletes nothing on its own. This conflicts with a plain "erase on request", and legal must reconcile the two.
 - A2. **Browser error reporting.** It runs on every page when the build carries its key. It sends timing measurements from 10% of page visits, and a masked screen recording of any session that hits an error. On production the key falls back to staging's when no production key is set (decision request 8). The page says "may be sent" and names both kinds of report.
 - A3. **The CRM integration and tenant LRS forwarding** are off unless an organisation turns them on. For the pilot the CRM is off (ADR 0033 part 1). The page describes what each does when on.
 - A4. **Profile rows.** Any signed-in member of an organisation can read every co-member's whole profile row: name, username, work email, photo address, phone, gender and date of birth. The page says so (decision request 7).
 - A5. **Profile photos** are stored in a public bucket. Anyone with a photo's web address can open it.
 - A6. **Support access.** It is entered with administrator (`super_owner`) rights. It lasts at most 60 minutes and is recorded with the operator's network address, browser and stated reason.
+  - Beyond support visits, the operators run the database and its backups directly, and the app records none of it. Migrations are pasted by hand in the database host's SQL editor (`supabase/migrations/0117_account_setup_links.sql:3-4`). Log rows are deleted there (`0113_platform_email_log.sql:52-55`). Step 6 of this record reads organisations there. The nightly dumps are encrypted to the operator's own key, so the operator can decrypt them (`.github/workflows/backup.yml:3-7`). The page says the operators run the database and its backups and can reach the data there.
 - A7. **Providers.**
   - Production runs on Cloudflare Workers.
   - Supabase holds the database, sign-in and file storage, and runs the `send-smtp` function.
-  - Backblaze B2 holds the encrypted database backups.
+  - Backblaze B2 holds the database backups. Dumps made since encryption became mandatory are encrypted (`.github/workflows/backup.yml:3-7`). Older objects ending in plain `.sql.gz` are plaintext (`docs/ops/backup-restore.md:9`). So the page says "new backups are encrypted". Open before production: the owner confirms that the older plaintext objects are deleted from the bucket and records it. The two lines may then drop "new".
   - GitHub Actions runs the backups and the scheduled jobs.
   - Sentry receives the error reports.
   - The Cloud Run trial is staging only and R2 is unused, so neither is listed.
@@ -300,6 +302,7 @@ Assumptions the text makes. These are facts as of `main` at 3094e35, with eviden
   - two cookies when a person arrives from a connected HR or business system;
   - a support-visit cookie for platform operators only.
   It also keeps the announcements a person closed in browser storage. A cookie section is out of scope here; legal decides whether to list these.
+- A15. **Leaderboards.** Any member can open the leaderboard while the organisation has it on, as it is by default. A board lists the top 50, or up to 1,000 rows when filtered. Each row shows the person's name and photo with one figure: points, active days in the last 30 days, points gained, streak days, or average score as a percentage on the highest-scorer board, which is on by default. Designation, team and city are shown when any listed person has them recorded, and the top three on the podium show designation and branch. Level, courses completed and badge count are read but not shown for other people. The vertical board shows other learners only group totals. The page lists these figures and fields.
 
 ### A.2 The text (clean copy)
 
@@ -313,7 +316,7 @@ Version 1, draft for legal review, 2026-11-26
 
 This notice explains what personal data this learning platform holds about you, why, who can see it, how long it is kept and what you can ask for.
 
-In this notice, "your organisation" means the organisation that gave you access to this platform (usually your employer). It decides who gets access, what training you are given and how your training records are used. It may also give you its own privacy notice.
+In this notice, "your organisation" means the organisation that gave you access to this platform (usually your employer). It gives you access to this platform and assigns your training. It may also give you its own privacy notice.
 
 **What the platform holds about you**
 
@@ -343,15 +346,15 @@ The platform shows no advertising and uses no marketing trackers.
 - You: your profile and your own learning records.
 - Your organisation's administrators and data analysts: the details and learning records of everyone in the organisation, including reports and downloads.
 - Your managers (up to three levels above you, as named in your record): your progress and results. Only your direct manager sees your email address there.
-- Other people in your organisation who use the platform: the details in your profile (your name, work email, photo and any optional details) and your leaderboard places. Where your organisation allows it, you can hide yourself from leaderboards on your profile page; administrators still see you. Your photo's web address works for anyone who has it.
-- The platform's operators: to give support, they can enter your organisation's workspace with administrator access. Each visit lasts at most one hour and is recorded.
+- Other people in your organisation who use the platform: the details in your profile (your name, work email, photo and any optional details) and, on leaderboards, your place with your points, average score, active days and streak, and your designation, team, branch and city where recorded. Where your organisation allows it, you can hide yourself from leaderboards on your profile page; administrators still see you. Your photo's web address works for anyone who has it.
+- The platform's operators: to give support, they can enter your organisation's workspace with administrator access. Each visit lasts at most one hour and is recorded. They also run the platform's database and its backups, and can reach your data there when they maintain, repair or restore the platform.
 
 **Systems your organisation can connect**
 
 These are off unless your organisation turns them on.
 
 - An HR or business system: it can create, update and deactivate your account, sign you in, and read your courses, progress, scores and completions. When you complete a course, the platform can send it your employee ID, email address, the course, your score, whether you passed and when.
-- A learning record store: your organisation can have a copy of your learning records sent to its own store. Each copy carries your name and email address.
+- A learning record store: your organisation can have a copy of your learning records sent to its own store. Each copy carries your name, email address, employee ID and work details (such as your role, designation, grade, branch, location, joining date, manager, teams and groups).
 
 **Service providers**
 
@@ -360,21 +363,21 @@ The platform relies on:
 - a database, sign-in and file storage provider, which also hands emails to the email service;
 - a hosting provider that runs the website and keeps technical logs of requests;
 - an automation service that runs scheduled jobs, including backups;
-- a separate storage provider that holds encrypted copies of the database;
+- a separate storage provider that holds database backups (new backups are encrypted);
 - an error-reporting service (see above);
 - your organisation's own email service or, for some messages to administrators, the platform's email account.
 
 **How it is protected**
 
 - Database rules keep each organisation's data apart. Each person sees only what their role allows.
-- Passwords and reset codes are stored only in scrambled form, and database backups are encrypted.
+- Passwords and reset codes are stored only in scrambled form, and new database backups are encrypted.
 - Your training history is not deleted or rewritten; a correction is recorded alongside it.
 
 If a security breach affects your personal data, you will be told as the law requires.
 
 **How long it is kept**
 
-Your organisation decides how long your data is kept, and keeps it only as long as it needs it for the purposes in this notice or as the law requires. Your training history is kept as a lasting record, also after you leave your organisation's workspace.
+The platform does not delete your data on its own. Your training history and profile are kept as a lasting record, also after you leave your organisation's workspace, and copies stay in database backups until they are deleted.
 
 **Your rights**
 
@@ -399,7 +402,7 @@ This notice may change. The version line at the top shows which version you are 
 
 ----- END NOTICE TEXT, VERSION 1 -----
 
-The text is about 1,030 words, title and headings included, counted by hand. Step 5 (g) counts it again in the module.
+The text is 1,077 words, title, version line and headings included, as step 5 (g) counts it in the module.
 
 ## Appendix B. What the notice relies on
 
@@ -434,13 +437,16 @@ The text is about 1,030 words, title and headings included, counted by hand. Ste
 | Administrators and data analysts see the whole organisation | `lib/auth/permissions.ts:4-16`; `docs/ARCHITECTURE.md:28` |
 | Managers L1 to L3; email address for the direct team only | `lib/manager/access.ts:4-14` |
 | Co-members can read whole profile rows | `supabase/migrations/0115_membership_status_enforced.sql:920-933` |
+| Leaderboards show each listed person's place with points, average score, active days or streak, and designation, team, branch and city where recorded (A15) | `app/[org]/(learner)/leaderboard/page.tsx:32-38`, `:78-93`, `:119-140`, `:221-231`, `:383-385`, `:392-405`, `:644-701`; `app/[org]/(learner)/leaderboard/_components/podium.tsx:9-16`, `:145-150`; `supabase/migrations/0053_gamification.sql:38-39`, `:45`; `app/[org]/(learner)/leaderboard/_components/vertical-board.tsx:24-30` |
+| Operators run the database and its backups (A6) | `supabase/migrations/0117_account_setup_links.sql:3-4`; `supabase/migrations/0113_platform_email_log.sql:52-55`; `.github/workflows/backup.yml:3-7`; step 6 of this record |
 | Connected HR or business system: create, update, deactivate, sign in, read progress | `app/api/integrations/employees/route.ts:24-42`; `app/api/integrations/sso-link/route.ts`; `app/api/integrations/progress/route.ts`; `app/api/integrations/learner-summary/route.ts` |
 | Completion message: employee ID, email, course, score, pass, time | `lib/integrations/webhook.ts:48-60` |
 | Off for the pilot | `docs/adr/0033-paths-pilot-first-release.md:81-98` |
-| Learning record store copies carry name and email | `supabase/migrations/0044_lrs_forwarding.sql:13`, `:27`; `lib/lrs/enrich.ts:96-102` |
+| Learning record store copies carry name, email, employee ID and work details | `supabase/migrations/0044_lrs_forwarding.sql:13`, `:27`; `lib/lrs/enrich.ts:96-102` (name and email), `:123-142` (employee ID, role, vertical and segment, branch, city, state, unit code, designation, job role, grade, line manager, joining date, tenure, teams, groups); `lib/lrs/context.ts:236-247` |
 | Providers by role | `docs/ARCHITECTURE.md:9-12`; `wrangler.toml:39-40`; `.github/workflows/backup.yml:4`; `docs/ops/backup-restore.md:6-7` |
 | Error reports and timing measurements: what is sent, the 10% sample, masking | `instrumentation-client.ts:41-95`; `lib/security/telemetry-scrub.ts:8-27`; `.github/workflows/deploy-prod.yml:38-42` |
 | No advertising or marketing trackers | `package.json:37` (the only telemetry dependency); ADR 0025 |
 | Organisations kept apart by database rules | `docs/ARCHITECTURE.md:10` |
 | Training history never deleted or rewritten; corrections added | `docs/ARCHITECTURE.md:71`; `supabase/migrations/0053_gamification.sql:128-146` |
-| Nothing deleted automatically; removal keeps history | `app/api/organization-members/[userId]/route.ts:169-175`; `app/api/cron/reaper/route.ts:11-19`; `app/api/cron/lrs-forward/route.ts:225`; `docs/ops/backup-restore.md:6` |
+| Nothing deleted automatically; removal keeps history and the profile; backup copies stay until deleted | `app/api/organization-members/[userId]/route.ts:169-175`; `app/api/cron/reaper/route.ts:11-19`; `app/api/cron/lrs-forward/route.ts:225`; `lib/manager/cache.ts:147-157`; `docs/ops/backup-restore.md:6`; `auth.admin.deleteUser` only under `scripts/` |
+| New database backups are encrypted; older plain objects are not (A7) | `.github/workflows/backup.yml:3-7`; `docs/ops/backup-restore.md:9` |
