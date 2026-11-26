@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { createClient as createServiceClient } from "@supabase/supabase-js";
 import { auditLog, requirePlatformOwnerApi } from "@/lib/auth/require-platform-owner";
 import { originFromRequest } from "@/lib/http/origin";
+import { RESERVED_TOP_PATHS } from "@/lib/supabase/middleware";
 
 /**
  *   POST /api/super/tenants
@@ -39,6 +40,11 @@ export async function POST(request: Request) {
       { error: "Slug must be 3-42 chars, lowercase letters/digits/hyphens, not starting or ending with a hyphen" },
       { status: 400 }
     );
+  }
+  // A top-level path the platform answers itself (/login, /privacy, ...)
+  // would hide the organisation's pages behind the platform's (ADR 0034).
+  if (RESERVED_TOP_PATHS.has(slug)) {
+    return NextResponse.json({ error: "This address is reserved by the platform" }, { status: 400 });
   }
 
   const svc = createServiceClient(
