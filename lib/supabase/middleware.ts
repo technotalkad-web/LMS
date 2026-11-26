@@ -15,6 +15,24 @@ import { signInNext } from "@/lib/auth/safe-next";
 // /<org>/dashboard still go through the auth gate.
 const ORG_LOGIN_RE = /^\/[^/]+\/login$/;
 
+// Reserved top-level paths are NOT org slugs: a signed-out visit to one goes
+// to /login, not to /<segment>/login, and POST /api/super/tenants refuses
+// them as a new organisation's slug (ADR 0034). Keep this list in sync with
+// the top-level routes under app/.
+export const RESERVED_TOP_PATHS: ReadonlySet<string> = new Set([
+  "super",
+  "super-mfa",
+  "auth",
+  "api",
+  "invitations",
+  "login",
+  "forgot-password",
+  "select-org",
+  "change-password",
+  "privacy",
+  "_next",
+]);
+
 export async function updateSession(request: NextRequest) {
   let response = NextResponse.next({ request });
 
@@ -92,6 +110,8 @@ export async function updateSession(request: NextRequest) {
   const path = effectivePath;
   const isPublic =
     path === "/" ||
+    // The privacy notice (ADR 0034). Exact: a slug such as privacy-team keeps its sign-in gate.
+    path === "/privacy" ||
     path.startsWith("/login") ||
     // Per-tenant branded login: /<slug>/login — entry point for that tenant.
     ORG_LOGIN_RE.test(path) ||
@@ -131,19 +151,8 @@ export async function updateSession(request: NextRequest) {
     // learner sees the generic Mentora login the first time they click
     // through, defeating the whole point of per-tenant branding.
     //
-    // Reserved top-level paths are NOT org slugs; they go to /login.
-    // (Keep this list in sync with the route groups under app/.)
-    const RESERVED_TOP_PATHS = new Set([
-      "super",
-      "auth",
-      "api",
-      "invitations",
-      "login",
-      "forgot-password",
-      "select-org",
-      "change-password",
-      "_next",
-    ]);
+    // Reserved top-level paths (RESERVED_TOP_PATHS, above) are NOT org
+    // slugs; they go to /login.
     const firstSegment = path.split("/")[1] ?? "";
     const isTenantPath =
       firstSegment.length > 0 && !RESERVED_TOP_PATHS.has(firstSegment);

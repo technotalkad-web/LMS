@@ -324,14 +324,10 @@ export default function LoginPage() {
           <p className="text-center text-sm text-muted mt-6">{LEARNERS_LINE}</p>
 
           <p className="text-center text-xs text-muted mt-10">
-            By signing in you agree to our{" "}
-            <a href="#" className="underline hover:text-ink">
-              Terms
-            </a>{" "}
-            and{" "}
-            <a href="#" className="underline hover:text-ink">
+            By signing in you agree to our Terms and{" "}
+            <Link href="/privacy" className="underline hover:text-ink">
               Privacy Policy
-            </a>
+            </Link>
             .
           </p>
         </div>

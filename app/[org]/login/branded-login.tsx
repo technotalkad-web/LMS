@@ -438,8 +438,11 @@ export function BrandedLogin({
           )}
 
           <p className="text-center text-xs text-muted mt-10">
-            By signing in you agree to {orgName}&apos;s Terms and Privacy
-            Policy.
+            By signing in you agree to {orgName}&apos;s Terms and{" "}
+            <Link href="/privacy" className="underline hover:text-ink">
+              Privacy Policy
+            </Link>
+            .
           </p>
         </div>
       </main>

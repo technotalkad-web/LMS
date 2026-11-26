@@ -56,6 +56,8 @@ export function isInfraPath(p: string): boolean {
     p.startsWith("/forgot-password") ||
     p.startsWith("/change-password") ||
     p.startsWith("/super") ||
+    // The platform's privacy notice (ADR 0034). Exact: /privacy-team stays a tenant path.
+    p === "/privacy" ||
     p === "/favicon.ico"
   );
 }

@@ -23,6 +23,15 @@ test.describe("/login", () => {
     ).toBeVisible();
   });
 
+  test("the Privacy Policy link opens the privacy notice, signed out (ADR 0034)", async ({ page }) => {
+    await page.goto("/login");
+    await expect(page.getByLabel(/work email/i)).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("link", { name: "Privacy Policy" }).click();
+    await expect(page).toHaveURL(/\/privacy$/);
+    await expect(page.getByRole("heading", { level: 1, name: "Privacy Notice" })).toBeVisible();
+    await expect(page.getByText(/Version \d+/)).toBeVisible();
+  });
+
   test("rejects invalid credentials with an inline error", async ({ page }) => {
     await loginByPassword(page, "nobody@example.test", "wrong-password");
     await expect(page.getByText(/invalid|incorrect|wrong/i)).toBeVisible({
