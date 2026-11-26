@@ -1,6 +1,6 @@
 # 0034. A public Privacy Notice page at `/privacy`, linked from both sign-in pages
 
-Status: Proposed (2026-11-26). Nothing is built before the owner answers the decisions below. Code and documentation only: no migration, table, view, function, policy, grant, role or permission change. Decision 4 changes one platform-owner API answer and is asked on its own.
+Status: Accepted (2026-11-26; the owner answers and the lead's minor rulings are under "Owner answers"). Proposed 2026-11-26. Code and documentation only: no migration, table, view, function, policy, grant, role or permission change. Decision 4 changes one platform-owner API answer and is asked on its own.
 Date: 2026-11-26
 Deciders: owner; Ambak Legal for the notice's wording
 Architect: Opus 5.5, standing in this week for Fable 5.2, which is at its usage limit
@@ -330,7 +330,7 @@ In this notice, "your organisation" means the organisation that gave you access 
 
 **Why it is used**
 
-Your organisation uses this data as part of your employment, for your training and development:
+This data is used as part of your employment, for your training and development:
 
 - to give you your training, keep your place, and record what you complete and your results;
 - to show your progress to the people listed below;

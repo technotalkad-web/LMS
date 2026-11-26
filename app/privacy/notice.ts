@@ -69,7 +69,7 @@ export const PRIVACY_NOTICE_SECTIONS: readonly PrivacyNoticeSection[] = [
   {
     heading: "Why it is used",
     paragraphs: [
-      "Your organisation uses this data as part of your employment, for your training and development:",
+      "This data is used as part of your employment, for your training and development:",
     ],
     items: [
       { text: "to give you your training, keep your place, and record what you complete and your results;" },
