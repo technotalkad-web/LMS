@@ -82,7 +82,7 @@ A search of `.github/` for "Cloud Run", "cloud-run" and "run.app" finds nothing.
 | `deploy-staging.yml` | Builds and deploys the Workers staging | `.github/workflows/deploy-staging.yml:53-60` | No |
 | `cron.yml` | Production only, through `PROD_BASE_URL` | `.github/workflows/cron.yml:12-13`, `:50`, `:72-75` | No |
 | `ops-watch.yml` | Production's health route only | `.github/workflows/ops-watch.yml:21`, `:48`, `:120` | No |
-| `ops-review.yml` | GitHub issues and runs | `.github/workflows/ops-review.yml:3-6`, `:86` | No |
+| `ops-review.yml` | GitHub issues and runs, and once a day the Workers staging's public health route (`ops/ops-review-prompt.md:24`, loaded at `ops-review.yml:69`; curl allowed at `:86`) | `.github/workflows/ops-review.yml:3-6`, `:86` | No |
 | `deploy-prod.yml`, `backup.yml`, `content-backup.yml`, `rls-audit.yml`, `migration-rehearsal.yml` | Production, a database or storage | The search above | No |
 | The staging database's pg_cron jobs | Job 1 `refresh-report-views` refreshes the report views inside the database. It is the owner's paste on staging, not a migration in this repository (`docs/ARCHITECTURE.md` §1, Supabase and Crons rows), so its command is not in the repository. The `completion-sweep` job, where it was scheduled, runs the SQL of `supabase/migrations/0112_sweep_time_box.sql:153`. No migration uses `pg_net` | The search of the repository for `net.http_`, `pg_net` and `cron.schedule` | No, as far as the repository shows. Owner check (b) reads the job commands |
 
@@ -114,7 +114,7 @@ With (R) the loopback receiver also works, which ADR 0015 step 9 found unreachab
 **The figures that can be counted.**
 - Production's own schedule makes at most about 655 requests a day. From `cron.yml:22-31`: 288 `lrs-forward`, 96 `gamification-refresh`, 96 `report-card-refresh`, 24 `journey-nudges` and 4 daily jobs, plus a weekly and a monthly one. From `ops-watch.yml:28-29`: 144 probes and one digest. GitHub often starts fewer.
 - Production's learners come with the pilot. Every package file a learner's browser fetches is one request to the Worker, so each course launch costs many requests. The figure per launch has not been measured.
-- On staging, `nightly-e2e` is the only automated job that calls the Worker. It runs once a night across five browser projects (`nightly-e2e.yml:31`, `:56-58`, `:69`). Its figure has not been measured (F5).
+- On staging, `nightly-e2e` and the daily ops review's single health probe (`ops/ops-review-prompt.md:24`) are the only automated jobs that call the Worker. `nightly-e2e` runs once a night across five browser projects (`nightly-e2e.yml:31`, `:56-58`, `:69`). Its figure has not been measured (F5).
 - The pull-request e2e job and the lifecycle nightly cost the Worker nothing. Both run in the runner.
 - `tests/load` ramps to 300 virtual users (`tests/load/learner-journey.js:66-72`), and its README points at staging (`tests/load/README.md:4`). One run can use the whole day.
 - Whether files served from `[assets]` (`wrangler.toml:34-36`) count toward the limit is Cloudflare's rule. It is read when the count is first recorded (owner check (d)).
