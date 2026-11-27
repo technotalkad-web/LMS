@@ -12,6 +12,12 @@ Never `supabase db push` — the CLI is linked to production.
 - Deploy-safe in both orders: code that reads a new column must tolerate it
   being absent (select `*`, treat `undefined` as the default) and code that
   writes it must only do so when a value is supplied.
+- Staging has one deployment, the Workers staging (ADR 0037, 2026-11-27).
+  Where a file header, an ADR or this page says "code first on both staging
+  deployments" or "on every deployment that shares the database", on
+  staging that is the green Workers staging deploy of the code from `main`
+  (`deploy-staging.yml`). Cloud Run staging is stopped and is never waited
+  for. Production is unchanged.
 
 ## Data API grants (mandatory from 2026-10-30)
 
